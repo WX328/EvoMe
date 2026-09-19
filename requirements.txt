@@ -4,3 +4,4 @@ openai>=1.0
 langgraph>=0.2
 pytest>=8.0
 json-repair>=0.30
+qdrant-client>=1.12

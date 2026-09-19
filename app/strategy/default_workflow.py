@@ -1,5 +1,7 @@
 from langgraph.graph import END, START, StateGraph
 
+from app.hypothesis.canonical import build_canonical_signal
+from app.models import ReflectionRecord
 from app.strategy.state import EvoMeState
 
 
@@ -12,6 +14,7 @@ SYSTEM_PROMPT = """
 3. 只在真正有帮助时使用历史信息。
 4. Strategy 是可执行 Workflow；Skill 是能力抽象。
 5. InteractionRecord 是审计日志，不参与常规检索。
+6. Reflection/Hypothesis 只是进化证据，不代表已验证的 Strategy。
 """
 
 
@@ -27,8 +30,10 @@ class DefaultConversationStrategy:
         personal_memory_service,
         personal_memory_gate,
         experience_gate,
+        context_builder,
         evolution_memory_service,
         reflection_service,
+        hypothesis_aggregator,
         evaluation_service,
         skill_registry,
     ) -> None:
@@ -37,8 +42,10 @@ class DefaultConversationStrategy:
         self.personal_memory_service = personal_memory_service
         self.personal_memory_gate = personal_memory_gate
         self.experience_gate = experience_gate
+        self.context_builder = context_builder
         self.evolution_memory_service = evolution_memory_service
         self.reflection_service = reflection_service
+        self.hypothesis_aggregator = hypothesis_aggregator
         self.evaluation_service = evaluation_service
         self.skill_registry = skill_registry
         self.graph = self._build_graph()
@@ -47,8 +54,14 @@ class DefaultConversationStrategy:
         skill_name = "recall_relevant_memory"
         impl = self.skill_registry.resolve(skill_name)
         memories = impl.execute(query=state["user_input"], top_k=5)
+        quality = (
+            sum(float(memory.confidence) for memory in memories) / len(memories)
+            if memories
+            else 0.0
+        )
         return {
             "relevant_memories": [memory.content for memory in memories],
+            "memory_quality": quality,
             "skills_used": [skill_name],
         }
 
@@ -56,7 +69,8 @@ class DefaultConversationStrategy:
         memories = state.get("relevant_memories", [])
         memory_context = (
             "\n".join(f"- {memory}" for memory in memories)
-            if memories else "暂无直接相关的 Personal Memory。"
+            if memories
+            else "暂无直接相关的 Personal Memory。"
         )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -94,7 +108,8 @@ class DefaultConversationStrategy:
         result = self.personal_memory_gate.extract(state["user_input"])
         return {
             "personal_memory_candidates": result["memories"]
-            if result["should_save"] else []
+            if result["should_save"]
+            else []
         }
 
     def _write_personal_memory(self, state: EvoMeState) -> dict:
@@ -123,15 +138,35 @@ class DefaultConversationStrategy:
         )
         return {"experience_gate": result}
 
+    def _build_context(self, state: EvoMeState) -> dict:
+        gate = state["experience_gate"]
+        if not gate.get("should_save"):
+            return {"context_data": {}}
+
+        available_skills = [
+            skill.name for skill in self.skill_registry.list_skills()
+        ]
+        context_data = self.context_builder.build(
+            user_input=state["user_input"],
+            relevant_memories=state.get("relevant_memories", []),
+            available_skills=available_skills,
+            available_tools=[],
+            memory_quality=float(state.get("memory_quality", 0.0)),
+            task_type_hint=gate.get("task_type"),
+        )
+        return {"context_data": context_data}
+
     def _write_experience(self, state: EvoMeState) -> dict:
         gate = state["experience_gate"]
         if not gate.get("should_save"):
             return {"experience_saved": False, "experience_id": None}
 
         evaluation = state["evaluation"]
+        context_data = state.get("context_data", {})
+        task_type = str(context_data.get("task_type") or gate.get("task_type") or "other")
         experience = self.evolution_memory_service.save_experience(
             interaction_id=state["interaction_id"],
-            task_type=gate["task_type"],
+            task_type=task_type,
             strategy_name=self.name,
             strategy_version=self.version,
             skills_used=state.get("skills_used", []),
@@ -139,6 +174,7 @@ class DefaultConversationStrategy:
             success=bool(evaluation.get("success", False)),
             score=float(evaluation.get("score", 0.0)),
             experience_metadata={"gate_reason": gate.get("reason", "")},
+            context_data=context_data,
         )
         return {"experience_saved": True, "experience_id": experience.id}
 
@@ -149,31 +185,62 @@ class DefaultConversationStrategy:
     def _reflect_experience(self, state: EvoMeState) -> dict:
         gate = state["experience_gate"]
         reflection = self.reflection_service.reflect(
-            task_type=gate["task_type"],
+            task_type=str(state.get("context_data", {}).get("task_type") or gate["task_type"]),
             result_summary=gate["result_summary"],
             evaluation=state["evaluation"],
             strategy_name=f"{self.name}_v{self.version}",
             skills_used=state.get("skills_used", []),
+            context_data=state.get("context_data", {}),
         )
         return {"reflection": reflection}
 
     def _write_reflection(self, state: EvoMeState) -> dict:
         reflection = state.get("reflection", {})
-        observation = reflection.get("observation", "").strip()
-        lesson = reflection.get("lesson", "").strip()
-        if not observation and not lesson:
-            return {"reflection_saved": False}
+        observation = str(reflection.get("observation", "")).strip()
+        insight = str(reflection.get("insight", reflection.get("lesson", ""))).strip()
+        if not observation and not insight:
+            return {"reflection_saved": False, "reflection_id": None}
 
-        self.evolution_memory_service.save_reflection(
+        canonical_signal = ""
+        strategy_signal = str(reflection.get("strategy_signal", "")).strip()
+        if strategy_signal and insight:
+            canonical_signal = build_canonical_signal(
+                applicable_context=reflection.get("applicable_context", {}),
+                proposed_change=strategy_signal,
+                expected_effect=str(reflection.get("expected_effect", "")),
+                insight=insight,
+            )
+
+        record = self.evolution_memory_service.save_reflection(
             experience_id=state["experience_id"],
             reflection_type=reflection["reflection_type"],
             observation=observation,
-            lesson=lesson,
-            strategy_signal=reflection.get("strategy_signal", ""),
+            insight=insight,
+            applicable_context=reflection.get("applicable_context", {}),
+            expected_effect=str(reflection.get("expected_effect", "")),
+            canonical_signal=canonical_signal,
+            strategy_signal=strategy_signal,
             skill_signal=reflection.get("skill_signal", ""),
             confidence=reflection.get("confidence", 0.8),
         )
-        return {"reflection_saved": True}
+        return {"reflection_saved": True, "reflection_id": record.id}
+
+    @staticmethod
+    def _route_after_reflection(state: EvoMeState) -> str:
+        return "aggregate_hypothesis" if state.get("reflection_saved") else "end"
+
+    def _aggregate_hypothesis(self, state: EvoMeState) -> dict:
+        reflection_id = state.get("reflection_id")
+        if reflection_id is None:
+            return {"hypothesis_id": None, "hypothesis_action": "skipped"}
+        reflection = self.evolution_memory_service.db.get(ReflectionRecord, reflection_id)
+        if reflection is None:
+            return {"hypothesis_id": None, "hypothesis_action": "skipped"}
+        result = self.hypothesis_aggregator.process(reflection)
+        return {
+            "hypothesis_id": result.get("hypothesis_id"),
+            "hypothesis_action": result.get("action", "skipped"),
+        }
 
     def _build_graph(self):
         builder = StateGraph(EvoMeState)
@@ -184,9 +251,11 @@ class DefaultConversationStrategy:
         builder.add_node("personal_memory_gate", self._extract_personal_memory)
         builder.add_node("write_personal_memory", self._write_personal_memory)
         builder.add_node("experience_gate", self._experience_gate)
+        builder.add_node("build_context", self._build_context)
         builder.add_node("write_experience", self._write_experience)
         builder.add_node("reflect_experience", self._reflect_experience)
         builder.add_node("write_reflection", self._write_reflection)
+        builder.add_node("aggregate_hypothesis", self._aggregate_hypothesis)
 
         builder.add_edge(START, "retrieve_personal_memory")
         builder.add_edge("retrieve_personal_memory", "respond")
@@ -195,14 +264,20 @@ class DefaultConversationStrategy:
         builder.add_edge("record_interaction", "personal_memory_gate")
         builder.add_edge("personal_memory_gate", "write_personal_memory")
         builder.add_edge("write_personal_memory", "experience_gate")
-        builder.add_edge("experience_gate", "write_experience")
+        builder.add_edge("experience_gate", "build_context")
+        builder.add_edge("build_context", "write_experience")
         builder.add_conditional_edges(
             "write_experience",
             self._route_after_experience,
             {"reflect_experience": "reflect_experience", "end": END},
         )
         builder.add_edge("reflect_experience", "write_reflection")
-        builder.add_edge("write_reflection", END)
+        builder.add_conditional_edges(
+            "write_reflection",
+            self._route_after_reflection,
+            {"aggregate_hypothesis": "aggregate_hypothesis", "end": END},
+        )
+        builder.add_edge("aggregate_hypothesis", END)
         return builder.compile()
 
     def invoke(self, *, user_input: str, session_id: str) -> EvoMeState:
@@ -213,11 +288,16 @@ class DefaultConversationStrategy:
                 "strategy_version": self.version,
                 "session_id": session_id,
                 "relevant_memories": [],
+                "memory_quality": 0.0,
                 "skills_used": [],
                 "personal_memory_candidates": [],
                 "personal_memories_saved": 0,
+                "context_data": {},
                 "experience_saved": False,
                 "experience_id": None,
                 "reflection_saved": False,
+                "reflection_id": None,
+                "hypothesis_id": None,
+                "hypothesis_action": "skipped",
             }
         )

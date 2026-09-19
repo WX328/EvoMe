@@ -20,6 +20,7 @@ class EvolutionMemoryService:
         success: bool,
         score: float,
         experience_metadata: dict | None = None,
+        context_data: dict | None = None,
     ) -> Experience:
         experience = Experience(
             interaction_id=interaction_id,
@@ -31,6 +32,7 @@ class EvolutionMemoryService:
             success=success,
             score=max(0.0, min(1.0, score)),
             experience_metadata=experience_metadata or {},
+            context_data=context_data or {},
         )
         self.db.add(experience)
         self.db.commit()
@@ -43,7 +45,10 @@ class EvolutionMemoryService:
         experience_id: int,
         reflection_type: str,
         observation: str,
-        lesson: str,
+        insight: str,
+        applicable_context: dict | None = None,
+        expected_effect: str = "",
+        canonical_signal: str = "",
         strategy_signal: str = "",
         skill_signal: str = "",
         confidence: float = 0.8,
@@ -52,7 +57,11 @@ class EvolutionMemoryService:
             experience_id=experience_id,
             reflection_type=reflection_type,
             observation=observation,
-            lesson=lesson,
+            lesson=insight,  # 兼容 V0.1.1 schema/历史代码
+            insight=insight,
+            applicable_context=applicable_context or {},
+            expected_effect=expected_effect,
+            canonical_signal=canonical_signal,
             strategy_signal=strategy_signal,
             skill_signal=skill_signal,
             confidence=max(0.0, min(1.0, confidence)),

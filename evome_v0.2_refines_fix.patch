@@ -1,0 +1,300 @@
+diff --git a/app/hypothesis/aggregator.py b/app/hypothesis/aggregator.py
+index a88b25c..2a688ae 100644
+--- a/app/hypothesis/aggregator.py
++++ b/app/hypothesis/aggregator.py
+@@ -31,6 +31,9 @@ class HypothesisAggregator:
+         self.min_relation_confidence = min_relation_confidence
+ 
+     def sync_index(self) -> None:
++        # 启动时先按当前 Evidence 规则重算，修正旧 V0.2 数据中
++        # “REFINES 被当作 SUPPORTS”造成的错误成熟度。
++        self.service.recalculate_all()
+         for hypothesis in self.service.list_all(include_inactive=False):
+             self.retriever.index(hypothesis)
+ 
+@@ -83,7 +86,9 @@ class HypothesisAggregator:
+         judged: list[tuple[float, str, str, StrategyHypothesis]] = []
+         for match in matches:
+             hypothesis = self.service.get(match.hypothesis_id)
+-            if hypothesis is None or hypothesis.status not in {"observing", "ready_for_review"}:
++            if hypothesis is None or hypothesis.status not in {
++                "observing", "ready_for_review", "needs_revision"
++            }:
+                 continue
+             decision = self.relation_judge.judge(
+                 reflection_payload=self._reflection_payload(reflection),
+diff --git a/app/hypothesis/relation_judge.py b/app/hypothesis/relation_judge.py
+index fb01abb..1a18184 100644
+--- a/app/hypothesis/relation_judge.py
++++ b/app/hypothesis/relation_judge.py
+@@ -11,15 +11,16 @@ MODULE: HYPOTHESIS_RELATION_JUDGE
+ 判断“新的 Reflection”与“已有 Strategy Hypothesis”的语义关系。
+ 
+ 只能选择：
+-- SUPPORTS：本质上支持同一条规律，Context/Action/Expected Outcome 基本一致。
+-- REFINES：支持核心规律，但补充/收窄/修正了适用 Context 或行为边界。
++- SUPPORTS：直接支持“当前 Hypothesis 的现有表述”；Context/Action/Expected Outcome 基本一致，不需要修改当前 WHEN/DO/EXPECT。
++- REFINES：与核心规律相关，但新证据要求扩展、收窄或修正当前 WHEN/DO/EXPECT。REFINES 不是对当前表述的直接支持。
+ - CONFLICTS：在相近 Context 下给出相反证据，或表明原规律可能失效。
+ - UNRELATED：不是同一个行为规律。
+ 
+ 不要用文本相似度代替语义判断。重点比较：
+ 1. Context 是否相同/重叠；
+ 2. Proposed Change 是否同向；
+-3. Expected Effect 是否同一目标。
++3. Expected Effect 是否同一目标；
++4. 如果接纳新 Reflection 后必须改写当前 Hypothesis 的适用边界或行为描述，应判为 REFINES，而不是 SUPPORTS。
+ 
+ 严格 JSON：
+ {
+diff --git a/app/hypothesis/service.py b/app/hypothesis/service.py
+index 36f8165..0ba0bc5 100644
+--- a/app/hypothesis/service.py
++++ b/app/hypothesis/service.py
+@@ -15,7 +15,7 @@ from app.models import (
+ )
+ 
+ 
+-POSITIVE_RELATIONS = {"SUPPORTS", "REFINES"}
++ACTIVE_HYPOTHESIS_STATUSES = {"observing", "ready_for_review", "needs_revision"}
+ 
+ 
+ class HypothesisService:
+@@ -29,7 +29,7 @@ class HypothesisService:
+         stmt = select(StrategyHypothesis)
+         if not include_inactive:
+             stmt = stmt.where(
+-                StrategyHypothesis.status.in_({"observing", "ready_for_review"})
++                StrategyHypothesis.status.in_(ACTIVE_HYPOTHESIS_STATUSES)
+             )
+         stmt = stmt.order_by(StrategyHypothesis.updated_at.desc())
+         return list(self.db.scalars(stmt).all())
+@@ -149,23 +149,28 @@ class HypothesisService:
+             raise ValueError(f"Hypothesis #{hypothesis_id} 不存在")
+ 
+         rows = self._evidence_rows(hypothesis_id)
+-        supporting = [row for row in rows if row[0].relation_type in POSITIVE_RELATIONS]
++        supporting = [row for row in rows if row[0].relation_type == "SUPPORTS"]
++        refinements = [row for row in rows if row[0].relation_type == "REFINES"]
+         conflicts = [row for row in rows if row[0].relation_type == "CONFLICTS"]
+ 
+         independent_count = sum(1 for evidence, _, _ in rows if evidence.is_independent)
+-        signatures = {
++        independent_support_count = sum(
++            1 for evidence, _, _ in supporting if evidence.is_independent
++        )
++
++        # ready_for_review 只能由“直接支持当前表述”的证据推动。
++        # REFINES 说明当前 Hypothesis 的边界/表述仍需修订，因此不能扩大
++        # support diversity，也不能把当前版本推向成熟。
++        support_signatures = {
+             self._context_signature(experience.context_data or {})
+-            for _, _, experience in rows
++            for _, _, experience in supporting
+         }
+-        context_diversity = len(signatures)
+-
+-        positive_strength = 0.0
+-        for evidence, reflection, _ in supporting:
+-            relation_weight = 0.8 if evidence.relation_type == "REFINES" else 1.0
+-            positive_strength += (
+-                evidence.relation_confidence * reflection.confidence * relation_weight
+-            )
++        context_diversity = len(support_signatures)
+ 
++        positive_strength = sum(
++            evidence.relation_confidence * reflection.confidence
++            for evidence, reflection, _ in supporting
++        )
+         negative_strength = sum(
+             evidence.relation_confidence * reflection.confidence
+             for evidence, reflection, _ in conflicts
+@@ -174,24 +179,29 @@ class HypothesisService:
+         confidence = (
+             0.48
+             + min(0.30, positive_strength * 0.10)
+-            + min(0.15, max(0, independent_count - 1) * 0.05)
++            + min(0.15, max(0, independent_support_count - 1) * 0.05)
+             + min(0.10, max(0, context_diversity - 1) * 0.04)
+             - min(0.45, negative_strength * 0.12)
+         )
+         confidence = max(0.0, min(1.0, confidence))
+ 
+         hypothesis.supporting_count = len(supporting)
++        hypothesis.refinement_count = len(refinements)
+         hypothesis.counter_count = len(conflicts)
+         hypothesis.independent_evidence_count = independent_count
++        hypothesis.independent_support_count = independent_support_count
+         hypothesis.context_diversity = context_diversity
+         hypothesis.confidence = round(confidence, 4)
+         hypothesis.last_evidence_at = datetime.now()
+ 
+-        if hypothesis.status in {"observing", "ready_for_review"}:
+-            if (
++        if hypothesis.status in ACTIVE_HYPOTHESIS_STATUSES:
++            if hypothesis.refinement_count > 0:
++                hypothesis.status = "needs_revision"
++            elif (
+                 hypothesis.confidence >= 0.8
+-                and hypothesis.independent_evidence_count >= 3
++                and hypothesis.independent_support_count >= 3
+                 and hypothesis.context_diversity >= 2
++                and hypothesis.counter_count == 0
+             ):
+                 hypothesis.status = "ready_for_review"
+             else:
+@@ -200,3 +210,11 @@ class HypothesisService:
+         self.db.commit()
+         self.db.refresh(hypothesis)
+         return hypothesis
++
++    def recalculate_all(self) -> list[StrategyHypothesis]:
++        """按现有 Evidence 重新计算所有活动 Hypothesis。
++
++        用于规则修正后纠正旧数据库里把 REFINES 计入 support 的统计。
++        """
++        hypotheses = self.list_all(include_inactive=False)
++        return [self.recalculate(hypothesis.id) for hypothesis in hypotheses]
+diff --git a/app/migrations.py b/app/migrations.py
+index 11690b1..7327510 100644
+--- a/app/migrations.py
++++ b/app/migrations.py
+@@ -14,6 +14,10 @@ V0_2_SQLITE_COLUMNS = {
+         "expected_effect": "TEXT DEFAULT ''",
+         "canonical_signal": "TEXT DEFAULT ''",
+     },
++    "strategy_hypotheses": {
++        "refinement_count": "INTEGER DEFAULT 0",
++        "independent_support_count": "INTEGER DEFAULT 0",
++    },
+ }
+ 
+ 
+diff --git a/app/models.py b/app/models.py
+index ef1c076..0a18444 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -99,8 +99,10 @@ class StrategyHypothesis(Base):
+     revision: Mapped[int] = mapped_column(Integer, default=1)
+ 
+     supporting_count: Mapped[int] = mapped_column(Integer, default=0)
++    refinement_count: Mapped[int] = mapped_column(Integer, default=0)
+     counter_count: Mapped[int] = mapped_column(Integer, default=0)
+     independent_evidence_count: Mapped[int] = mapped_column(Integer, default=0)
++    independent_support_count: Mapped[int] = mapped_column(Integer, default=0)
+     context_diversity: Mapped[int] = mapped_column(Integer, default=0)
+ 
+     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+diff --git a/main.py b/main.py
+index 5382922..7ae15a5 100644
+--- a/main.py
++++ b/main.py
+@@ -65,8 +65,10 @@ def show_hypotheses(runtime: EvoMeRuntime) -> None:
+             f"WHEN: {h.applicable_context or {}}\n"
+             f"DO: {h.proposed_change}\n"
+             f"EXPECT: {h.expected_effect}\n"
+-            f"Evidence: support={h.supporting_count} counter={h.counter_count} "
+-            f"independent={h.independent_evidence_count} diversity={h.context_diversity}\n"
++            f"Evidence: support={h.supporting_count} refine={h.refinement_count} "
++            f"counter={h.counter_count} independent={h.independent_evidence_count} "
++            f"independent_support={h.independent_support_count} "
++            f"diversity={h.context_diversity}\n"
+         )
+ 
+ 
+diff --git a/tests/test_workflow.py b/tests/test_workflow.py
+index 6ed2c85..f464ff5 100644
+--- a/tests/test_workflow.py
++++ b/tests/test_workflow.py
+@@ -146,7 +146,91 @@ def test_similar_reflections_aggregate_into_one_hypothesis(db):
+ 
+     hypothesis = hypotheses[0]
+     assert hypothesis.supporting_count == 3
++    assert hypothesis.refinement_count == 0
+     assert hypothesis.independent_evidence_count == 3
++    assert hypothesis.independent_support_count == 3
+     assert hypothesis.context_diversity >= 2
+     assert hypothesis.confidence >= 0.8
+     assert hypothesis.status == "ready_for_review"
++
++
++def test_refines_does_not_promote_current_hypothesis(db):
++    from app.evolution.service import EvolutionMemoryService
++    from app.hypothesis.service import HypothesisService
++
++    evolution = EvolutionMemoryService(db)
++    service = HypothesisService(db)
++
++    def make_reflection(*, interaction_id: int, complexity: str, relation_seed: str):
++        experience = evolution.save_experience(
++            interaction_id=interaction_id,
++            task_type="architecture_design",
++            strategy_name="default_conversation_strategy",
++            strategy_version=2,
++            skills_used=["recall_relevant_memory"],
++            result_summary=relation_seed,
++            success=True,
++            score=0.95,
++            context_data={
++                "task_type": "architecture_design",
++                "complexity": complexity,
++                "interaction_mode": "collaborative",
++                "project_stage": "design",
++            },
++        )
++        return evolution.save_reflection(
++            experience_id=experience.id,
++            reflection_type="pattern",
++            observation=relation_seed,
++            insight="复杂架构设计需要结构化职责边界分析",
++            applicable_context={
++                "task_type": "architecture_design",
++                "complexity": complexity,
++                "interaction_mode": "collaborative",
++                "project_stage": "design",
++            },
++            expected_effect="减少返工",
++            canonical_signal=relation_seed,
++            strategy_signal="执行前分析职责边界和数据流",
++            confidence=0.9,
++        )
++
++    first = make_reflection(
++        interaction_id=101, complexity="high", relation_seed="support-1"
++    )
++    hypothesis = service.create_from_reflection(
++        reflection=first, canonical_signal=first.canonical_signal
++    )
++
++    second = make_reflection(
++        interaction_id=102, complexity="high", relation_seed="support-2"
++    )
++    service.add_evidence(
++        hypothesis=hypothesis,
++        reflection=second,
++        relation_type="SUPPORTS",
++        relation_confidence=0.95,
++        relation_reason="直接支持当前表述",
++    )
++
++    refinement = make_reflection(
++        interaction_id=103,
++        complexity="medium",
++        relation_seed="refine-medium-context",
++    )
++    service.add_evidence(
++        hypothesis=hypothesis,
++        reflection=refinement,
++        relation_type="REFINES",
++        relation_confidence=0.95,
++        relation_reason="说明规律可能从 high 扩展到 medium",
++    )
++
++    updated = service.get(hypothesis.id)
++    assert updated is not None
++    assert updated.supporting_count == 2
++    assert updated.refinement_count == 1
++    assert updated.independent_evidence_count == 3
++    assert updated.independent_support_count == 2
++    assert updated.status == "needs_revision"
++    assert updated.status != "ready_for_review"

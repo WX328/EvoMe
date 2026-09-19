@@ -8,6 +8,7 @@ class EvoMeState(TypedDict, total=False):
     session_id: str
 
     relevant_memories: list[str]
+    memory_quality: float
     skills_used: list[str]
     response: str
     evaluation: dict[str, Any]
@@ -17,8 +18,13 @@ class EvoMeState(TypedDict, total=False):
     personal_memories_saved: int
 
     experience_gate: dict[str, Any]
+    context_data: dict[str, Any]
     experience_id: int | None
     experience_saved: bool
 
     reflection: dict[str, Any]
+    reflection_id: int | None
     reflection_saved: bool
+
+    hypothesis_id: int | None
+    hypothesis_action: str

@@ -1,9 +1,11 @@
 from app.database import Base, engine, SessionLocal
+from app.migrations import migrate_v0_2
 from app.runtime import EvoMeRuntime
 
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    migrate_v0_2(engine)
 
 
 def show_personal_memories(runtime: EvoMeRuntime) -> None:
@@ -24,8 +26,12 @@ def show_experiences(runtime: EvoMeRuntime) -> None:
     if not items:
         print("暂无 Experience")
     for e in items:
+        context = e.context_data or {}
         print(
             f"#{e.id} [{e.task_type}] score={e.score:.2f} success={e.success}\n"
+            f"Context: {context.get('task_type', 'unknown')} / "
+            f"{context.get('complexity', 'unknown')} / "
+            f"{context.get('interaction_mode', 'unknown')}\n"
             f"{e.result_summary}\n"
         )
 
@@ -36,11 +42,33 @@ def show_reflections(runtime: EvoMeRuntime) -> None:
     if not items:
         print("暂无 Reflection")
     for r in items:
+        insight = r.insight or r.lesson
         print(
             f"#{r.id} [{r.reflection_type}] confidence={r.confidence:.2f}\n"
-            f"观察: {r.observation}\n经验: {r.lesson}\n"
+            f"观察: {r.observation}\n"
+            f"Insight: {insight}\n"
+            f"Applicable Context: {r.applicable_context or {}}\n"
             f"Strategy Signal: {r.strategy_signal}\n"
             f"Skill Signal: {r.skill_signal}\n"
+        )
+
+
+def show_hypotheses(runtime: EvoMeRuntime) -> None:
+    print("\n===== Strategy Hypotheses =====")
+    items = runtime.list_hypotheses()
+    if not items:
+        print("暂无 Strategy Hypothesis")
+    for h in items:
+        print(
+            f"H#{h.id} [{h.status}] confidence={h.confidence:.2f} revision={h.revision}\n"
+            f"{h.title}\n"
+            f"WHEN: {h.applicable_context or {}}\n"
+            f"DO: {h.proposed_change}\n"
+            f"EXPECT: {h.expected_effect}\n"
+            f"Evidence: support={h.supporting_count} refine={h.refinement_count} "
+            f"counter={h.counter_count} independent={h.independent_evidence_count} "
+            f"independent_support={h.independent_support_count} "
+            f"diversity={h.context_diversity}\n"
         )
 
 
@@ -68,8 +96,11 @@ def show_skills(runtime: EvoMeRuntime) -> None:
 
 def main() -> None:
     init_db()
-    print("🌱 EvoMe V0.1.1 Core")
-    print("命令：/memory  /experience  /reflection  /audit  /skills  /exit\n")
+    print("🌱 EvoMe V0.2 Core")
+    print(
+        "命令：/memory  /experience  /reflection  /hypothesis  "
+        "/audit  /skills  /exit\n"
+    )
 
     with SessionLocal() as db:
         runtime = EvoMeRuntime(db)
@@ -86,6 +117,8 @@ def main() -> None:
                 show_experiences(runtime); continue
             if user_input == "/reflection":
                 show_reflections(runtime); continue
+            if user_input == "/hypothesis":
+                show_hypotheses(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
             if user_input == "/skills":
@@ -101,7 +134,8 @@ def main() -> None:
                     f"interaction={result['interaction_id']} "
                     f"personal_memory+={result['personal_memories_saved']} "
                     f"experience={result['experience_saved']} "
-                    f"reflection={result['reflection_saved']}\n"
+                    f"reflection={result['reflection_saved']} "
+                    f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']}\n"
                 )
             except Exception as exc:
                 print(f"\n❌ EvoMe Error: {exc}\n")

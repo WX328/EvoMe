@@ -4,10 +4,22 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.audit.service import AuditService
+from app.config import (
+    DEEPSEEK_MODEL,
+    EVOME_QDRANT_PATH,
+    HYPOTHESIS_RELATION_CONFIDENCE,
+    HYPOTHESIS_SCORE_THRESHOLD,
+    HYPOTHESIS_TOP_K,
+)
+from app.context.builder import ContextBuilder
 from app.evaluation.service import EvaluationService
 from app.evolution.service import EvolutionMemoryService
 from app.gates.experience_gate import ExperienceGate
 from app.gates.personal_memory_gate import PersonalMemoryGate
+from app.hypothesis.aggregator import HypothesisAggregator
+from app.hypothesis.relation_judge import HypothesisRelationJudge
+from app.hypothesis.retriever import HybridHypothesisRetriever
+from app.hypothesis.service import HypothesisService
 from app.llm import DeepSeekClient
 from app.memory.service import PersonalMemoryService
 from app.models import StrategyRecord
@@ -25,11 +37,28 @@ class EvoMeRuntime:
         self.audit_service = AuditService(db)
         self.personal_memory_service = PersonalMemoryService(db)
         self.evolution_memory_service = EvolutionMemoryService(db)
+        self.hypothesis_service = HypothesisService(db)
+
         self.personal_memory_gate = PersonalMemoryGate(self.llm)
         self.experience_gate = ExperienceGate(self.llm)
+        self.context_builder = ContextBuilder(self.llm, model_name=DEEPSEEK_MODEL)
         self.reflection_service = ReflectionService(self.llm)
         self.evaluation_service = EvaluationService(self.llm)
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
+
+        self.hypothesis_retriever = HybridHypothesisRetriever(
+            db, qdrant_path=EVOME_QDRANT_PATH
+        )
+        self.hypothesis_relation_judge = HypothesisRelationJudge(self.llm)
+        self.hypothesis_aggregator = HypothesisAggregator(
+            db,
+            relation_judge=self.hypothesis_relation_judge,
+            retriever=self.hypothesis_retriever,
+            top_k=HYPOTHESIS_TOP_K,
+            score_threshold=HYPOTHESIS_SCORE_THRESHOLD,
+            min_relation_confidence=HYPOTHESIS_RELATION_CONFIDENCE,
+        )
+        self.hypothesis_aggregator.sync_index()
 
         self.strategy = DefaultConversationStrategy(
             llm=self.llm,
@@ -37,8 +66,10 @@ class EvoMeRuntime:
             personal_memory_service=self.personal_memory_service,
             personal_memory_gate=self.personal_memory_gate,
             experience_gate=self.experience_gate,
+            context_builder=self.context_builder,
             evolution_memory_service=self.evolution_memory_service,
             reflection_service=self.reflection_service,
+            hypothesis_aggregator=self.hypothesis_aggregator,
             evaluation_service=self.evaluation_service,
             skill_registry=self.skill_registry,
         )
@@ -61,7 +92,8 @@ class EvoMeRuntime:
                 status="active",
                 description=(
                     "Retrieve Personal Memory -> Respond -> Evaluate -> Audit -> "
-                    "Personal Memory Gate -> Experience Gate -> Reflection"
+                    "Personal Memory Gate -> Experience Gate -> Context Builder -> "
+                    "Reflection -> Strategy Hypothesis Aggregation"
                 ),
             )
             self.db.add(record)
@@ -99,6 +131,9 @@ class EvoMeRuntime:
             "personal_memories_saved": state.get("personal_memories_saved", 0),
             "experience_saved": bool(state.get("experience_saved", False)),
             "reflection_saved": bool(state.get("reflection_saved", False)),
+            "context_data": state.get("context_data", {}),
+            "hypothesis_id": state.get("hypothesis_id"),
+            "hypothesis_action": state.get("hypothesis_action", "skipped"),
         }
 
     def list_personal_memories(self):
@@ -109,6 +144,9 @@ class EvoMeRuntime:
 
     def list_reflections(self):
         return self.evolution_memory_service.list_reflections()
+
+    def list_hypotheses(self):
+        return self.hypothesis_service.list_all()
 
     def list_interactions(self, limit: int = 20):
         return self.audit_service.list_recent(limit=limit)
