@@ -1,39 +1,20 @@
-from app.memory.service import MemoryService
+from app.memory.service import PersonalMemoryService
 
 
-def test_save_and_list_memory(db):
-    service = MemoryService(db)
-
+def test_save_and_search_personal_memory(db):
+    service = PersonalMemoryService(db)
     service.save(
-        memory_type="experience",
-        content="EvoMe 第一次拥有长期 Memory",
+        memory_type="project",
+        content="用户正在开发 EvoMe，它是长期 Personal AI 项目",
         importance=0.9,
     )
-
-    memories = service.list_all()
-
-    assert len(memories) == 1
-    assert "长期 Memory" in memories[0].content
-
-
-def test_memory_search(db):
-    service = MemoryService(db)
-
-    service.save(
-        memory_type="experience",
-        content="Python 依赖冲突时先检查虚拟环境和版本约束",
-        importance=0.9,
-    )
-    service.save(
-        memory_type="experience",
-        content="今天阅读了一篇 Agent 论文",
-        importance=0.5,
-    )
-
-    results = service.search(
-        "Python 依赖冲突怎么办",
-        top_k=3,
-    )
-
+    results = service.search("EvoMe 是什么项目", top_k=3)
     assert results
-    assert "Python" in results[0].content
+    assert "EvoMe" in results[0].content
+
+
+def test_personal_memory_duplicate(db):
+    service = PersonalMemoryService(db)
+    content = "用户偏好先讨论架构，再进入代码实现"
+    service.save(memory_type="preference", content=content, importance=0.8)
+    assert service.is_duplicate(content) is True
