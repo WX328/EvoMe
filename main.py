@@ -1,11 +1,12 @@
 from app.database import Base, engine, SessionLocal
-from app.migrations import migrate_v0_2
+from app.migrations import migrate_v0_2, migrate_v0_2_1
 from app.runtime import EvoMeRuntime
 
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     migrate_v0_2(engine)
+    migrate_v0_2_1(engine)
 
 
 def show_personal_memories(runtime: EvoMeRuntime) -> None:
@@ -60,7 +61,7 @@ def show_hypotheses(runtime: EvoMeRuntime) -> None:
         print("暂无 Strategy Hypothesis")
     for h in items:
         print(
-            f"H#{h.id} [{h.status}] confidence={h.confidence:.2f} revision={h.revision}\n"
+            f"H#{h.id} [{h.status}] confidence={h.confidence:.2f} revision={h.current_revision}\n"
             f"{h.title}\n"
             f"WHEN: {h.applicable_context or {}}\n"
             f"DO: {h.proposed_change}\n"
@@ -70,6 +71,25 @@ def show_hypotheses(runtime: EvoMeRuntime) -> None:
             f"independent_support={h.independent_support_count} "
             f"diversity={h.context_diversity}\n"
         )
+
+
+def show_revisions(runtime: EvoMeRuntime) -> None:
+    print("\n===== Hypothesis Revisions =====")
+    hypotheses = runtime.list_hypotheses()
+    if not hypotheses:
+        print("暂无 Hypothesis Revision")
+        return
+    for hypothesis in hypotheses:
+        revisions = runtime.list_hypothesis_revisions(hypothesis.id)
+        for revision in revisions:
+            marker = " *current" if revision.revision_number == hypothesis.current_revision else ""
+            print(
+                f"H#{hypothesis.id}:r{revision.revision_number}{marker} "
+                f"reason={revision.created_reason}\n"
+                f"WHEN: {revision.when_data or {}}\n"
+                f"DO: {revision.do_data or {}}\n"
+                f"EXPECT: {revision.expect_data or {}}\n"
+            )
 
 
 def show_interactions(runtime: EvoMeRuntime) -> None:
@@ -96,9 +116,9 @@ def show_skills(runtime: EvoMeRuntime) -> None:
 
 def main() -> None:
     init_db()
-    print("🌱 EvoMe V0.2 Core")
+    print("🌱 EvoMe V0.2.1-dev Core")
     print(
-        "命令：/memory  /experience  /reflection  /hypothesis  "
+        "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
         "/audit  /skills  /exit\n"
     )
 
@@ -119,6 +139,8 @@ def main() -> None:
                 show_reflections(runtime); continue
             if user_input == "/hypothesis":
                 show_hypotheses(runtime); continue
+            if user_input == "/revision":
+                show_revisions(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
             if user_input == "/skills":

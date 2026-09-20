@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 evome.db
+# Local Qdrant vector index
+evome_qdrant/

@@ -96,7 +96,9 @@ class StrategyHypothesis(Base):
 
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     status: Mapped[str] = mapped_column(String(32), default="observing", index=True)
+    # V0.2 compatibility: revision 暂时保留，并与 current_revision 镜像。
     revision: Mapped[int] = mapped_column(Integer, default=1)
+    current_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
 
     supporting_count: Mapped[int] = mapped_column(Integer, default=0)
     refinement_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -112,12 +114,18 @@ class StrategyHypothesis(Base):
     last_evidence_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
-class HypothesisEvidence(Base):
-    """Reflection 与 StrategyHypothesis 之间的证据关系。"""
-    __tablename__ = "hypothesis_evidence"
+class HypothesisRevision(Base):
+    """StrategyHypothesis 的不可变认知快照。
+
+    同一个 hypothesis_id 下通过 revision_number 形成 r1/r2/r3... 历史。
+    V0.2.1 第一阶段只建立版本地基，不自动生成新 Revision。
+    """
+    __tablename__ = "hypothesis_revisions"
     __table_args__ = (
         UniqueConstraint(
-            "hypothesis_id", "reflection_id", name="uq_hypothesis_reflection_evidence"
+            "hypothesis_id",
+            "revision_number",
+            name="uq_hypothesis_revision_number",
         ),
     )
 
@@ -125,6 +133,40 @@ class HypothesisEvidence(Base):
     hypothesis_id: Mapped[int] = mapped_column(
         ForeignKey("strategy_hypotheses.id"), index=True
     )
+    revision_number: Mapped[int] = mapped_column(Integer, index=True)
+
+    title: Mapped[str] = mapped_column(String(200))
+    canonical_signal: Mapped[str] = mapped_column(Text)
+    insight: Mapped[str] = mapped_column(Text)
+
+    # Revision 层从一开始就保留机器可比较的 WHEN / DO / EXPECT。
+    # 对 V0.2 旧数据不做语义猜测：WHEN 直接迁移 applicable_context，
+    # DO/EXPECT 先以 {"text": ...} 形式无损保存。
+    when_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    do_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    expect_data: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    created_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class HypothesisEvidence(Base):
+    """Reflection 与 StrategyHypothesis 之间的证据关系。"""
+    __tablename__ = "hypothesis_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "hypothesis_id",
+            "hypothesis_revision",
+            "reflection_id",
+            name="uq_hypothesis_revision_reflection_evidence",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    hypothesis_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
     reflection_id: Mapped[int] = mapped_column(
         ForeignKey("reflection_records.id"), index=True
     )

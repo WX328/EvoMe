@@ -82,7 +82,7 @@ class QdrantHypothesisRetriever:
                     payload={
                         "hypothesis_id": hypothesis.id,
                         "status": hypothesis.status,
-                        "revision": hypothesis.revision,
+                        "revision": hypothesis.current_revision,
                     },
                 )
             ],

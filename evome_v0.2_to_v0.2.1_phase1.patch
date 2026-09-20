@@ -1,0 +1,1622 @@
+diff --git a/app/hypothesis/retriever.py b/app/hypothesis/retriever.py
+index 7f63501..75be7d5 100644
+--- a/app/hypothesis/retriever.py
++++ b/app/hypothesis/retriever.py
+@@ -82,7 +82,7 @@ class QdrantHypothesisRetriever:
+                     payload={
+                         "hypothesis_id": hypothesis.id,
+                         "status": hypothesis.status,
+-                        "revision": hypothesis.revision,
++                        "revision": hypothesis.current_revision,
+                     },
+                 )
+             ],
+diff --git a/app/hypothesis/service.py b/app/hypothesis/service.py
+index 0ba0bc5..48cf29a 100644
+--- a/app/hypothesis/service.py
++++ b/app/hypothesis/service.py
+@@ -10,6 +10,7 @@ from app.hypothesis.canonical import build_hypothesis_title
+ from app.models import (
+     Experience,
+     HypothesisEvidence,
++    HypothesisRevision,
+     ReflectionRecord,
+     StrategyHypothesis,
+ )
+@@ -34,6 +35,92 @@ class HypothesisService:
+         stmt = stmt.order_by(StrategyHypothesis.updated_at.desc())
+         return list(self.db.scalars(stmt).all())
+ 
++    def get_revision(
++        self,
++        hypothesis_id: int,
++        revision_number: int,
++    ) -> HypothesisRevision | None:
++        stmt = select(HypothesisRevision).where(
++            HypothesisRevision.hypothesis_id == hypothesis_id,
++            HypothesisRevision.revision_number == revision_number,
++        )
++        return self.db.scalar(stmt)
++
++    def list_revisions(self, hypothesis_id: int) -> list[HypothesisRevision]:
++        stmt = (
++            select(HypothesisRevision)
++            .where(HypothesisRevision.hypothesis_id == hypothesis_id)
++            .order_by(HypothesisRevision.revision_number.asc())
++        )
++        return list(self.db.scalars(stmt).all())
++
++    def create_revision_snapshot(
++        self,
++        *,
++        hypothesis_id: int,
++        revision_number: int,
++        title: str,
++        canonical_signal: str,
++        insight: str,
++        when_data: dict[str, Any],
++        do_data: dict[str, Any],
++        expect_data: dict[str, Any],
++        created_reason: str,
++        commit: bool = True,
++    ) -> HypothesisRevision:
++        """创建不可变 Revision 快照。
++
++        已存在的 (hypothesis_id, revision_number) 永远不覆盖；调用方必须创建新版本。
++        """
++        hypothesis = self.get(hypothesis_id)
++        if hypothesis is None:
++            raise ValueError(f"Hypothesis #{hypothesis_id} 不存在")
++
++        if self.get_revision(hypothesis_id, revision_number) is not None:
++            raise ValueError(
++                f"Hypothesis #{hypothesis_id}:r{revision_number} 已存在；"
++                "Revision 是不可变快照，不能原地覆盖"
++            )
++
++        revision = HypothesisRevision(
++            hypothesis_id=hypothesis_id,
++            revision_number=revision_number,
++            title=title,
++            canonical_signal=canonical_signal,
++            insight=insight,
++            when_data=when_data or {},
++            do_data=do_data or {},
++            expect_data=expect_data or {},
++            created_reason=created_reason,
++        )
++        self.db.add(revision)
++        if commit:
++            self.db.commit()
++            self.db.refresh(revision)
++        else:
++            self.db.flush()
++        return revision
++
++    def _snapshot_current_hypothesis(
++        self,
++        hypothesis: StrategyHypothesis,
++        *,
++        created_reason: str,
++        commit: bool = True,
++    ) -> HypothesisRevision:
++        return self.create_revision_snapshot(
++            hypothesis_id=hypothesis.id,
++            revision_number=hypothesis.current_revision,
++            title=hypothesis.title,
++            canonical_signal=hypothesis.canonical_signal,
++            insight=hypothesis.insight,
++            when_data=hypothesis.applicable_context or {},
++            do_data={"text": hypothesis.proposed_change},
++            expect_data={"text": hypothesis.expected_effect},
++            created_reason=created_reason,
++            commit=commit,
++        )
++
+     def create_from_reflection(
+         self,
+         *,
+@@ -50,8 +137,16 @@ class HypothesisService:
+             confidence=0.5,
+             status="observing",
+             revision=1,
++            current_revision=1,
+         )
+         self.db.add(hypothesis)
++        self.db.flush()
++
++        self._snapshot_current_hypothesis(
++            hypothesis,
++            created_reason="created_from_first_supporting_reflection",
++            commit=False,
++        )
+         self.db.commit()
+         self.db.refresh(hypothesis)
+ 
+@@ -61,6 +156,7 @@ class HypothesisService:
+             relation_type="SUPPORTS",
+             relation_confidence=reflection.confidence,
+             relation_reason="创建 Hypothesis 的首条 Reflection 证据",
++            revision_number=1,
+         )
+         return hypothesis
+ 
+@@ -72,7 +168,11 @@ class HypothesisService:
+         )
+         return self.db.scalar(stmt)
+ 
+-    def _existing_interaction_ids(self, hypothesis_id: int) -> set[int]:
++    def _existing_interaction_ids(
++        self,
++        hypothesis_id: int,
++        revision_number: int,
++    ) -> set[int]:
+         stmt = (
+             select(Experience.interaction_id)
+             .join(ReflectionRecord, ReflectionRecord.experience_id == Experience.id)
+@@ -80,7 +180,10 @@ class HypothesisService:
+                 HypothesisEvidence,
+                 HypothesisEvidence.reflection_id == ReflectionRecord.id,
+             )
+-            .where(HypothesisEvidence.hypothesis_id == hypothesis_id)
++            .where(
++                HypothesisEvidence.hypothesis_id == hypothesis_id,
++                HypothesisEvidence.hypothesis_revision == revision_number,
++            )
+         )
+         return {int(item) for item in self.db.scalars(stmt).all() if item is not None}
+ 
+@@ -92,10 +195,20 @@ class HypothesisService:
+         relation_type: str,
+         relation_confidence: float,
+         relation_reason: str = "",
++        revision_number: int | None = None,
++        recalculate_current: bool = True,
+     ) -> HypothesisEvidence:
++        target_revision = int(revision_number or hypothesis.current_revision or 1)
++        if self.get_revision(hypothesis.id, target_revision) is None:
++            raise ValueError(
++                f"Hypothesis #{hypothesis.id}:r{target_revision} 不存在，"
++                "不能绑定 Evidence"
++            )
++
+         existing = self.db.scalar(
+             select(HypothesisEvidence).where(
+                 HypothesisEvidence.hypothesis_id == hypothesis.id,
++                HypothesisEvidence.hypothesis_revision == target_revision,
+                 HypothesisEvidence.reflection_id == reflection.id,
+             )
+         )
+@@ -103,11 +216,17 @@ class HypothesisService:
+             return existing
+ 
+         interaction_id = self._interaction_id_for_reflection(reflection.id)
+-        previous_interactions = self._existing_interaction_ids(hypothesis.id)
+-        is_independent = interaction_id is not None and interaction_id not in previous_interactions
++        previous_interactions = self._existing_interaction_ids(
++            hypothesis.id,
++            target_revision,
++        )
++        is_independent = (
++            interaction_id is not None and interaction_id not in previous_interactions
++        )
+ 
+         evidence = HypothesisEvidence(
+             hypothesis_id=hypothesis.id,
++            hypothesis_revision=target_revision,
+             reflection_id=reflection.id,
+             relation_type=relation_type,
+             relation_confidence=max(0.0, min(1.0, float(relation_confidence))),
+@@ -117,7 +236,9 @@ class HypothesisService:
+         self.db.add(evidence)
+         self.db.commit()
+         self.db.refresh(evidence)
+-        self.recalculate(hypothesis.id)
++
++        if recalculate_current and target_revision == hypothesis.current_revision:
++            self.recalculate(hypothesis.id)
+         return evidence
+ 
+     @staticmethod
+@@ -130,7 +251,9 @@ class HypothesisService:
+         )
+ 
+     def _evidence_rows(
+-        self, hypothesis_id: int
++        self,
++        hypothesis_id: int,
++        revision_number: int,
+     ) -> list[tuple[HypothesisEvidence, ReflectionRecord, Experience]]:
+         stmt = (
+             select(HypothesisEvidence, ReflectionRecord, Experience)
+@@ -139,16 +262,24 @@ class HypothesisService:
+                 ReflectionRecord.id == HypothesisEvidence.reflection_id,
+             )
+             .join(Experience, Experience.id == ReflectionRecord.experience_id)
+-            .where(HypothesisEvidence.hypothesis_id == hypothesis_id)
++            .where(
++                HypothesisEvidence.hypothesis_id == hypothesis_id,
++                HypothesisEvidence.hypothesis_revision == revision_number,
++            )
+         )
+         return list(self.db.execute(stmt).all())
+ 
+-    def recalculate(self, hypothesis_id: int) -> StrategyHypothesis:
+-        hypothesis = self.db.get(StrategyHypothesis, hypothesis_id)
+-        if hypothesis is None:
+-            raise ValueError(f"Hypothesis #{hypothesis_id} 不存在")
++    def get_revision_stats(
++        self,
++        hypothesis_id: int,
++        revision_number: int,
++    ) -> dict[str, Any]:
++        if self.get_revision(hypothesis_id, revision_number) is None:
++            raise ValueError(
++                f"Hypothesis #{hypothesis_id}:r{revision_number} 不存在"
++            )
+ 
+-        rows = self._evidence_rows(hypothesis_id)
++        rows = self._evidence_rows(hypothesis_id, revision_number)
+         supporting = [row for row in rows if row[0].relation_type == "SUPPORTS"]
+         refinements = [row for row in rows if row[0].relation_type == "REFINES"]
+         conflicts = [row for row in rows if row[0].relation_type == "CONFLICTS"]
+@@ -158,9 +289,6 @@ class HypothesisService:
+             1 for evidence, _, _ in supporting if evidence.is_independent
+         )
+ 
+-        # ready_for_review 只能由“直接支持当前表述”的证据推动。
+-        # REFINES 说明当前 Hypothesis 的边界/表述仍需修订，因此不能扩大
+-        # support diversity，也不能把当前版本推向成熟。
+         support_signatures = {
+             self._context_signature(experience.context_data or {})
+             for _, _, experience in supporting
+@@ -185,13 +313,31 @@ class HypothesisService:
+         )
+         confidence = max(0.0, min(1.0, confidence))
+ 
+-        hypothesis.supporting_count = len(supporting)
+-        hypothesis.refinement_count = len(refinements)
+-        hypothesis.counter_count = len(conflicts)
+-        hypothesis.independent_evidence_count = independent_count
+-        hypothesis.independent_support_count = independent_support_count
+-        hypothesis.context_diversity = context_diversity
+-        hypothesis.confidence = round(confidence, 4)
++        return {
++            "supporting_count": len(supporting),
++            "refinement_count": len(refinements),
++            "counter_count": len(conflicts),
++            "independent_evidence_count": independent_count,
++            "independent_support_count": independent_support_count,
++            "context_diversity": context_diversity,
++            "confidence": round(confidence, 4),
++        }
++
++    def recalculate(self, hypothesis_id: int) -> StrategyHypothesis:
++        hypothesis = self.db.get(StrategyHypothesis, hypothesis_id)
++        if hypothesis is None:
++            raise ValueError(f"Hypothesis #{hypothesis_id} 不存在")
++
++        current_revision = int(hypothesis.current_revision or hypothesis.revision or 1)
++        stats = self.get_revision_stats(hypothesis_id, current_revision)
++
++        hypothesis.supporting_count = stats["supporting_count"]
++        hypothesis.refinement_count = stats["refinement_count"]
++        hypothesis.counter_count = stats["counter_count"]
++        hypothesis.independent_evidence_count = stats["independent_evidence_count"]
++        hypothesis.independent_support_count = stats["independent_support_count"]
++        hypothesis.context_diversity = stats["context_diversity"]
++        hypothesis.confidence = stats["confidence"]
+         hypothesis.last_evidence_at = datetime.now()
+ 
+         if hypothesis.status in ACTIVE_HYPOTHESIS_STATUSES:
+@@ -211,10 +357,41 @@ class HypothesisService:
+         self.db.refresh(hypothesis)
+         return hypothesis
+ 
+-    def recalculate_all(self) -> list[StrategyHypothesis]:
+-        """按现有 Evidence 重新计算所有活动 Hypothesis。
++    def activate_revision(
++        self,
++        hypothesis_id: int,
++        revision_number: int,
++    ) -> StrategyHypothesis:
++        """切换 current revision 的受控入口。
+ 
+-        用于规则修正后纠正旧数据库里把 REFINES 计入 support 的统计。
++        V0.2.1 第一阶段只提供版本切换地基；Risk Gate / EvolutionEvent 将在后续阶段接入。
+         """
++        hypothesis = self.get(hypothesis_id)
++        if hypothesis is None:
++            raise ValueError(f"Hypothesis #{hypothesis_id} 不存在")
++        revision = self.get_revision(hypothesis_id, revision_number)
++        if revision is None:
++            raise ValueError(
++                f"Hypothesis #{hypothesis_id}:r{revision_number} 不存在"
++            )
++
++        hypothesis.current_revision = revision_number
++        hypothesis.revision = revision_number  # V0.2 compatibility mirror
++
++        # StrategyHypothesis 暂时保留 current-head 内容，避免上层 Retriever/Aggregator
++        # 在第一阶段同时大改；内容来源始终是不可变 Revision snapshot。
++        hypothesis.title = revision.title
++        hypothesis.canonical_signal = revision.canonical_signal
++        hypothesis.insight = revision.insight
++        hypothesis.applicable_context = revision.when_data or {}
++        hypothesis.proposed_change = str((revision.do_data or {}).get("text", ""))
++        hypothesis.expected_effect = str((revision.expect_data or {}).get("text", ""))
++
++        self.db.commit()
++        self.db.refresh(hypothesis)
++        return self.recalculate(hypothesis_id)
++
++    def recalculate_all(self) -> list[StrategyHypothesis]:
++        """按各 Hypothesis 的 current revision 重新计算活动 Hypothesis。"""
+         hypotheses = self.list_all(include_inactive=False)
+         return [self.recalculate(hypothesis.id) for hypothesis in hypotheses]
+diff --git a/app/migrations.py b/app/migrations.py
+index 7327510..39cf021 100644
+--- a/app/migrations.py
++++ b/app/migrations.py
+@@ -1,8 +1,13 @@
+ from __future__ import annotations
+ 
++import json
++from datetime import datetime
++
+ from sqlalchemy import inspect, text
+ from sqlalchemy.engine import Engine
+ 
++from app.models import HypothesisEvidence, HypothesisRevision
++
+ 
+ V0_2_SQLITE_COLUMNS = {
+     "experiences": {
+@@ -21,6 +26,13 @@ V0_2_SQLITE_COLUMNS = {
+ }
+ 
+ 
++V0_2_1_SQLITE_COLUMNS = {
++    "strategy_hypotheses": {
++        "current_revision": "INTEGER DEFAULT 1",
++    },
++}
++
++
+ def migrate_v0_2(engine: Engine) -> None:
+     """对 V0.1.1 SQLite 数据库做非破坏性 V0.2 增量迁移。
+ 
+@@ -48,3 +60,237 @@ def migrate_v0_2(engine: Engine) -> None:
+                         f'ADD COLUMN "{column_name}" {definition}'
+                     )
+                 )
++
++
++def _sqlite_rebuild_hypothesis_evidence(engine: Engine) -> None:
++    """把 V0.2 evidence 表升级为 revision-aware schema。
++
++    SQLite 不能直接删除旧 UNIQUE(hypothesis_id, reflection_id)，因此必须重建表。
++    迁移保持 id、关系类型、置信度与时间不变，并把所有旧证据绑定到 revision=1。
++    """
++    inspector = inspect(engine)
++    if "hypothesis_evidence" not in inspector.get_table_names():
++        return
++
++    columns = {column["name"] for column in inspector.get_columns("hypothesis_evidence")}
++    unique_constraints = inspector.get_unique_constraints("hypothesis_evidence")
++    has_revision = "hypothesis_revision" in columns
++    has_revision_unique = any(
++        set(item.get("column_names") or [])
++        == {"hypothesis_id", "hypothesis_revision", "reflection_id"}
++        for item in unique_constraints
++    )
++    if has_revision and has_revision_unique:
++        return
++
++    backup = "hypothesis_evidence_v0_2_backup"
++    with engine.begin() as conn:
++        conn.execute(text("PRAGMA foreign_keys=OFF"))
++        conn.execute(text(f'DROP TABLE IF EXISTS "{backup}"'))
++        conn.execute(text(f'ALTER TABLE "hypothesis_evidence" RENAME TO "{backup}"'))
++
++        # 旧表被 rename 后，其普通索引名仍占用 namespace。先删除，随后 ORM
++        # 为新表重新创建索引。
++        backup_inspector = inspect(conn)
++        for index in backup_inspector.get_indexes(backup):
++            name = index.get("name")
++            if name:
++                safe_name = str(name).replace('"', '""')
++                conn.execute(text(f'DROP INDEX IF EXISTS "{safe_name}"'))
++
++        HypothesisEvidence.__table__.create(bind=conn, checkfirst=False)
++
++        old_columns = {
++            column["name"] for column in backup_inspector.get_columns(backup)
++        }
++        revision_expr = (
++            "COALESCE(hypothesis_revision, 1)"
++            if "hypothesis_revision" in old_columns
++            else "1"
++        )
++        conn.execute(
++            text(
++                f'''
++                INSERT INTO hypothesis_evidence (
++                    id,
++                    hypothesis_id,
++                    hypothesis_revision,
++                    reflection_id,
++                    relation_type,
++                    relation_confidence,
++                    relation_reason,
++                    is_independent,
++                    created_at
++                )
++                SELECT
++                    id,
++                    hypothesis_id,
++                    {revision_expr},
++                    reflection_id,
++                    relation_type,
++                    relation_confidence,
++                    relation_reason,
++                    is_independent,
++                    created_at
++                FROM "{backup}"
++                '''
++            )
++        )
++        conn.execute(text(f'DROP TABLE "{backup}"'))
++        conn.execute(text("PRAGMA foreign_keys=ON"))
++
++
++def _backfill_hypothesis_revisions(engine: Engine) -> None:
++    """把 V0.2 StrategyHypothesis 当前内容无损固化为 Revision 快照。"""
++    inspector = inspect(engine)
++    tables = set(inspector.get_table_names())
++    if "strategy_hypotheses" not in tables:
++        return
++
++    # 新表通常已由 Base.metadata.create_all 建立；这里保持 migration 自包含。
++    HypothesisRevision.__table__.create(bind=engine, checkfirst=True)
++
++    with engine.begin() as conn:
++        rows = conn.execute(
++            text(
++                """
++                SELECT
++                    id,
++                    title,
++                    canonical_signal,
++                    insight,
++                    proposed_change,
++                    expected_effect,
++                    applicable_context,
++                    COALESCE(current_revision, revision, 1) AS current_revision,
++                    created_at
++                FROM strategy_hypotheses
++                """
++            )
++        ).mappings().all()
++
++        for row in rows:
++            hypothesis_id = int(row["id"])
++            revision_number = int(row["current_revision"] or 1)
++            exists = conn.execute(
++                text(
++                    """
++                    SELECT 1
++                    FROM hypothesis_revisions
++                    WHERE hypothesis_id = :hypothesis_id
++                      AND revision_number = :revision_number
++                    LIMIT 1
++                    """
++                ),
++                {
++                    "hypothesis_id": hypothesis_id,
++                    "revision_number": revision_number,
++                },
++            ).first()
++            if exists is not None:
++                continue
++
++            raw_context = row["applicable_context"]
++            if isinstance(raw_context, str):
++                try:
++                    when_data = json.loads(raw_context) if raw_context else {}
++                except json.JSONDecodeError:
++                    when_data = {"legacy_raw": raw_context}
++            elif isinstance(raw_context, dict):
++                when_data = raw_context
++            else:
++                when_data = {}
++
++            conn.execute(
++                text(
++                    """
++                    INSERT INTO hypothesis_revisions (
++                        hypothesis_id,
++                        revision_number,
++                        title,
++                        canonical_signal,
++                        insight,
++                        when_data,
++                        do_data,
++                        expect_data,
++                        created_reason,
++                        created_at
++                    ) VALUES (
++                        :hypothesis_id,
++                        :revision_number,
++                        :title,
++                        :canonical_signal,
++                        :insight,
++                        :when_data,
++                        :do_data,
++                        :expect_data,
++                        :created_reason,
++                        :created_at
++                    )
++                    """
++                ),
++                {
++                    "hypothesis_id": hypothesis_id,
++                    "revision_number": revision_number,
++                    "title": row["title"] or "",
++                    "canonical_signal": row["canonical_signal"] or "",
++                    "insight": row["insight"] or "",
++                    "when_data": json.dumps(when_data, ensure_ascii=False),
++                    "do_data": json.dumps(
++                        {"text": row["proposed_change"] or ""}, ensure_ascii=False
++                    ),
++                    "expect_data": json.dumps(
++                        {"text": row["expected_effect"] or ""}, ensure_ascii=False
++                    ),
++                    "created_reason": "migrated_from_v0.2_current_state",
++                    "created_at": row["created_at"] or datetime.now(),
++                },
++            )
++
++
++def migrate_v0_2_1(engine: Engine) -> None:
++    """V0.2 -> V0.2.1 第一阶段迁移：Hypothesis revision-aware schema。
++
++    目标：
++    - StrategyHypothesis 增加 current_revision；
++    - 现有 Hypothesis 当前内容固化为不可变 Revision；
++    - HypothesisEvidence 绑定具体 revision，并移除旧的跨 revision 唯一约束；
++    - 不改变当前 Hypothesis 的业务语义或成熟度。
++    """
++    if engine.dialect.name != "sqlite":
++        return
++
++    inspector = inspect(engine)
++    existing_tables = set(inspector.get_table_names())
++
++    with engine.begin() as conn:
++        for table_name, columns in V0_2_1_SQLITE_COLUMNS.items():
++            if table_name not in existing_tables:
++                continue
++            existing_columns = {
++                column["name"] for column in inspector.get_columns(table_name)
++            }
++            for column_name, definition in columns.items():
++                if column_name in existing_columns:
++                    continue
++                conn.execute(
++                    text(
++                        f'ALTER TABLE "{table_name}" '
++                        f'ADD COLUMN "{column_name}" {definition}'
++                    )
++                )
++
++        if "strategy_hypotheses" in existing_tables:
++            # V0.2 的 revision 就是当时的 current revision。V0.2 真实数据目前通常为 1，
++            # 这里仍保留通用迁移语义。
++            conn.execute(
++                text(
++                    """
++                    UPDATE strategy_hypotheses
++                    SET current_revision = COALESCE(revision, current_revision, 1)
++                    """
++                )
++            )
++
++    _sqlite_rebuild_hypothesis_evidence(engine)
++    _backfill_hypothesis_revisions(engine)
+diff --git a/app/models.py b/app/models.py
+index 0a18444..d5b5c24 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -1,160 +1,202 @@
+-from datetime import datetime
+-
+-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+-from sqlalchemy.orm import Mapped, mapped_column
+-
+-from app.database import Base
+-
+-
+-class InteractionRecord(Base):
+-    """原始交互审计日志；默认不参与常规 Memory Retrieval。"""
+-    __tablename__ = "interaction_records"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    session_id: Mapped[str] = mapped_column(String(64), index=True)
+-    user_input: Mapped[str] = mapped_column(Text)
+-    assistant_response: Mapped[str] = mapped_column(Text)
+-    strategy_name: Mapped[str] = mapped_column(String(100), index=True)
+-    record_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+-
+-
+-class PersonalMemory(Base):
+-    """关于用户及其世界的长期认识。"""
+-    __tablename__ = "personal_memories"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    memory_type: Mapped[str] = mapped_column(String(32), index=True)
+-    content: Mapped[str] = mapped_column(Text)
+-    importance: Mapped[float] = mapped_column(Float, default=0.5)
+-    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+-    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+-    source_interaction_id: Mapped[int | None] = mapped_column(
+-        ForeignKey("interaction_records.id"), nullable=True, index=True
+-    )
+-    memory_data: Mapped[dict] = mapped_column(JSON, default=dict)
+-    access_count: Mapped[int] = mapped_column(Integer, default=0)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+-    updated_at: Mapped[datetime] = mapped_column(
+-        DateTime, default=datetime.now, onupdate=datetime.now
+-    )
+-    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+-
+-
+-class Experience(Base):
+-    """EvoMe 自己的任务经验：这次怎么做、结果怎么样。"""
+-    __tablename__ = "experiences"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    interaction_id: Mapped[int] = mapped_column(
+-        ForeignKey("interaction_records.id"), index=True
+-    )
+-    task_type: Mapped[str] = mapped_column(String(100), default="general", index=True)
+-    strategy_name: Mapped[str] = mapped_column(String(100), index=True)
+-    strategy_version: Mapped[int] = mapped_column(Integer, default=1)
+-    skills_used: Mapped[list] = mapped_column(JSON, default=list)
+-    result_summary: Mapped[str] = mapped_column(Text)
+-    success: Mapped[bool] = mapped_column(Boolean, default=False)
+-    score: Mapped[float] = mapped_column(Float, default=0.0)
+-    user_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
+-    experience_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+-    context_data: Mapped[dict] = mapped_column(JSON, default=dict)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+-
+-
+-class ReflectionRecord(Base):
+-    """对 Experience 的反思结果。"""
+-    __tablename__ = "reflection_records"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    experience_id: Mapped[int] = mapped_column(ForeignKey("experiences.id"), index=True)
+-    reflection_type: Mapped[str] = mapped_column(String(32), index=True)
+-    observation: Mapped[str] = mapped_column(Text)
+-    lesson: Mapped[str] = mapped_column(Text)  # V0.1.1 compatibility
+-    insight: Mapped[str] = mapped_column(Text, default="")
+-    applicable_context: Mapped[dict] = mapped_column(JSON, default=dict)
+-    expected_effect: Mapped[str] = mapped_column(Text, default="")
+-    canonical_signal: Mapped[str] = mapped_column(Text, default="")
+-    strategy_signal: Mapped[str] = mapped_column(Text, default="")
+-    skill_signal: Mapped[str] = mapped_column(Text, default="")
+-    confidence: Mapped[float] = mapped_column(Float, default=0.8)
+-    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+-
+-
+-class StrategyHypothesis(Base):
+-    """多次 Reflection 聚合形成的、带适用环境的策略假设。"""
+-    __tablename__ = "strategy_hypotheses"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    title: Mapped[str] = mapped_column(String(200), index=True)
+-    canonical_signal: Mapped[str] = mapped_column(Text)
+-    insight: Mapped[str] = mapped_column(Text)
+-    proposed_change: Mapped[str] = mapped_column(Text)
+-    expected_effect: Mapped[str] = mapped_column(Text, default="")
+-    applicable_context: Mapped[dict] = mapped_column(JSON, default=dict)
+-
+-    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+-    status: Mapped[str] = mapped_column(String(32), default="observing", index=True)
+-    revision: Mapped[int] = mapped_column(Integer, default=1)
+-
+-    supporting_count: Mapped[int] = mapped_column(Integer, default=0)
+-    refinement_count: Mapped[int] = mapped_column(Integer, default=0)
+-    counter_count: Mapped[int] = mapped_column(Integer, default=0)
+-    independent_evidence_count: Mapped[int] = mapped_column(Integer, default=0)
+-    independent_support_count: Mapped[int] = mapped_column(Integer, default=0)
+-    context_diversity: Mapped[int] = mapped_column(Integer, default=0)
+-
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+-    updated_at: Mapped[datetime] = mapped_column(
+-        DateTime, default=datetime.now, onupdate=datetime.now
+-    )
+-    last_evidence_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+-
+-
+-class HypothesisEvidence(Base):
+-    """Reflection 与 StrategyHypothesis 之间的证据关系。"""
+-    __tablename__ = "hypothesis_evidence"
+-    __table_args__ = (
+-        UniqueConstraint(
+-            "hypothesis_id", "reflection_id", name="uq_hypothesis_reflection_evidence"
+-        ),
+-    )
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    hypothesis_id: Mapped[int] = mapped_column(
+-        ForeignKey("strategy_hypotheses.id"), index=True
+-    )
+-    reflection_id: Mapped[int] = mapped_column(
+-        ForeignKey("reflection_records.id"), index=True
+-    )
+-    relation_type: Mapped[str] = mapped_column(String(32), index=True)
+-    relation_confidence: Mapped[float] = mapped_column(Float, default=0.8)
+-    relation_reason: Mapped[str] = mapped_column(Text, default="")
+-    is_independent: Mapped[bool] = mapped_column(Boolean, default=True)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+-
+-
+-class StrategyRecord(Base):
+-    __tablename__ = "strategy_records"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    name: Mapped[str] = mapped_column(String(100), index=True)
+-    version: Mapped[int] = mapped_column(Integer, default=1)
+-    status: Mapped[str] = mapped_column(String(32), default="active")
+-    description: Mapped[str] = mapped_column(Text, default="")
+-    run_count: Mapped[int] = mapped_column(Integer, default=0)
+-    success_count: Mapped[int] = mapped_column(Integer, default=0)
+-    total_score: Mapped[float] = mapped_column(Float, default=0.0)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+-
+-
+-class SkillUsage(Base):
+-    __tablename__ = "skill_usage"
+-
+-    id: Mapped[int] = mapped_column(primary_key=True)
+-    skill_name: Mapped[str] = mapped_column(String(100), index=True)
+-    implementation_name: Mapped[str] = mapped_column(String(100))
+-    success: Mapped[int] = mapped_column(Integer, default=1)
+-    score: Mapped[float] = mapped_column(Float, default=1.0)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
++from datetime import datetime
++
++from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
++from sqlalchemy.orm import Mapped, mapped_column
++
++from app.database import Base
++
++
++class InteractionRecord(Base):
++    """原始交互审计日志；默认不参与常规 Memory Retrieval。"""
++    __tablename__ = "interaction_records"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    session_id: Mapped[str] = mapped_column(String(64), index=True)
++    user_input: Mapped[str] = mapped_column(Text)
++    assistant_response: Mapped[str] = mapped_column(Text)
++    strategy_name: Mapped[str] = mapped_column(String(100), index=True)
++    record_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
++class PersonalMemory(Base):
++    """关于用户及其世界的长期认识。"""
++    __tablename__ = "personal_memories"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    memory_type: Mapped[str] = mapped_column(String(32), index=True)
++    content: Mapped[str] = mapped_column(Text)
++    importance: Mapped[float] = mapped_column(Float, default=0.5)
++    confidence: Mapped[float] = mapped_column(Float, default=1.0)
++    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
++    source_interaction_id: Mapped[int | None] = mapped_column(
++        ForeignKey("interaction_records.id"), nullable=True, index=True
++    )
++    memory_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    access_count: Mapped[int] = mapped_column(Integer, default=0)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime, default=datetime.now, onupdate=datetime.now
++    )
++    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
++
++
++class Experience(Base):
++    """EvoMe 自己的任务经验：这次怎么做、结果怎么样。"""
++    __tablename__ = "experiences"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    interaction_id: Mapped[int] = mapped_column(
++        ForeignKey("interaction_records.id"), index=True
++    )
++    task_type: Mapped[str] = mapped_column(String(100), default="general", index=True)
++    strategy_name: Mapped[str] = mapped_column(String(100), index=True)
++    strategy_version: Mapped[int] = mapped_column(Integer, default=1)
++    skills_used: Mapped[list] = mapped_column(JSON, default=list)
++    result_summary: Mapped[str] = mapped_column(Text)
++    success: Mapped[bool] = mapped_column(Boolean, default=False)
++    score: Mapped[float] = mapped_column(Float, default=0.0)
++    user_feedback: Mapped[str | None] = mapped_column(Text, nullable=True)
++    experience_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
++    context_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
++class ReflectionRecord(Base):
++    """对 Experience 的反思结果。"""
++    __tablename__ = "reflection_records"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    experience_id: Mapped[int] = mapped_column(ForeignKey("experiences.id"), index=True)
++    reflection_type: Mapped[str] = mapped_column(String(32), index=True)
++    observation: Mapped[str] = mapped_column(Text)
++    lesson: Mapped[str] = mapped_column(Text)  # V0.1.1 compatibility
++    insight: Mapped[str] = mapped_column(Text, default="")
++    applicable_context: Mapped[dict] = mapped_column(JSON, default=dict)
++    expected_effect: Mapped[str] = mapped_column(Text, default="")
++    canonical_signal: Mapped[str] = mapped_column(Text, default="")
++    strategy_signal: Mapped[str] = mapped_column(Text, default="")
++    skill_signal: Mapped[str] = mapped_column(Text, default="")
++    confidence: Mapped[float] = mapped_column(Float, default=0.8)
++    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
++class StrategyHypothesis(Base):
++    """多次 Reflection 聚合形成的、带适用环境的策略假设。"""
++    __tablename__ = "strategy_hypotheses"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    title: Mapped[str] = mapped_column(String(200), index=True)
++    canonical_signal: Mapped[str] = mapped_column(Text)
++    insight: Mapped[str] = mapped_column(Text)
++    proposed_change: Mapped[str] = mapped_column(Text)
++    expected_effect: Mapped[str] = mapped_column(Text, default="")
++    applicable_context: Mapped[dict] = mapped_column(JSON, default=dict)
++
++    confidence: Mapped[float] = mapped_column(Float, default=0.5)
++    status: Mapped[str] = mapped_column(String(32), default="observing", index=True)
++    # V0.2 compatibility: revision 暂时保留，并与 current_revision 镜像。
++    revision: Mapped[int] = mapped_column(Integer, default=1)
++    current_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
++
++    supporting_count: Mapped[int] = mapped_column(Integer, default=0)
++    refinement_count: Mapped[int] = mapped_column(Integer, default=0)
++    counter_count: Mapped[int] = mapped_column(Integer, default=0)
++    independent_evidence_count: Mapped[int] = mapped_column(Integer, default=0)
++    independent_support_count: Mapped[int] = mapped_column(Integer, default=0)
++    context_diversity: Mapped[int] = mapped_column(Integer, default=0)
++
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime, default=datetime.now, onupdate=datetime.now
++    )
++    last_evidence_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
++
++
++class HypothesisRevision(Base):
++    """StrategyHypothesis 的不可变认知快照。
++
++    同一个 hypothesis_id 下通过 revision_number 形成 r1/r2/r3... 历史。
++    V0.2.1 第一阶段只建立版本地基，不自动生成新 Revision。
++    """
++    __tablename__ = "hypothesis_revisions"
++    __table_args__ = (
++        UniqueConstraint(
++            "hypothesis_id",
++            "revision_number",
++            name="uq_hypothesis_revision_number",
++        ),
++    )
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    hypothesis_id: Mapped[int] = mapped_column(
++        ForeignKey("strategy_hypotheses.id"), index=True
++    )
++    revision_number: Mapped[int] = mapped_column(Integer, index=True)
++
++    title: Mapped[str] = mapped_column(String(200))
++    canonical_signal: Mapped[str] = mapped_column(Text)
++    insight: Mapped[str] = mapped_column(Text)
++
++    # Revision 层从一开始就保留机器可比较的 WHEN / DO / EXPECT。
++    # 对 V0.2 旧数据不做语义猜测：WHEN 直接迁移 applicable_context，
++    # DO/EXPECT 先以 {"text": ...} 形式无损保存。
++    when_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    do_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    expect_data: Mapped[dict] = mapped_column(JSON, default=dict)
++
++    created_reason: Mapped[str] = mapped_column(Text, default="")
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
++class HypothesisEvidence(Base):
++    """Reflection 与 StrategyHypothesis 之间的证据关系。"""
++    __tablename__ = "hypothesis_evidence"
++    __table_args__ = (
++        UniqueConstraint(
++            "hypothesis_id",
++            "hypothesis_revision",
++            "reflection_id",
++            name="uq_hypothesis_revision_reflection_evidence",
++        ),
++    )
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    hypothesis_id: Mapped[int] = mapped_column(
++        ForeignKey("strategy_hypotheses.id"), index=True
++    )
++    hypothesis_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
++    reflection_id: Mapped[int] = mapped_column(
++        ForeignKey("reflection_records.id"), index=True
++    )
++    relation_type: Mapped[str] = mapped_column(String(32), index=True)
++    relation_confidence: Mapped[float] = mapped_column(Float, default=0.8)
++    relation_reason: Mapped[str] = mapped_column(Text, default="")
++    is_independent: Mapped[bool] = mapped_column(Boolean, default=True)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
++class StrategyRecord(Base):
++    __tablename__ = "strategy_records"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    name: Mapped[str] = mapped_column(String(100), index=True)
++    version: Mapped[int] = mapped_column(Integer, default=1)
++    status: Mapped[str] = mapped_column(String(32), default="active")
++    description: Mapped[str] = mapped_column(Text, default="")
++    run_count: Mapped[int] = mapped_column(Integer, default=0)
++    success_count: Mapped[int] = mapped_column(Integer, default=0)
++    total_score: Mapped[float] = mapped_column(Float, default=0.0)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
++
++
++class SkillUsage(Base):
++    __tablename__ = "skill_usage"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    skill_name: Mapped[str] = mapped_column(String(100), index=True)
++    implementation_name: Mapped[str] = mapped_column(String(100))
++    success: Mapped[int] = mapped_column(Integer, default=1)
++    score: Mapped[float] = mapped_column(Float, default=1.0)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+diff --git a/app/runtime.py b/app/runtime.py
+index 65b3073..26468a0 100644
+--- a/app/runtime.py
++++ b/app/runtime.py
+@@ -1,152 +1,155 @@
+-from uuid import uuid4
+-
+-from sqlalchemy import select
+-from sqlalchemy.orm import Session
+-
+-from app.audit.service import AuditService
+-from app.config import (
+-    DEEPSEEK_MODEL,
+-    EVOME_QDRANT_PATH,
+-    HYPOTHESIS_RELATION_CONFIDENCE,
+-    HYPOTHESIS_SCORE_THRESHOLD,
+-    HYPOTHESIS_TOP_K,
+-)
+-from app.context.builder import ContextBuilder
+-from app.evaluation.service import EvaluationService
+-from app.evolution.service import EvolutionMemoryService
+-from app.gates.experience_gate import ExperienceGate
+-from app.gates.personal_memory_gate import PersonalMemoryGate
+-from app.hypothesis.aggregator import HypothesisAggregator
+-from app.hypothesis.relation_judge import HypothesisRelationJudge
+-from app.hypothesis.retriever import HybridHypothesisRetriever
+-from app.hypothesis.service import HypothesisService
+-from app.llm import DeepSeekClient
+-from app.memory.service import PersonalMemoryService
+-from app.models import StrategyRecord
+-from app.reflection.service import ReflectionService
+-from app.skills.builtin import build_default_skill_registry
+-from app.strategy.default_workflow import DefaultConversationStrategy
+-
+-
+-class EvoMeRuntime:
+-    def __init__(self, db: Session, llm=None, session_id: str | None = None) -> None:
+-        self.db = db
+-        self.llm = llm or DeepSeekClient()
+-        self.session_id = session_id or uuid4().hex
+-
+-        self.audit_service = AuditService(db)
+-        self.personal_memory_service = PersonalMemoryService(db)
+-        self.evolution_memory_service = EvolutionMemoryService(db)
+-        self.hypothesis_service = HypothesisService(db)
+-
+-        self.personal_memory_gate = PersonalMemoryGate(self.llm)
+-        self.experience_gate = ExperienceGate(self.llm)
+-        self.context_builder = ContextBuilder(self.llm, model_name=DEEPSEEK_MODEL)
+-        self.reflection_service = ReflectionService(self.llm)
+-        self.evaluation_service = EvaluationService(self.llm)
+-        self.skill_registry = build_default_skill_registry(self.personal_memory_service)
+-
+-        self.hypothesis_retriever = HybridHypothesisRetriever(
+-            db, qdrant_path=EVOME_QDRANT_PATH
+-        )
+-        self.hypothesis_relation_judge = HypothesisRelationJudge(self.llm)
+-        self.hypothesis_aggregator = HypothesisAggregator(
+-            db,
+-            relation_judge=self.hypothesis_relation_judge,
+-            retriever=self.hypothesis_retriever,
+-            top_k=HYPOTHESIS_TOP_K,
+-            score_threshold=HYPOTHESIS_SCORE_THRESHOLD,
+-            min_relation_confidence=HYPOTHESIS_RELATION_CONFIDENCE,
+-        )
+-        self.hypothesis_aggregator.sync_index()
+-
+-        self.strategy = DefaultConversationStrategy(
+-            llm=self.llm,
+-            audit_service=self.audit_service,
+-            personal_memory_service=self.personal_memory_service,
+-            personal_memory_gate=self.personal_memory_gate,
+-            experience_gate=self.experience_gate,
+-            context_builder=self.context_builder,
+-            evolution_memory_service=self.evolution_memory_service,
+-            reflection_service=self.reflection_service,
+-            hypothesis_aggregator=self.hypothesis_aggregator,
+-            evaluation_service=self.evaluation_service,
+-            skill_registry=self.skill_registry,
+-        )
+-        self._ensure_strategy_record()
+-
+-    @property
+-    def strategy_full_name(self) -> str:
+-        return f"{self.strategy.name}_v{self.strategy.version}"
+-
+-    def _ensure_strategy_record(self) -> StrategyRecord:
+-        stmt = select(StrategyRecord).where(
+-            StrategyRecord.name == self.strategy.name,
+-            StrategyRecord.version == self.strategy.version,
+-        )
+-        record = self.db.scalar(stmt)
+-        if record is None:
+-            record = StrategyRecord(
+-                name=self.strategy.name,
+-                version=self.strategy.version,
+-                status="active",
+-                description=(
+-                    "Retrieve Personal Memory -> Respond -> Evaluate -> Audit -> "
+-                    "Personal Memory Gate -> Experience Gate -> Context Builder -> "
+-                    "Reflection -> Strategy Hypothesis Aggregation"
+-                ),
+-            )
+-            self.db.add(record)
+-            self.db.commit()
+-            self.db.refresh(record)
+-        return record
+-
+-    def _record_strategy_result(self, score: float, success: bool) -> None:
+-        stmt = select(StrategyRecord).where(
+-            StrategyRecord.name == self.strategy.name,
+-            StrategyRecord.version == self.strategy.version,
+-        )
+-        record = self.db.scalar(stmt)
+-        if record is None:
+-            return
+-        record.run_count += 1
+-        record.total_score += score
+-        if success:
+-            record.success_count += 1
+-        self.db.commit()
+-
+-    def run(self, user_input: str) -> dict:
+-        state = self.strategy.invoke(user_input=user_input, session_id=self.session_id)
+-        evaluation = state.get("evaluation", {})
+-        score = float(evaluation.get("score", 0.0))
+-        success = bool(evaluation.get("success", False))
+-        self._record_strategy_result(score, success)
+-
+-        return {
+-            "response": state.get("response", ""),
+-            "strategy_name": self.strategy_full_name,
+-            "evaluation_score": score,
+-            "evaluation": evaluation,
+-            "interaction_id": state.get("interaction_id"),
+-            "personal_memories_saved": state.get("personal_memories_saved", 0),
+-            "experience_saved": bool(state.get("experience_saved", False)),
+-            "reflection_saved": bool(state.get("reflection_saved", False)),
+-            "context_data": state.get("context_data", {}),
+-            "hypothesis_id": state.get("hypothesis_id"),
+-            "hypothesis_action": state.get("hypothesis_action", "skipped"),
+-        }
+-
+-    def list_personal_memories(self):
+-        return self.personal_memory_service.list_all()
+-
+-    def list_experiences(self):
+-        return self.evolution_memory_service.list_experiences()
+-
+-    def list_reflections(self):
+-        return self.evolution_memory_service.list_reflections()
+-
+-    def list_hypotheses(self):
+-        return self.hypothesis_service.list_all()
+-
+-    def list_interactions(self, limit: int = 20):
+-        return self.audit_service.list_recent(limit=limit)
++from uuid import uuid4
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.audit.service import AuditService
++from app.config import (
++    DEEPSEEK_MODEL,
++    EVOME_QDRANT_PATH,
++    HYPOTHESIS_RELATION_CONFIDENCE,
++    HYPOTHESIS_SCORE_THRESHOLD,
++    HYPOTHESIS_TOP_K,
++)
++from app.context.builder import ContextBuilder
++from app.evaluation.service import EvaluationService
++from app.evolution.service import EvolutionMemoryService
++from app.gates.experience_gate import ExperienceGate
++from app.gates.personal_memory_gate import PersonalMemoryGate
++from app.hypothesis.aggregator import HypothesisAggregator
++from app.hypothesis.relation_judge import HypothesisRelationJudge
++from app.hypothesis.retriever import HybridHypothesisRetriever
++from app.hypothesis.service import HypothesisService
++from app.llm import DeepSeekClient
++from app.memory.service import PersonalMemoryService
++from app.models import StrategyRecord
++from app.reflection.service import ReflectionService
++from app.skills.builtin import build_default_skill_registry
++from app.strategy.default_workflow import DefaultConversationStrategy
++
++
++class EvoMeRuntime:
++    def __init__(self, db: Session, llm=None, session_id: str | None = None) -> None:
++        self.db = db
++        self.llm = llm or DeepSeekClient()
++        self.session_id = session_id or uuid4().hex
++
++        self.audit_service = AuditService(db)
++        self.personal_memory_service = PersonalMemoryService(db)
++        self.evolution_memory_service = EvolutionMemoryService(db)
++        self.hypothesis_service = HypothesisService(db)
++
++        self.personal_memory_gate = PersonalMemoryGate(self.llm)
++        self.experience_gate = ExperienceGate(self.llm)
++        self.context_builder = ContextBuilder(self.llm, model_name=DEEPSEEK_MODEL)
++        self.reflection_service = ReflectionService(self.llm)
++        self.evaluation_service = EvaluationService(self.llm)
++        self.skill_registry = build_default_skill_registry(self.personal_memory_service)
++
++        self.hypothesis_retriever = HybridHypothesisRetriever(
++            db, qdrant_path=EVOME_QDRANT_PATH
++        )
++        self.hypothesis_relation_judge = HypothesisRelationJudge(self.llm)
++        self.hypothesis_aggregator = HypothesisAggregator(
++            db,
++            relation_judge=self.hypothesis_relation_judge,
++            retriever=self.hypothesis_retriever,
++            top_k=HYPOTHESIS_TOP_K,
++            score_threshold=HYPOTHESIS_SCORE_THRESHOLD,
++            min_relation_confidence=HYPOTHESIS_RELATION_CONFIDENCE,
++        )
++        self.hypothesis_aggregator.sync_index()
++
++        self.strategy = DefaultConversationStrategy(
++            llm=self.llm,
++            audit_service=self.audit_service,
++            personal_memory_service=self.personal_memory_service,
++            personal_memory_gate=self.personal_memory_gate,
++            experience_gate=self.experience_gate,
++            context_builder=self.context_builder,
++            evolution_memory_service=self.evolution_memory_service,
++            reflection_service=self.reflection_service,
++            hypothesis_aggregator=self.hypothesis_aggregator,
++            evaluation_service=self.evaluation_service,
++            skill_registry=self.skill_registry,
++        )
++        self._ensure_strategy_record()
++
++    @property
++    def strategy_full_name(self) -> str:
++        return f"{self.strategy.name}_v{self.strategy.version}"
++
++    def _ensure_strategy_record(self) -> StrategyRecord:
++        stmt = select(StrategyRecord).where(
++            StrategyRecord.name == self.strategy.name,
++            StrategyRecord.version == self.strategy.version,
++        )
++        record = self.db.scalar(stmt)
++        if record is None:
++            record = StrategyRecord(
++                name=self.strategy.name,
++                version=self.strategy.version,
++                status="active",
++                description=(
++                    "Retrieve Personal Memory -> Respond -> Evaluate -> Audit -> "
++                    "Personal Memory Gate -> Experience Gate -> Context Builder -> "
++                    "Reflection -> Strategy Hypothesis Aggregation"
++                ),
++            )
++            self.db.add(record)
++            self.db.commit()
++            self.db.refresh(record)
++        return record
++
++    def _record_strategy_result(self, score: float, success: bool) -> None:
++        stmt = select(StrategyRecord).where(
++            StrategyRecord.name == self.strategy.name,
++            StrategyRecord.version == self.strategy.version,
++        )
++        record = self.db.scalar(stmt)
++        if record is None:
++            return
++        record.run_count += 1
++        record.total_score += score
++        if success:
++            record.success_count += 1
++        self.db.commit()
++
++    def run(self, user_input: str) -> dict:
++        state = self.strategy.invoke(user_input=user_input, session_id=self.session_id)
++        evaluation = state.get("evaluation", {})
++        score = float(evaluation.get("score", 0.0))
++        success = bool(evaluation.get("success", False))
++        self._record_strategy_result(score, success)
++
++        return {
++            "response": state.get("response", ""),
++            "strategy_name": self.strategy_full_name,
++            "evaluation_score": score,
++            "evaluation": evaluation,
++            "interaction_id": state.get("interaction_id"),
++            "personal_memories_saved": state.get("personal_memories_saved", 0),
++            "experience_saved": bool(state.get("experience_saved", False)),
++            "reflection_saved": bool(state.get("reflection_saved", False)),
++            "context_data": state.get("context_data", {}),
++            "hypothesis_id": state.get("hypothesis_id"),
++            "hypothesis_action": state.get("hypothesis_action", "skipped"),
++        }
++
++    def list_personal_memories(self):
++        return self.personal_memory_service.list_all()
++
++    def list_experiences(self):
++        return self.evolution_memory_service.list_experiences()
++
++    def list_reflections(self):
++        return self.evolution_memory_service.list_reflections()
++
++    def list_hypotheses(self):
++        return self.hypothesis_service.list_all()
++
++    def list_hypothesis_revisions(self, hypothesis_id: int):
++        return self.hypothesis_service.list_revisions(hypothesis_id)
++
++    def list_interactions(self, limit: int = 20):
++        return self.audit_service.list_recent(limit=limit)
+diff --git a/main.py b/main.py
+index 7ae15a5..f51b673 100644
+--- a/main.py
++++ b/main.py
+@@ -1,145 +1,167 @@
+-from app.database import Base, engine, SessionLocal
+-from app.migrations import migrate_v0_2
+-from app.runtime import EvoMeRuntime
+-
+-
+-def init_db() -> None:
+-    Base.metadata.create_all(bind=engine)
+-    migrate_v0_2(engine)
+-
+-
+-def show_personal_memories(runtime: EvoMeRuntime) -> None:
+-    print("\n===== Personal Memory =====")
+-    memories = runtime.list_personal_memories()
+-    if not memories:
+-        print("暂无 Personal Memory")
+-    for m in memories:
+-        print(
+-            f"#{m.id} [{m.memory_type}] importance={m.importance:.2f} "
+-            f"confidence={m.confidence:.2f}\n{m.content}\n"
+-        )
+-
+-
+-def show_experiences(runtime: EvoMeRuntime) -> None:
+-    print("\n===== Evolution Experience =====")
+-    items = runtime.list_experiences()
+-    if not items:
+-        print("暂无 Experience")
+-    for e in items:
+-        context = e.context_data or {}
+-        print(
+-            f"#{e.id} [{e.task_type}] score={e.score:.2f} success={e.success}\n"
+-            f"Context: {context.get('task_type', 'unknown')} / "
+-            f"{context.get('complexity', 'unknown')} / "
+-            f"{context.get('interaction_mode', 'unknown')}\n"
+-            f"{e.result_summary}\n"
+-        )
+-
+-
+-def show_reflections(runtime: EvoMeRuntime) -> None:
+-    print("\n===== Reflection =====")
+-    items = runtime.list_reflections()
+-    if not items:
+-        print("暂无 Reflection")
+-    for r in items:
+-        insight = r.insight or r.lesson
+-        print(
+-            f"#{r.id} [{r.reflection_type}] confidence={r.confidence:.2f}\n"
+-            f"观察: {r.observation}\n"
+-            f"Insight: {insight}\n"
+-            f"Applicable Context: {r.applicable_context or {}}\n"
+-            f"Strategy Signal: {r.strategy_signal}\n"
+-            f"Skill Signal: {r.skill_signal}\n"
+-        )
+-
+-
+-def show_hypotheses(runtime: EvoMeRuntime) -> None:
+-    print("\n===== Strategy Hypotheses =====")
+-    items = runtime.list_hypotheses()
+-    if not items:
+-        print("暂无 Strategy Hypothesis")
+-    for h in items:
+-        print(
+-            f"H#{h.id} [{h.status}] confidence={h.confidence:.2f} revision={h.revision}\n"
+-            f"{h.title}\n"
+-            f"WHEN: {h.applicable_context or {}}\n"
+-            f"DO: {h.proposed_change}\n"
+-            f"EXPECT: {h.expected_effect}\n"
+-            f"Evidence: support={h.supporting_count} refine={h.refinement_count} "
+-            f"counter={h.counter_count} independent={h.independent_evidence_count} "
+-            f"independent_support={h.independent_support_count} "
+-            f"diversity={h.context_diversity}\n"
+-        )
+-
+-
+-def show_interactions(runtime: EvoMeRuntime) -> None:
+-    print("\n===== Audit Log =====")
+-    items = runtime.list_interactions()
+-    if not items:
+-        print("暂无 InteractionRecord")
+-    for r in items:
+-        preview = r.assistant_response[:160]
+-        suffix = "..." if len(r.assistant_response) > 160 else ""
+-        print(
+-            f"#{r.id} session={r.session_id[:8]} strategy={r.strategy_name}\n"
+-            f"User: {r.user_input}\nAssistant: {preview}{suffix}\n"
+-        )
+-
+-
+-def show_skills(runtime: EvoMeRuntime) -> None:
+-    print("\n===== Skills =====")
+-    for skill in runtime.skill_registry.list_skills():
+-        print(f"- {skill.name}: {skill.description}")
+-        for impl in runtime.skill_registry.list_implementations(skill.name):
+-            print(f"    -> {impl.name} ({impl.kind})")
+-
+-
+-def main() -> None:
+-    init_db()
+-    print("🌱 EvoMe V0.2 Core")
+-    print(
+-        "命令：/memory  /experience  /reflection  /hypothesis  "
+-        "/audit  /skills  /exit\n"
+-    )
+-
+-    with SessionLocal() as db:
+-        runtime = EvoMeRuntime(db)
+-        while True:
+-            user_input = input("You > ").strip()
+-            if not user_input:
+-                continue
+-            if user_input == "/exit":
+-                print("EvoMe > 下次见。")
+-                break
+-            if user_input == "/memory":
+-                show_personal_memories(runtime); continue
+-            if user_input == "/experience":
+-                show_experiences(runtime); continue
+-            if user_input == "/reflection":
+-                show_reflections(runtime); continue
+-            if user_input == "/hypothesis":
+-                show_hypotheses(runtime); continue
+-            if user_input == "/audit":
+-                show_interactions(runtime); continue
+-            if user_input == "/skills":
+-                show_skills(runtime); continue
+-
+-            try:
+-                result = runtime.run(user_input)
+-                print(f"\nEvoMe > {result['response']}\n")
+-                print(
+-                    "DEBUG | "
+-                    f"strategy={result['strategy_name']} "
+-                    f"score={result['evaluation_score']:.2f} "
+-                    f"interaction={result['interaction_id']} "
+-                    f"personal_memory+={result['personal_memories_saved']} "
+-                    f"experience={result['experience_saved']} "
+-                    f"reflection={result['reflection_saved']} "
+-                    f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']}\n"
+-                )
+-            except Exception as exc:
+-                print(f"\n❌ EvoMe Error: {exc}\n")
+-
+-
+-if __name__ == "__main__":
+-    main()
++from app.database import Base, engine, SessionLocal
++from app.migrations import migrate_v0_2, migrate_v0_2_1
++from app.runtime import EvoMeRuntime
++
++
++def init_db() -> None:
++    Base.metadata.create_all(bind=engine)
++    migrate_v0_2(engine)
++    migrate_v0_2_1(engine)
++
++
++def show_personal_memories(runtime: EvoMeRuntime) -> None:
++    print("\n===== Personal Memory =====")
++    memories = runtime.list_personal_memories()
++    if not memories:
++        print("暂无 Personal Memory")
++    for m in memories:
++        print(
++            f"#{m.id} [{m.memory_type}] importance={m.importance:.2f} "
++            f"confidence={m.confidence:.2f}\n{m.content}\n"
++        )
++
++
++def show_experiences(runtime: EvoMeRuntime) -> None:
++    print("\n===== Evolution Experience =====")
++    items = runtime.list_experiences()
++    if not items:
++        print("暂无 Experience")
++    for e in items:
++        context = e.context_data or {}
++        print(
++            f"#{e.id} [{e.task_type}] score={e.score:.2f} success={e.success}\n"
++            f"Context: {context.get('task_type', 'unknown')} / "
++            f"{context.get('complexity', 'unknown')} / "
++            f"{context.get('interaction_mode', 'unknown')}\n"
++            f"{e.result_summary}\n"
++        )
++
++
++def show_reflections(runtime: EvoMeRuntime) -> None:
++    print("\n===== Reflection =====")
++    items = runtime.list_reflections()
++    if not items:
++        print("暂无 Reflection")
++    for r in items:
++        insight = r.insight or r.lesson
++        print(
++            f"#{r.id} [{r.reflection_type}] confidence={r.confidence:.2f}\n"
++            f"观察: {r.observation}\n"
++            f"Insight: {insight}\n"
++            f"Applicable Context: {r.applicable_context or {}}\n"
++            f"Strategy Signal: {r.strategy_signal}\n"
++            f"Skill Signal: {r.skill_signal}\n"
++        )
++
++
++def show_hypotheses(runtime: EvoMeRuntime) -> None:
++    print("\n===== Strategy Hypotheses =====")
++    items = runtime.list_hypotheses()
++    if not items:
++        print("暂无 Strategy Hypothesis")
++    for h in items:
++        print(
++            f"H#{h.id} [{h.status}] confidence={h.confidence:.2f} revision={h.current_revision}\n"
++            f"{h.title}\n"
++            f"WHEN: {h.applicable_context or {}}\n"
++            f"DO: {h.proposed_change}\n"
++            f"EXPECT: {h.expected_effect}\n"
++            f"Evidence: support={h.supporting_count} refine={h.refinement_count} "
++            f"counter={h.counter_count} independent={h.independent_evidence_count} "
++            f"independent_support={h.independent_support_count} "
++            f"diversity={h.context_diversity}\n"
++        )
++
++
++def show_revisions(runtime: EvoMeRuntime) -> None:
++    print("\n===== Hypothesis Revisions =====")
++    hypotheses = runtime.list_hypotheses()
++    if not hypotheses:
++        print("暂无 Hypothesis Revision")
++        return
++    for hypothesis in hypotheses:
++        revisions = runtime.list_hypothesis_revisions(hypothesis.id)
++        for revision in revisions:
++            marker = " *current" if revision.revision_number == hypothesis.current_revision else ""
++            print(
++                f"H#{hypothesis.id}:r{revision.revision_number}{marker} "
++                f"reason={revision.created_reason}\n"
++                f"WHEN: {revision.when_data or {}}\n"
++                f"DO: {revision.do_data or {}}\n"
++                f"EXPECT: {revision.expect_data or {}}\n"
++            )
++
++
++def show_interactions(runtime: EvoMeRuntime) -> None:
++    print("\n===== Audit Log =====")
++    items = runtime.list_interactions()
++    if not items:
++        print("暂无 InteractionRecord")
++    for r in items:
++        preview = r.assistant_response[:160]
++        suffix = "..." if len(r.assistant_response) > 160 else ""
++        print(
++            f"#{r.id} session={r.session_id[:8]} strategy={r.strategy_name}\n"
++            f"User: {r.user_input}\nAssistant: {preview}{suffix}\n"
++        )
++
++
++def show_skills(runtime: EvoMeRuntime) -> None:
++    print("\n===== Skills =====")
++    for skill in runtime.skill_registry.list_skills():
++        print(f"- {skill.name}: {skill.description}")
++        for impl in runtime.skill_registry.list_implementations(skill.name):
++            print(f"    -> {impl.name} ({impl.kind})")
++
++
++def main() -> None:
++    init_db()
++    print("🌱 EvoMe V0.2.1-dev Core")
++    print(
++        "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
++        "/audit  /skills  /exit\n"
++    )
++
++    with SessionLocal() as db:
++        runtime = EvoMeRuntime(db)
++        while True:
++            user_input = input("You > ").strip()
++            if not user_input:
++                continue
++            if user_input == "/exit":
++                print("EvoMe > 下次见。")
++                break
++            if user_input == "/memory":
++                show_personal_memories(runtime); continue
++            if user_input == "/experience":
++                show_experiences(runtime); continue
++            if user_input == "/reflection":
++                show_reflections(runtime); continue
++            if user_input == "/hypothesis":
++                show_hypotheses(runtime); continue
++            if user_input == "/revision":
++                show_revisions(runtime); continue
++            if user_input == "/audit":
++                show_interactions(runtime); continue
++            if user_input == "/skills":
++                show_skills(runtime); continue
++
++            try:
++                result = runtime.run(user_input)
++                print(f"\nEvoMe > {result['response']}\n")
++                print(
++                    "DEBUG | "
++                    f"strategy={result['strategy_name']} "
++                    f"score={result['evaluation_score']:.2f} "
++                    f"interaction={result['interaction_id']} "
++                    f"personal_memory+={result['personal_memories_saved']} "
++                    f"experience={result['experience_saved']} "
++                    f"reflection={result['reflection_saved']} "
++                    f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']}\n"
++                )
++            except Exception as exc:
++                print(f"\n❌ EvoMe Error: {exc}\n")
++
++
++if __name__ == "__main__":
++    main()

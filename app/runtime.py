@@ -148,5 +148,8 @@ class EvoMeRuntime:
     def list_hypotheses(self):
         return self.hypothesis_service.list_all()
 
+    def list_hypothesis_revisions(self, hypothesis_id: int):
+        return self.hypothesis_service.list_revisions(hypothesis_id)
+
     def list_interactions(self, limit: int = 20):
         return self.audit_service.list_recent(limit=limit)
