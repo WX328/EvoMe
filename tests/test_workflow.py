@@ -234,3 +234,16 @@ def test_refines_does_not_promote_current_hypothesis(db):
     assert updated.independent_support_count == 2
     assert updated.status == "needs_revision"
     assert updated.status != "ready_for_review"
+
+
+def test_structural_module_boundary_task_is_not_missed_by_experience_gate(db):
+    runtime = EvoMeRuntime(db, llm=FakeLLM(), session_id="test-session")
+
+    result = runtime.run(
+        "请和我一起检查 PersonalMemory 和 Experience 两个模块之间的数据边界，"
+        "分析各自职责、数据流和最容易混淆的职责边界。"
+    )
+
+    assert result["experience_saved"] is True
+    assert result["experience_gate_source"] == "deterministic_hard_pass"
+    assert result["context_data"]["task_type"] == "architecture_design"

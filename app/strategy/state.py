@@ -28,3 +28,4 @@ class EvoMeState(TypedDict, total=False):
 
     hypothesis_id: int | None
     hypothesis_action: str
+    revision_signal_count: int

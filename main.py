@@ -92,6 +92,27 @@ def show_revisions(runtime: EvoMeRuntime) -> None:
             )
 
 
+def show_revision_signals(runtime: EvoMeRuntime) -> None:
+    print("\n===== Revision Signals =====")
+    signals = runtime.list_revision_signals()
+    invalid_count = runtime.count_invalid_revision_signals()
+    if invalid_count:
+        print(f"(已忽略 {invalid_count} 条旧版/无效 Revision Signal)")
+    if not signals:
+        print("暂无有效 Revision Signal")
+        return
+    for signal in signals:
+        print(
+            f"RS#{signal.id} -> H#{signal.hypothesis_id}:r{signal.base_revision} "
+            f"reflection=R#{signal.reflection_id} "
+            f"confidence={signal.confidence:.2f}\n"
+            f"{signal.dimension} / {signal.operation} / {signal.target_field}\n"
+            f"before: {signal.before_data}\n"
+            f"observed: {signal.observed_data}\n"
+            f"change: {signal.canonical_change}\n"
+        )
+
+
 def show_interactions(runtime: EvoMeRuntime) -> None:
     print("\n===== Audit Log =====")
     items = runtime.list_interactions()
@@ -119,7 +140,7 @@ def main() -> None:
     print("🌱 EvoMe V0.2.1-dev Core")
     print(
         "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
-        "/audit  /skills  /exit\n"
+        "/revision-signals  /audit  /skills  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -141,6 +162,8 @@ def main() -> None:
                 show_hypotheses(runtime); continue
             if user_input == "/revision":
                 show_revisions(runtime); continue
+            if user_input == "/revision-signals":
+                show_revision_signals(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
             if user_input == "/skills":
@@ -156,8 +179,10 @@ def main() -> None:
                     f"interaction={result['interaction_id']} "
                     f"personal_memory+={result['personal_memories_saved']} "
                     f"experience={result['experience_saved']} "
+                    f"gate={result['experience_gate_source']} "
                     f"reflection={result['reflection_saved']} "
-                    f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']}\n"
+                    f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']} "
+                    f"revision_signals={result['revision_signal_count']}\n"
                 )
             except Exception as exc:
                 print(f"\n❌ EvoMe Error: {exc}\n")

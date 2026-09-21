@@ -177,6 +177,54 @@ class HypothesisEvidence(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
 
+class RevisionSignal(Base):
+    """REFINES Evidence 对某个 Hypothesis Revision 提出的局部修改信号。
+
+    Phase 2 仅记录信号，不自动聚合、生成 Proposal 或修改 Hypothesis。
+    """
+    __tablename__ = "revision_signals"
+    __table_args__ = (
+        UniqueConstraint(
+            "hypothesis_id",
+            "base_revision",
+            "reflection_id",
+            "dimension",
+            "operation",
+            "target_field",
+            name="uq_revision_signal_identity",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    base_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    reflection_id: Mapped[int] = mapped_column(
+        ForeignKey("reflection_records.id"), index=True
+    )
+    # 逻辑引用 Evidence ID，不使用数据库 FK。原因：V0.2 -> V0.2.1 的 SQLite
+    # migration 会重建 hypothesis_evidence 表；避免新表在旧库迁移时绑定到临时 backup 表。
+    evidence_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    interaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("interaction_records.id"), nullable=True, index=True
+    )
+
+    dimension: Mapped[str] = mapped_column(String(32), index=True)
+    operation: Mapped[str] = mapped_column(String(32), index=True)
+    target_field: Mapped[str] = mapped_column(String(100), index=True)
+
+    before_data: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
+        JSON, nullable=True
+    )
+    observed_data: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
+        JSON, nullable=True
+    )
+    canonical_change: Mapped[str] = mapped_column(Text)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
 class StrategyRecord(Base):
     __tablename__ = "strategy_records"
 

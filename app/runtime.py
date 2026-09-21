@@ -19,6 +19,7 @@ from app.gates.personal_memory_gate import PersonalMemoryGate
 from app.hypothesis.aggregator import HypothesisAggregator
 from app.hypothesis.relation_judge import HypothesisRelationJudge
 from app.hypothesis.retriever import HybridHypothesisRetriever
+from app.hypothesis.revision_signal import RevisionSignalService
 from app.hypothesis.service import HypothesisService
 from app.llm import DeepSeekClient
 from app.memory.service import PersonalMemoryService
@@ -38,6 +39,7 @@ class EvoMeRuntime:
         self.personal_memory_service = PersonalMemoryService(db)
         self.evolution_memory_service = EvolutionMemoryService(db)
         self.hypothesis_service = HypothesisService(db)
+        self.revision_signal_service = RevisionSignalService(db)
 
         self.personal_memory_gate = PersonalMemoryGate(self.llm)
         self.experience_gate = ExperienceGate(self.llm)
@@ -130,10 +132,14 @@ class EvoMeRuntime:
             "interaction_id": state.get("interaction_id"),
             "personal_memories_saved": state.get("personal_memories_saved", 0),
             "experience_saved": bool(state.get("experience_saved", False)),
+            "experience_gate_source": str(
+                state.get("experience_gate", {}).get("decision_source", "unknown")
+            ),
             "reflection_saved": bool(state.get("reflection_saved", False)),
             "context_data": state.get("context_data", {}),
             "hypothesis_id": state.get("hypothesis_id"),
             "hypothesis_action": state.get("hypothesis_action", "skipped"),
+            "revision_signal_count": int(state.get("revision_signal_count", 0)),
         }
 
     def list_personal_memories(self):
@@ -150,6 +156,12 @@ class EvoMeRuntime:
 
     def list_hypothesis_revisions(self, hypothesis_id: int):
         return self.hypothesis_service.list_revisions(hypothesis_id)
+
+    def list_revision_signals(self):
+        return self.revision_signal_service.list_all()
+
+    def count_invalid_revision_signals(self) -> int:
+        return self.revision_signal_service.count_invalid()
 
     def list_interactions(self, limit: int = 20):
         return self.audit_service.list_recent(limit=limit)

@@ -7,8 +7,9 @@ from sqlalchemy.orm import Session
 from app.hypothesis.canonical import build_canonical_signal
 from app.hypothesis.relation_judge import HypothesisRelationJudge
 from app.hypothesis.retriever import HypothesisRetriever
+from app.hypothesis.revision_signal import RevisionSignalService
 from app.hypothesis.service import HypothesisService
-from app.models import ReflectionRecord, StrategyHypothesis
+from app.models import Experience, HypothesisRevision, ReflectionRecord, StrategyHypothesis
 
 
 class HypothesisAggregator:
@@ -24,6 +25,7 @@ class HypothesisAggregator:
     ) -> None:
         self.db = db
         self.service = HypothesisService(db)
+        self.revision_signal_service = RevisionSignalService(db)
         self.relation_judge = relation_judge
         self.retriever = retriever
         self.top_k = top_k
@@ -37,25 +39,58 @@ class HypothesisAggregator:
         for hypothesis in self.service.list_all(include_inactive=False):
             self.retriever.index(hypothesis)
 
-    @staticmethod
-    def _reflection_payload(reflection: ReflectionRecord) -> dict[str, Any]:
+    def _reflection_payload(self, reflection: ReflectionRecord) -> dict[str, Any]:
+        user_feedback = ""
+        if reflection.experience_id is not None:
+            experience = self.db.get(Experience, reflection.experience_id)
+            if experience is not None and experience.user_feedback:
+                user_feedback = str(experience.user_feedback).strip()
         return {
             "insight": reflection.insight,
             "applicable_context": reflection.applicable_context or {},
             "proposed_change": reflection.strategy_signal,
             "expected_effect": reflection.expected_effect,
             "canonical_signal": reflection.canonical_signal,
+            "user_feedback": user_feedback,
         }
 
+    def _hypothesis_payload(self, hypothesis: StrategyHypothesis) -> dict[str, Any]:
+        revision = self.service.get_revision(
+            hypothesis.id,
+            int(hypothesis.current_revision or hypothesis.revision or 1),
+        )
+        if revision is None:
+            return {
+                "id": hypothesis.id,
+                "revision": hypothesis.current_revision,
+                "insight": hypothesis.insight,
+                "applicable_context": hypothesis.applicable_context or {},
+                "proposed_change": hypothesis.proposed_change,
+                "expected_effect": hypothesis.expected_effect,
+                "canonical_signal": hypothesis.canonical_signal,
+                "confidence": hypothesis.confidence,
+            }
+        return self._revision_payload(hypothesis, revision)
+
     @staticmethod
-    def _hypothesis_payload(hypothesis: StrategyHypothesis) -> dict[str, Any]:
+    def _revision_payload(
+        hypothesis: StrategyHypothesis,
+        revision: HypothesisRevision,
+    ) -> dict[str, Any]:
         return {
             "id": hypothesis.id,
-            "insight": hypothesis.insight,
-            "applicable_context": hypothesis.applicable_context or {},
-            "proposed_change": hypothesis.proposed_change,
-            "expected_effect": hypothesis.expected_effect,
-            "canonical_signal": hypothesis.canonical_signal,
+            "revision": revision.revision_number,
+            "insight": revision.insight,
+            "when_data": revision.when_data or {},
+            "do_data": revision.do_data or {},
+            "expect_data": revision.expect_data or {},
+            # 同时保留 Relation Judge 已熟悉的语义键名，减少提示词漂移。
+            "applicable_context": revision.when_data or {},
+            "proposed_change": (revision.do_data or {}).get("text", revision.do_data or {}),
+            "expected_effect": (revision.expect_data or {}).get(
+                "text", revision.expect_data or {}
+            ),
+            "canonical_signal": revision.canonical_signal,
             "confidence": hypothesis.confidence,
         }
 
@@ -65,6 +100,7 @@ class HypothesisAggregator:
                 "action": "skipped",
                 "hypothesis_id": None,
                 "reason": "Reflection 没有可执行 strategy_signal 或 insight",
+                "revision_signal_count": 0,
             }
 
         canonical_signal = reflection.canonical_signal.strip() or build_canonical_signal(
@@ -83,7 +119,15 @@ class HypothesisAggregator:
             score_threshold=self.score_threshold,
         )
 
-        judged: list[tuple[float, str, str, StrategyHypothesis]] = []
+        judged: list[
+            tuple[
+                float,
+                str,
+                str,
+                list[dict[str, Any]],
+                StrategyHypothesis,
+            ]
+        ] = []
         for match in matches:
             hypothesis = self.service.get(match.hypothesis_id)
             if hypothesis is None or hypothesis.status not in {
@@ -98,18 +142,32 @@ class HypothesisAggregator:
             confidence = float(decision["confidence"])
             if relation == "UNRELATED" or confidence < self.min_relation_confidence:
                 continue
-            judged.append((confidence, relation, decision["reason"], hypothesis))
+            judged.append(
+                (
+                    confidence,
+                    relation,
+                    decision["reason"],
+                    list(decision.get("revision_signals") or []),
+                    hypothesis,
+                )
+            )
 
         if judged:
-            confidence, relation, reason, hypothesis = max(
+            confidence, relation, reason, raw_revision_signals, hypothesis = max(
                 judged, key=lambda item: item[0]
             )
-            self.service.add_evidence(
+            evidence = self.service.add_evidence(
                 hypothesis=hypothesis,
                 reflection=reflection,
                 relation_type=relation,
                 relation_confidence=confidence,
                 relation_reason=reason,
+            )
+            created_signals = self.revision_signal_service.create_from_refines(
+                hypothesis=hypothesis,
+                reflection=reflection,
+                evidence=evidence,
+                raw_signals=raw_revision_signals,
             )
             updated = self.service.get(hypothesis.id)
             if updated is not None:
@@ -119,6 +177,7 @@ class HypothesisAggregator:
                 "hypothesis_id": hypothesis.id,
                 "relation": relation,
                 "relation_confidence": confidence,
+                "revision_signal_count": len(created_signals),
             }
 
         hypothesis = self.service.create_from_reflection(
@@ -131,4 +190,5 @@ class HypothesisAggregator:
             "hypothesis_id": hypothesis.id,
             "relation": "SUPPORTS",
             "relation_confidence": reflection.confidence,
+            "revision_signal_count": 0,
         }

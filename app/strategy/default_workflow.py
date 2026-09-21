@@ -173,7 +173,10 @@ class DefaultConversationStrategy:
             result_summary=gate["result_summary"],
             success=bool(evaluation.get("success", False)),
             score=float(evaluation.get("score", 0.0)),
-            experience_metadata={"gate_reason": gate.get("reason", "")},
+            experience_metadata={
+                "gate_reason": gate.get("reason", ""),
+                "gate_source": gate.get("decision_source", "unknown"),
+            },
             context_data=context_data,
         )
         return {"experience_saved": True, "experience_id": experience.id}
@@ -232,14 +235,23 @@ class DefaultConversationStrategy:
     def _aggregate_hypothesis(self, state: EvoMeState) -> dict:
         reflection_id = state.get("reflection_id")
         if reflection_id is None:
-            return {"hypothesis_id": None, "hypothesis_action": "skipped"}
+            return {
+                "hypothesis_id": None,
+                "hypothesis_action": "skipped",
+                "revision_signal_count": 0,
+            }
         reflection = self.evolution_memory_service.db.get(ReflectionRecord, reflection_id)
         if reflection is None:
-            return {"hypothesis_id": None, "hypothesis_action": "skipped"}
+            return {
+                "hypothesis_id": None,
+                "hypothesis_action": "skipped",
+                "revision_signal_count": 0,
+            }
         result = self.hypothesis_aggregator.process(reflection)
         return {
             "hypothesis_id": result.get("hypothesis_id"),
             "hypothesis_action": result.get("action", "skipped"),
+            "revision_signal_count": int(result.get("revision_signal_count", 0)),
         }
 
     def _build_graph(self):
@@ -299,5 +311,6 @@ class DefaultConversationStrategy:
                 "reflection_id": None,
                 "hypothesis_id": None,
                 "hypothesis_action": "skipped",
+                "revision_signal_count": 0,
             }
         )

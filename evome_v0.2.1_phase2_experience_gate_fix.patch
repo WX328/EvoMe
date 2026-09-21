@@ -1,0 +1,461 @@
+diff --git a/app/gates/experience_gate.py b/app/gates/experience_gate.py
+index 86c4ec2..b73fcbc 100644
+--- a/app/gates/experience_gate.py
++++ b/app/gates/experience_gate.py
+@@ -1,13 +1,32 @@
++from __future__ import annotations
++
++import re
+ from typing import Any
+ 
+ 
+ EXPERIENCE_GATE_PROMPT = """
+ 你是 EvoMe 的 Experience Gate。
+ 
+-判断“EvoMe 这次执行本身”是否值得成为进化经验。
++你的职责是判断“EvoMe 这次执行本身”是否具有长期学习价值，是否值得保存为 Experience。
++这里判断的是 Learning Value，不是“用户的问题重不重要”，也不是“这次回答是否成功”。
++
++值得保存：
++- 失败/部分失败、用户纠正、明显低分结果；
++- 可复用的成功执行模式；
++- 多步骤、跨模块、有明显权衡的设计/调试/规划任务；
++- Strategy/Skill 有意义地参与并产生了可评价结果；
++- 与历史经验冲突，或可能改变后续 Strategy/Skill 的执行经验。
++
++通常不保存：
++- 普通定义问答；
++- 低价值闲聊；
++- 简单、重复、没有新学习信号的普通成功；
++- 只是在陈述用户事实、但没有形成 EvoMe 执行经验的交互。
+ 
+-值得保存：失败/部分失败、用户纠正、明确的成功模式、Strategy/Skill 有意义地参与且有结果、与历史经验冲突。
+-通常不保存：普通定义问答、重复回答、低价值闲聊、没有学习信号的普通成功。
++注意：
++1. Experience 可以保存，即使后续 Reflection 最终没有产生新 Insight。
++2. “成功”不等于“值得保存”；“失败”也可能具有很高学习价值。
++3. 不要因为回答看起来完整，就自动 should_save=true。
+ 
+ 严格 JSON：
+ {
+@@ -20,9 +39,248 @@ EXPERIENCE_GATE_PROMPT = """
+ 
+ 
+ class ExperienceGate:
++    """Hybrid Experience Gate.
++
++    Clear high-value/low-value cases are handled deterministically so that
++    evolution is stable and cheap. Only ambiguous cases are delegated to LLM.
++    """
++
++    _CORRECTION_MARKERS = (
++        "不对",
++        "错了",
++        "不是这样",
++        "你理解错",
++        "有问题",
++        "不行",
++        "重新来",
++        "重新分析",
++        "需要修正",
++    )
++
++    _ARCHITECTURE_TERMS = (
++        "架构",
++        "模块",
++        "组件",
++        "职责",
++        "边界",
++        "数据流",
++        "调用流程",
++        "读写流程",
++        "反模式",
++        "分层",
++        "存储层",
++        "memory",
++        "strategy",
++        "skill",
++        "context builder",
++        "reflection",
++        "hypothesis",
++        "aggregator",
++    )
++
++    _DESIGN_ACTION_MARKERS = (
++        "设计",
++        "分析",
++        "检查",
++        "划分",
++        "梳理",
++        "讨论",
++        "比较",
++        "明确",
++        "怎么流动",
++        "怎么调用",
++        "如何流转",
++    )
++
++    _DEBUG_PROBLEM_MARKERS = (
++        "报错",
++        "错误",
++        "异常",
++        "冲突",
++        "失败",
++        "bug",
++        "崩溃",
++        "traceback",
++    )
++
++    _DEBUG_ACTION_MARKERS = (
++        "排查",
++        "定位",
++        "诊断",
++        "修复",
++        "解决",
++        "为什么",
++        "原因",
++    )
++
++    _PLANNING_MARKERS = (
++        "项目规划",
++        "路线图",
++        "里程碑",
++        "阶段规划",
++        "实施计划",
++        "落地计划",
++    )
++
++    _LOW_VALUE_MARKERS = (
++        "是什么",
++        "什么意思",
++        "怎么翻译",
++        "翻译成",
++        "英文怎么说",
++        "怎么读",
++        "你好",
++        "hello",
++        "hi",
++    )
++
+     def __init__(self, llm):
+         self.llm = llm
+ 
++    @staticmethod
++    def _normalize_text(text: str) -> str:
++        return re.sub(r"\s+", " ", str(text or "")).strip()
++
++    @classmethod
++    def _contains_any(cls, text: str, markers: tuple[str, ...]) -> bool:
++        lowered = text.lower()
++        return any(marker.lower() in lowered for marker in markers)
++
++    @classmethod
++    def _count_terms(cls, text: str, markers: tuple[str, ...]) -> int:
++        lowered = text.lower()
++        return sum(1 for marker in markers if marker.lower() in lowered)
++
++    @classmethod
++    def _infer_structural_task_type(cls, user_input: str) -> str | None:
++        """Conservative deterministic task recognition for obvious cases only."""
++        text = cls._normalize_text(user_input)
++
++        architecture_term_count = cls._count_terms(text, cls._ARCHITECTURE_TERMS)
++        has_design_action = cls._contains_any(text, cls._DESIGN_ACTION_MARKERS)
++        if architecture_term_count >= 2 and has_design_action:
++            return "architecture_design"
++
++        has_debug_problem = cls._contains_any(text, cls._DEBUG_PROBLEM_MARKERS)
++        has_debug_action = cls._contains_any(text, cls._DEBUG_ACTION_MARKERS)
++        if has_debug_problem and has_debug_action:
++            return "debugging"
++
++        if cls._contains_any(text, cls._PLANNING_MARKERS):
++            return "project_planning"
++
++        return None
++
++    @classmethod
++    def _is_obvious_low_value(cls, user_input: str) -> bool:
++        text = cls._normalize_text(user_input)
++        if not text:
++            return True
++
++        # Only hard-skip very short, clearly definitional/chitchat requests.
++        # Anything structurally rich remains eligible for LLM judgment.
++        if len(text) > 80:
++            return False
++        if cls._infer_structural_task_type(text) is not None:
++            return False
++        return cls._contains_any(text, cls._LOW_VALUE_MARKERS)
++
++    @staticmethod
++    def _compact_summary(
++        *,
++        user_input: str,
++        assistant_response: str,
++        task_type: str,
++        evaluation: dict[str, Any],
++    ) -> str:
++        user_text = ExperienceGate._normalize_text(user_input)
++        response_text = ExperienceGate._normalize_text(assistant_response)
++        reason = ExperienceGate._normalize_text(evaluation.get("reason", ""))
++
++        user_preview = user_text[:140]
++        response_preview = response_text[:300]
++        parts = [f"[{task_type}] 用户任务：{user_preview}"]
++        if response_preview:
++            parts.append(f"执行结果：{response_preview}")
++        if reason:
++            parts.append(f"评估：{reason[:120]}")
++        return "；".join(parts)
++
++    def _deterministic_decision(
++        self,
++        *,
++        user_input: str,
++        assistant_response: str,
++        evaluation: dict[str, Any],
++    ) -> dict[str, Any] | None:
++        score = max(0.0, min(1.0, float(evaluation.get("score", 0.5))))
++        success = bool(evaluation.get("success", score >= 0.7))
++        structural_task_type = self._infer_structural_task_type(user_input)
++
++        # Meaningful failures are learning evidence even when the original task
++        # itself was simple. Keep this rule before hard-skip.
++        if (not success) or score < 0.65:
++            task_type = structural_task_type or "general"
++            return {
++                "should_save": True,
++                "task_type": task_type,
++                "result_summary": self._compact_summary(
++                    user_input=user_input,
++                    assistant_response=assistant_response,
++                    task_type=task_type,
++                    evaluation=evaluation,
++                ),
++                "reason": "deterministic: meaningful failure/low-score outcome has learning value",
++                "decision_source": "deterministic_hard_pass",
++            }
++
++        # Explicit user correction is a strong learning signal.
++        if self._contains_any(user_input, self._CORRECTION_MARKERS):
++            task_type = structural_task_type or "general"
++            return {
++                "should_save": True,
++                "task_type": task_type,
++                "result_summary": self._compact_summary(
++                    user_input=user_input,
++                    assistant_response=assistant_response,
++                    task_type=task_type,
++                    evaluation=evaluation,
++                ),
++                "reason": "deterministic: explicit correction/revision signal from user",
++                "decision_source": "deterministic_hard_pass",
++            }
++
++        # Clear reusable structural work should not depend on a stochastic gate.
++        if structural_task_type is not None:
++            return {
++                "should_save": True,
++                "task_type": structural_task_type,
++                "result_summary": self._compact_summary(
++                    user_input=user_input,
++                    assistant_response=assistant_response,
++                    task_type=structural_task_type,
++                    evaluation=evaluation,
++                ),
++                "reason": (
++                    "deterministic: structurally significant design/debug/planning "
++                    "task has reusable execution value"
++                ),
++                "decision_source": "deterministic_hard_pass",
++            }
++
++        # Save tokens on only the clearest low-value cases. Everything else
++        # remains ambiguous and is sent to the LLM gate.
++        if self._is_obvious_low_value(user_input):
++            return {
++                "should_save": False,
++                "task_type": "general",
++                "result_summary": "",
++                "reason": "deterministic: short definitional/chitchat interaction",
++                "decision_source": "deterministic_hard_skip",
++            }
++
++        return None
++
+     def evaluate(
+         self,
+         *,
+@@ -32,6 +290,14 @@ class ExperienceGate:
+         strategy_name: str,
+         skills_used: list[str],
+     ) -> dict[str, Any]:
++        deterministic = self._deterministic_decision(
++            user_input=user_input,
++            assistant_response=assistant_response,
++            evaluation=evaluation,
++        )
++        if deterministic is not None:
++            return deterministic
++
+         result = self.llm.json_chat(
+             [
+                 {"role": "system", "content": EXPERIENCE_GATE_PROMPT},
+@@ -53,4 +319,5 @@ class ExperienceGate:
+             "task_type": str(result.get("task_type", "general")).strip() or "general",
+             "result_summary": str(result.get("result_summary", "")).strip(),
+             "reason": str(result.get("reason", "")).strip(),
++            "decision_source": "llm",
+         }
+diff --git a/app/runtime.py b/app/runtime.py
+index f0a9b5b..76ee1db 100644
+--- a/app/runtime.py
++++ b/app/runtime.py
+@@ -132,6 +132,9 @@ class EvoMeRuntime:
+             "interaction_id": state.get("interaction_id"),
+             "personal_memories_saved": state.get("personal_memories_saved", 0),
+             "experience_saved": bool(state.get("experience_saved", False)),
++            "experience_gate_source": str(
++                state.get("experience_gate", {}).get("decision_source", "unknown")
++            ),
+             "reflection_saved": bool(state.get("reflection_saved", False)),
+             "context_data": state.get("context_data", {}),
+             "hypothesis_id": state.get("hypothesis_id"),
+diff --git a/app/strategy/default_workflow.py b/app/strategy/default_workflow.py
+index b12802e..a81d27b 100644
+--- a/app/strategy/default_workflow.py
++++ b/app/strategy/default_workflow.py
+@@ -173,7 +173,10 @@ class DefaultConversationStrategy:
+             result_summary=gate["result_summary"],
+             success=bool(evaluation.get("success", False)),
+             score=float(evaluation.get("score", 0.0)),
+-            experience_metadata={"gate_reason": gate.get("reason", "")},
++            experience_metadata={
++                "gate_reason": gate.get("reason", ""),
++                "gate_source": gate.get("decision_source", "unknown"),
++            },
+             context_data=context_data,
+         )
+         return {"experience_saved": True, "experience_id": experience.id}
+diff --git a/main.py b/main.py
+index 10d8f25..605c786 100644
+--- a/main.py
++++ b/main.py
+@@ -176,6 +176,7 @@ def main() -> None:
+                     f"interaction={result['interaction_id']} "
+                     f"personal_memory+={result['personal_memories_saved']} "
+                     f"experience={result['experience_saved']} "
++                    f"gate={result['experience_gate_source']} "
+                     f"reflection={result['reflection_saved']} "
+                     f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']} "
+                     f"revision_signals={result['revision_signal_count']}\n"
+diff --git a/tests/test_experience_gate.py b/tests/test_experience_gate.py
+new file mode 100644
+index 0000000..2012db6
+--- /dev/null
++++ b/tests/test_experience_gate.py
+@@ -0,0 +1,82 @@
++from app.gates.experience_gate import ExperienceGate
++
++
++class CountingLLM:
++    def __init__(self, result=None):
++        self.calls = 0
++        self.result = result or {
++            "should_save": False,
++            "task_type": "general",
++            "result_summary": "",
++            "reason": "ambiguous ordinary interaction",
++        }
++
++    def json_chat(self, messages, temperature=0.1):
++        self.calls += 1
++        return dict(self.result)
++
++
++def evaluate(gate: ExperienceGate, user_input: str, *, score=0.95, success=True):
++    return gate.evaluate(
++        user_input=user_input,
++        assistant_response="给出了一份结构清晰、可执行的回答。",
++        evaluation={"score": score, "success": success, "reason": "test"},
++        strategy_name="default_conversation_strategy_v2",
++        skills_used=["recall_relevant_memory"],
++    )
++
++
++def test_structural_architecture_task_hard_passes_without_llm():
++    llm = CountingLLM()
++    gate = ExperienceGate(llm)
++
++    result = evaluate(
++        gate,
++        "请和我一起检查 PersonalMemory 和 Experience 两个模块的数据边界、职责边界和数据流。",
++    )
++
++    assert result["should_save"] is True
++    assert result["task_type"] == "architecture_design"
++    assert result["decision_source"] == "deterministic_hard_pass"
++    assert llm.calls == 0
++
++
++def test_short_definition_hard_skips_without_llm():
++    llm = CountingLLM()
++    gate = ExperienceGate(llm)
++
++    result = evaluate(gate, "Python 的 list 是什么？")
++
++    assert result["should_save"] is False
++    assert result["decision_source"] == "deterministic_hard_skip"
++    assert llm.calls == 0
++
++
++def test_failure_hard_passes_even_for_ordinary_task():
++    llm = CountingLLM()
++    gate = ExperienceGate(llm)
++
++    result = evaluate(gate, "请解释一下这个问题。", score=0.4, success=False)
++
++    assert result["should_save"] is True
++    assert result["decision_source"] == "deterministic_hard_pass"
++    assert "failure" in result["reason"]
++    assert llm.calls == 0
++
++
++def test_ambiguous_case_falls_back_to_llm():
++    llm = CountingLLM(
++        {
++            "should_save": True,
++            "task_type": "general",
++            "result_summary": "有一定学习价值",
++            "reason": "LLM judged ambiguous case valuable",
++        }
++    )
++    gate = ExperienceGate(llm)
++
++    result = evaluate(gate, "帮我看看这个方案是否合理。")
++
++    assert result["should_save"] is True
++    assert result["decision_source"] == "llm"
++    assert llm.calls == 1
+diff --git a/tests/test_workflow.py b/tests/test_workflow.py
+index f464ff5..dc69446 100644
+--- a/tests/test_workflow.py
++++ b/tests/test_workflow.py
+@@ -234,3 +234,16 @@ def test_refines_does_not_promote_current_hypothesis(db):
+     assert updated.independent_support_count == 2
+     assert updated.status == "needs_revision"
+     assert updated.status != "ready_for_review"
++
++
++def test_structural_module_boundary_task_is_not_missed_by_experience_gate(db):
++    runtime = EvoMeRuntime(db, llm=FakeLLM(), session_id="test-session")
++
++    result = runtime.run(
++        "请和我一起检查 PersonalMemory 和 Experience 两个模块之间的数据边界，"
++        "分析各自职责、数据流和最容易混淆的职责边界。"
++    )
++
++    assert result["experience_saved"] is True
++    assert result["experience_gate_source"] == "deterministic_hard_pass"
++    assert result["context_data"]["task_type"] == "architecture_design"

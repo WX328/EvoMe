@@ -9,6 +9,7 @@ from app.context.schema import (
     TASK_TYPES,
     clamp_confidence,
     normalize_enum,
+    split_context,
 )
 
 
@@ -94,6 +95,16 @@ class ContextBuilder:
     def _field_meta(source: str, confidence: float) -> dict[str, Any]:
         return {"source": source, "confidence": clamp_confidence(confidence)}
 
+    @staticmethod
+    def _scope_bounded(user_input: str) -> bool:
+        text = user_input.lower()
+        markers = (
+            "只想", "只需要", "只讨论", "只分析", "仅",
+            "不涉及", "不要涉及", "不讨论", "限定", "范围",
+            "only", "without", "limit to", "scope", "do not include",
+        )
+        return any(marker in text for marker in markers)
+
     def build(
         self,
         *,
@@ -156,6 +167,14 @@ class ContextBuilder:
         project_name = str(result.get("project_name", "unknown") or "unknown").strip()
         project_stage = str(result.get("project_stage", "unknown") or "unknown").strip()
         explicit_instruction = str(result.get("explicit_instruction", "") or "").strip()
+        scope_bounded = self._scope_bounded(user_input)
+        explicit_instruction_present = bool(explicit_instruction)
+        cross_module = bool(complexity_indicators.get("cross_module", False))
+        multi_step = bool(complexity_indicators.get("multi_step", False))
+        tradeoff = bool(complexity_indicators.get("tradeoff", False))
+        ambiguity = bool(complexity_indicators.get("ambiguity", False))
+        long_term_state = bool(complexity_indicators.get("long_term_state", False))
+        external_tool = bool(complexity_indicators.get("external_tool", False))
 
         field_meta = {
             "task_type": self._field_meta(task_source, task_confidence),
@@ -174,6 +193,16 @@ class ContextBuilder:
             "project_stage": self._field_meta(
                 "inferred", result.get("project_stage_confidence", 0.6)
             ),
+            "cross_module": self._field_meta("deterministic", 0.9),
+            "multi_step": self._field_meta("deterministic", 0.9),
+            "tradeoff": self._field_meta("deterministic", 0.9),
+            "ambiguity": self._field_meta("deterministic", 0.85),
+            "long_term_state": self._field_meta("deterministic", 0.85),
+            "scope_bounded": self._field_meta("explicit", 1.0),
+            "explicit_instruction_present": self._field_meta(
+                "explicit" if explicit_instruction_present else "inferred",
+                1.0 if explicit_instruction_present else 0.4,
+            ),
             "available_skills": self._field_meta("deterministic", 1.0),
             "available_tools": self._field_meta("deterministic", 1.0),
             "model": self._field_meta("deterministic", 1.0),
@@ -189,21 +218,33 @@ class ContextBuilder:
         ]
         context_confidence = sum(important_confidences) / len(important_confidences)
 
-        return {
+        context = {
             "task_type": task_type,
             "complexity": complexity,
             "risk_level": risk_level,
             "interaction_mode": interaction_mode,
             "explicit_instruction": explicit_instruction,
+            "explicit_instruction_present": explicit_instruction_present,
+            "scope_bounded": scope_bounded,
             "project_name": project_name or "unknown",
             "project_stage": project_stage or "unknown",
+            "cross_module": cross_module,
+            "multi_step": multi_step,
+            "tradeoff": tradeoff,
+            "ambiguity": ambiguity,
+            "long_term_state": long_term_state,
             "available_skills": list(available_skills),
             "available_tools": list(available_tools or []),
             "model": self.model_name,
             "relevant_memory_count": len(relevant_memories),
             "memory_quality": max(0.0, min(1.0, float(memory_quality))),
+            "external_tool": external_tool,
             "complexity_indicators": complexity_indicators,
             "risk_indicators": risk_indicators,
             "field_meta": field_meta,
             "context_confidence": round(context_confidence, 4),
         }
+        applicability_context, execution_context = split_context(context)
+        context["applicability_context"] = applicability_context
+        context["execution_context"] = execution_context
+        return context
