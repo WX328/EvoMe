@@ -113,6 +113,43 @@ def show_revision_signals(runtime: EvoMeRuntime) -> None:
         )
 
 
+
+def show_revision_groups(runtime: EvoMeRuntime) -> None:
+    print("\n===== Revision Signal Groups =====")
+    groups = runtime.list_revision_signal_groups()
+    if not groups:
+        print("暂无可聚合的 Revision Signal Group")
+        return
+    for group in groups:
+        marker = " *analysis_candidate" if group.eligible_for_analysis else ""
+        print(
+            f"H#{group.hypothesis_id}:r{group.base_revision} "
+            f"{group.dimension}/{group.operation}/{group.target_field}{marker}\n"
+            f"signals={group.signal_count} independent={group.independent_count} "
+            f"avg_confidence={group.average_confidence:.2f}\n"
+            f"signal_ids={group.signal_ids} observed={group.observed_values}\n"
+        )
+
+
+def show_evidence_summary(runtime: EvoMeRuntime) -> None:
+    print("\n===== Evidence Summary =====")
+    hypotheses = runtime.list_hypotheses()
+    if not hypotheses:
+        print("暂无 Strategy Hypothesis")
+        return
+    for hypothesis in hypotheses:
+        summary = runtime.get_evidence_summary(hypothesis.id)
+        counts = summary["evidence_counts"]
+        print(
+            f"H#{hypothesis.id}:r{summary['revision']} confidence={summary['confidence']:.2f}\n"
+            f"Evidence: support={counts['supports']} refine={counts['refines']} "
+            f"counter={counts['conflicts']} independent={counts['independent_evidence']}\n"
+            f"Context Coverage: {summary['context_coverage']}\n"
+            f"Revision Groups: {len(summary['revision_groups'])} "
+            f"analysis_candidates={len(summary['analysis_candidates'])}\n"
+        )
+
+
 def show_interactions(runtime: EvoMeRuntime) -> None:
     print("\n===== Audit Log =====")
     items = runtime.list_interactions()
@@ -135,12 +172,38 @@ def show_skills(runtime: EvoMeRuntime) -> None:
             print(f"    -> {impl.name} ({impl.kind})")
 
 
+
+
+def show_background_status(runtime: EvoMeRuntime) -> None:
+    print("\n===== Background Jobs =====")
+    jobs = runtime.list_background_jobs(limit=10)
+    if not jobs:
+        print("暂无后台任务")
+        return
+    for job in jobs:
+        line = f"{job.id} [{job.status}] kind={job.kind}"
+        print(line)
+        if job.status == "completed":
+            result = job.result
+            print(
+                "  "
+                f"interaction={result.get('interaction_id')} "
+                f"score={float(result.get('evaluation_score', 0.0)):.2f} "
+                f"experience={result.get('experience_saved', False)} "
+                f"reflection={result.get('reflection_saved', False)} "
+                f"hypothesis={result.get('hypothesis_action', 'skipped')}:"
+                f"{result.get('hypothesis_id')} "
+                f"revision_signals={result.get('revision_signal_count', 0)}"
+            )
+        elif job.status == "failed":
+            print(f"  error={job.error}")
+
 def main() -> None:
     init_db()
     print("🌱 EvoMe V0.2.1-dev Core")
     print(
         "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
-        "/revision-signals  /audit  /skills  /exit\n"
+        "/revision-signals  /revision-groups  /evidence-summary  /status  /audit  /skills  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -150,6 +213,8 @@ def main() -> None:
             if not user_input:
                 continue
             if user_input == "/exit":
+                print("EvoMe > 正在等待已提交的后台学习任务安全结束...")
+                runtime.shutdown(wait=True)
                 print("EvoMe > 下次见。")
                 break
             if user_input == "/memory":
@@ -164,25 +229,30 @@ def main() -> None:
                 show_revisions(runtime); continue
             if user_input == "/revision-signals":
                 show_revision_signals(runtime); continue
+            if user_input == "/revision-groups":
+                show_revision_groups(runtime); continue
+            if user_input == "/evidence-summary":
+                show_evidence_summary(runtime); continue
+            if user_input == "/status":
+                show_background_status(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
             if user_input == "/skills":
                 show_skills(runtime); continue
 
             try:
-                result = runtime.run(user_input)
-                print(f"\nEvoMe > {result['response']}\n")
+                print("\nEvoMe > ", end="", flush=True)
+                result = runtime.stream_run(
+                    user_input,
+                    on_token=lambda token: print(token, end="", flush=True),
+                )
+                print("\n")
                 print(
-                    "DEBUG | "
+                    "FAST | "
                     f"strategy={result['strategy_name']} "
-                    f"score={result['evaluation_score']:.2f} "
-                    f"interaction={result['interaction_id']} "
-                    f"personal_memory+={result['personal_memories_saved']} "
-                    f"experience={result['experience_saved']} "
-                    f"gate={result['experience_gate_source']} "
-                    f"reflection={result['reflection_saved']} "
-                    f"hypothesis={result['hypothesis_action']}:{result['hypothesis_id']} "
-                    f"revision_signals={result['revision_signal_count']}\n"
+                    f"memory={result['relevant_memory_count']} "
+                    f"background_job={result['background_job_id']} "
+                    f"status={result['background_status']}\n"
                 )
             except Exception as exc:
                 print(f"\n❌ EvoMe Error: {exc}\n")

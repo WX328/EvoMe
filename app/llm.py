@@ -45,6 +45,26 @@ class DeepSeekClient:
         )
 
 
+    def stream_chat(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.4,
+    ):
+        response = self.client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=messages,
+            temperature=temperature,
+            stream=True,
+        )
+
+        for chunk in response:
+            if not chunk.choices:
+                continue
+            content = chunk.choices[0].delta.content or ""
+            if content:
+                yield content
+
+
     def json_chat(
         self,
         messages: list[dict[str, str]],

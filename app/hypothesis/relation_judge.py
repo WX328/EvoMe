@@ -26,7 +26,12 @@ ABSTRACTION: context_scope / action_scope / outcome_scope / hypothesis_scope
 禁止使用 applicable_context、do_data.text、expect_data.text 等宽泛字段。
 禁止把 available_skills / available_tools / model / memory_quality / relevant_memory_count 当作 CONTEXT Revision，它们属于 Execution Context。
 
-operation 只能是 EXPAND / NARROW / ADD_CONDITION / REMOVE_CONDITION / CHANGE / GENERALIZE / SPECIALIZE。
+operation 必须同时符合 dimension 的兼容矩阵：
+- CONTEXT: EXPAND / NARROW / ADD_CONDITION / REMOVE_CONDITION / CHANGE
+- ACTION: EXPAND / CHANGE / GENERALIZE / SPECIALIZE
+- OUTCOME: EXPAND / NARROW / CHANGE
+- ABSTRACTION: GENERALIZE / SPECIALIZE
+例如“给执行流程增加一步”属于 ACTION/EXPAND，不要写 ACTION/ADD_CONDITION。
 before_data 写当前 Hypothesis 里的现有值；observed_data 只写这条 Reflection 真正观察到的新信息；不得提前生成最终 after。
 user_satisfaction 只有存在明确用户反馈时才允许输出；不得从 evaluator score 推断。
 最多输出 5 条原子 Signal。relation 不是 REFINES 时 revision_signals 必须为空数组。

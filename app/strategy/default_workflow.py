@@ -65,14 +65,14 @@ class DefaultConversationStrategy:
             "skills_used": [skill_name],
         }
 
-    def _respond(self, state: EvoMeState) -> dict:
+    def _response_messages(self, state: EvoMeState) -> list[dict[str, str]]:
         memories = state.get("relevant_memories", [])
         memory_context = (
             "\n".join(f"- {memory}" for memory in memories)
             if memories
             else "暂无直接相关的 Personal Memory。"
         )
-        messages = [
+        return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "system",
@@ -80,7 +80,20 @@ class DefaultConversationStrategy:
             },
             {"role": "user", "content": state["user_input"]},
         ]
-        return {"response": self.llm.chat(messages)}
+
+    def _respond(self, state: EvoMeState) -> dict:
+        return {"response": self.llm.chat(self._response_messages(state))}
+
+    def stream_response(self, state: EvoMeState):
+        messages = self._response_messages(state)
+        stream_chat = getattr(self.llm, "stream_chat", None)
+        if callable(stream_chat):
+            yield from stream_chat(messages)
+            return
+        # 测试/兼容路径：旧 LLM adapter 没有 stream_chat 时仍可工作。
+        response = self.llm.chat(messages)
+        if response:
+            yield response
 
     def _evaluate(self, state: EvoMeState) -> dict:
         return {
@@ -254,6 +267,54 @@ class DefaultConversationStrategy:
             "revision_signal_count": int(result.get("revision_signal_count", 0)),
         }
 
+    def _initial_state(self, *, user_input: str, session_id: str) -> EvoMeState:
+        return {
+            "user_input": user_input,
+            "strategy_name": self.name,
+            "strategy_version": self.version,
+            "session_id": session_id,
+            "relevant_memories": [],
+            "memory_quality": 0.0,
+            "skills_used": [],
+            "personal_memory_candidates": [],
+            "personal_memories_saved": 0,
+            "context_data": {},
+            "experience_saved": False,
+            "experience_id": None,
+            "reflection_saved": False,
+            "reflection_id": None,
+            "hypothesis_id": None,
+            "hypothesis_action": "skipped",
+            "revision_signal_count": 0,
+        }
+
+    def prepare_fast_state(self, *, user_input: str, session_id: str) -> EvoMeState:
+        """Synchronous critical path before the first answer token."""
+        state = self._initial_state(user_input=user_input, session_id=session_id)
+        state.update(self._retrieve_memory(state))
+        return state
+
+    def process_slow_state(self, state: EvoMeState) -> EvoMeState:
+        """Post-response learning path. Safe to execute asynchronously."""
+        state = dict(state)
+        state.update(self._evaluate(state))
+        state.update(self._record_interaction(state))
+        state.update(self._extract_personal_memory(state))
+        state.update(self._write_personal_memory(state))
+        state.update(self._experience_gate(state))
+        state.update(self._build_context(state))
+        state.update(self._write_experience(state))
+        if not state.get("experience_saved"):
+            return state
+
+        state.update(self._reflect_experience(state))
+        state.update(self._write_reflection(state))
+        if not state.get("reflection_saved"):
+            return state
+
+        state.update(self._aggregate_hypothesis(state))
+        return state
+
     def _build_graph(self):
         builder = StateGraph(EvoMeState)
         builder.add_node("retrieve_personal_memory", self._retrieve_memory)
@@ -293,24 +354,7 @@ class DefaultConversationStrategy:
         return builder.compile()
 
     def invoke(self, *, user_input: str, session_id: str) -> EvoMeState:
-        return self.graph.invoke(
-            {
-                "user_input": user_input,
-                "strategy_name": self.name,
-                "strategy_version": self.version,
-                "session_id": session_id,
-                "relevant_memories": [],
-                "memory_quality": 0.0,
-                "skills_used": [],
-                "personal_memory_candidates": [],
-                "personal_memories_saved": 0,
-                "context_data": {},
-                "experience_saved": False,
-                "experience_id": None,
-                "reflection_saved": False,
-                "reflection_id": None,
-                "hypothesis_id": None,
-                "hypothesis_action": "skipped",
-                "revision_signal_count": 0,
-            }
-        )
+        # 保留同步入口用于测试和非交互调用；CLI 默认走 Fast/Slow 分离。
+        state = self.prepare_fast_state(user_input=user_input, session_id=session_id)
+        state.update(self._respond(state))
+        return self.process_slow_state(state)

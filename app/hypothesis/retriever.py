@@ -136,6 +136,19 @@ class HybridHypothesisRetriever:
         except Exception as exc:
             print(f"⚠️ Qdrant 不可用，Hypothesis Retrieval 回退 SQLite：{exc}")
 
+    def for_session(self, db: Session) -> "HybridHypothesisRetriever":
+        """Reuse the same Qdrant client with a fresh SQLAlchemy session.
+
+        The slow loop runs in a background thread and must never reuse the
+        foreground SQLAlchemy Session. Reusing the already-open local Qdrant
+        client also avoids opening the same embedded storage path twice.
+        """
+        clone = object.__new__(HybridHypothesisRetriever)
+        clone.db = db
+        clone.fallback = SqliteHypothesisRetriever(db)
+        clone.primary = self.primary
+        return clone
+
     def index(self, hypothesis: StrategyHypothesis) -> None:
         if self.primary is not None:
             try:

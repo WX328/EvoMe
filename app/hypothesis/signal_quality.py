@@ -16,6 +16,15 @@ REVISION_OPERATIONS = {
     "SPECIALIZE",
 }
 
+# operation 也必须与 dimension 语义兼容。否则同一语义会被模型随机写成
+# ACTION/ADD_CONDITION 或 ACTION/EXPAND，导致 Phase 3 聚合碎片化。
+OPERATIONS_BY_DIMENSION = {
+    "CONTEXT": {"EXPAND", "NARROW", "ADD_CONDITION", "REMOVE_CONDITION", "CHANGE"},
+    "ACTION": {"EXPAND", "CHANGE", "GENERALIZE", "SPECIALIZE"},
+    "OUTCOME": {"EXPAND", "NARROW", "CHANGE"},
+    "ABSTRACTION": {"GENERALIZE", "SPECIALIZE"},
+}
+
 # 第一版故意使用有限、稳定的 target_field taxonomy。
 # Aggregator 需要能对 RevisionSignal 做确定性聚合，因此不允许模型自由发明字段名。
 ACTION_TARGET_FIELDS = {
@@ -158,6 +167,8 @@ def normalize_revision_signal(
         return None, f"非法 dimension: {dimension or '<empty>'}"
     if operation not in REVISION_OPERATIONS:
         return None, f"非法 operation: {operation or '<empty>'}"
+    if operation not in OPERATIONS_BY_DIMENSION[dimension]:
+        return None, f"{dimension} 不允许 operation={operation}"
     if not target_field:
         return None, "target_field 为空"
     if target_field in GENERIC_TARGET_FIELDS:
