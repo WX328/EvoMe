@@ -15,6 +15,7 @@ from app.config import (
     HYPOTHESIS_SCORE_THRESHOLD,
     HYPOTHESIS_TOP_K,
     REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
+    REVISION_ANALYSIS_MAX_PER_RUN,
 )
 from app.context.builder import ContextBuilder
 from app.evaluation.service import EvaluationService
@@ -24,6 +25,7 @@ from app.gates.personal_memory_gate import PersonalMemoryGate
 from app.hypothesis.aggregator import HypothesisAggregator
 from app.hypothesis.relation_judge import HypothesisRelationJudge
 from app.hypothesis.revision_aggregation import RevisionAggregationService
+from app.hypothesis.revision_analyzer import RevisionAnalysisService
 from app.hypothesis.retriever import HybridHypothesisRetriever
 from app.hypothesis.revision_signal import RevisionSignalService
 from app.hypothesis.service import HypothesisService
@@ -68,6 +70,11 @@ class EvoMeRuntime:
         self.revision_signal_service = RevisionSignalService(db)
         self.revision_aggregation_service = RevisionAggregationService(
             db, min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS
+        )
+        self.revision_analysis_service = RevisionAnalysisService(
+            db,
+            self.llm,
+            min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
         )
 
         self.personal_memory_gate = PersonalMemoryGate(self.llm)
@@ -228,16 +235,48 @@ class EvoMeRuntime:
             "hypothesis_id": state.get("hypothesis_id"),
             "hypothesis_action": state.get("hypothesis_action", "skipped"),
             "revision_signal_count": int(state.get("revision_signal_count", 0)),
+            "revision_analysis_count": int(state.get("revision_analysis_count", 0)),
+            "revision_proposal_count": int(state.get("revision_proposal_count", 0)),
         }
 
     def run(self, user_input: str) -> dict:
         """Legacy synchronous path retained for tests and batch callers."""
         state = self.strategy.invoke(user_input=user_input, session_id=self.session_id)
+        analysis_results = self.revision_analysis_service.analyze_pending(
+            max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
+        )
+        state["revision_analysis_count"] = len(analysis_results)
+        state["revision_proposal_count"] = sum(
+            1 for item in analysis_results if item.proposal is not None
+        )
         evaluation = state.get("evaluation", {})
         score = float(evaluation.get("score", 0.0))
         success = bool(evaluation.get("success", False))
         self._record_strategy_result(score, success)
         return self._result_from_state(state, strategy_name=self.strategy_full_name)
+
+    def _process_revision_analysis_job(self) -> dict[str, Any]:
+        """Run pending Phase 4 analyses in the background without a user turn."""
+        with self._background_session_factory() as db:
+            llm = self._new_background_llm()
+            service = RevisionAnalysisService(
+                db,
+                llm,
+                min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
+            )
+            results = service.analyze_pending(
+                max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
+            )
+            return {
+                "revision_analysis_count": len(results),
+                "revision_proposal_count": sum(
+                    1 for item in results if item.proposal is not None
+                ),
+                "analysis_ids": [item.analysis.id for item in results],
+                "proposal_ids": [
+                    item.proposal.id for item in results if item.proposal is not None
+                ],
+            }
 
     def _process_slow_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._background_session_factory() as db:
@@ -255,6 +294,23 @@ class EvoMeRuntime:
                 hypothesis_retriever=retriever,
             )
             state = strategy.process_slow_state(dict(payload))
+
+            # Phase 4 stays entirely on the Slow Path. Only deterministic
+            # analysis candidates are considered, and unchanged candidate
+            # fingerprints are never sent to the LLM twice.
+            revision_analysis_service = RevisionAnalysisService(
+                db,
+                llm,
+                min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
+            )
+            analysis_results = revision_analysis_service.analyze_pending(
+                max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
+            )
+            state["revision_analysis_count"] = len(analysis_results)
+            state["revision_proposal_count"] = sum(
+                1 for item in analysis_results if item.proposal is not None
+            )
+
             evaluation = state.get("evaluation", {})
             score = float(evaluation.get("score", 0.0))
             success = bool(evaluation.get("success", False))
@@ -319,6 +375,18 @@ class EvoMeRuntime:
             "relevant_memory_count": len(state.get("relevant_memories", [])),
         }
 
+    def enqueue_revision_analysis(self) -> str | None:
+        """Queue Phase 4 analysis explicitly; useful for operator/testing workflows."""
+        if self.background_queue is None:
+            self._process_revision_analysis_job()
+            return None
+        job_id = self.background_queue.submit(
+            kind="revision_analysis",
+            fn=self._process_revision_analysis_job,
+        )
+        self._last_background_job_id = job_id
+        return job_id
+
     def list_background_jobs(self, limit: int = 10):
         if self.background_queue is None:
             return []
@@ -379,6 +447,14 @@ class EvoMeRuntime:
             hypothesis_id=hypothesis_id,
             revision_number=revision_number,
         )
+
+    def list_revision_analyses(self):
+        self.db.expire_all()
+        return self.revision_analysis_service.list_analyses()
+
+    def list_revision_proposals(self):
+        self.db.expire_all()
+        return self.revision_analysis_service.list_proposals()
 
     def list_interactions(self, limit: int = 20):
         self.db.expire_all()

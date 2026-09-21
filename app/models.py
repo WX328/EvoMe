@@ -225,6 +225,73 @@ class RevisionSignal(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
 
+class RevisionAnalysisRecord(Base):
+    """对一个 RevisionSignalGroup 的语义一致性分析记录。
+
+    Analysis 只回答“这些 Signal 是否指向同一个修订方向”，
+    不会创建或激活新的 HypothesisRevision。candidate_fingerprint 用于避免
+    在 Signal 集合没有变化时重复消耗 LLM Token。
+    """
+    __tablename__ = "revision_analysis_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    base_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    dimension: Mapped[str] = mapped_column(String(32), index=True)
+    operation: Mapped[str] = mapped_column(String(32), index=True)
+    target_field: Mapped[str] = mapped_column(String(100), index=True)
+
+    signal_ids: Mapped[list] = mapped_column(JSON, default=list)
+    candidate_fingerprint: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True
+    )
+
+    consistent: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    direction_confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class RevisionProposal(Base):
+    """Revision Analyzer 形成的候选局部修订。
+
+    V0.2.1 Phase 4 只生成 Proposal，不创建 r2、不修改当前 Hypothesis。
+    """
+    __tablename__ = "revision_proposals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    analysis_id: Mapped[int] = mapped_column(
+        ForeignKey("revision_analysis_records.id"), unique=True, index=True
+    )
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    base_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
+
+    dimension: Mapped[str] = mapped_column(String(32), index=True)
+    operation: Mapped[str] = mapped_column(String(32), index=True)
+    target_field: Mapped[str] = mapped_column(String(100), index=True)
+
+    before_data: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
+        JSON, nullable=True
+    )
+    proposed_after_data: Mapped[dict | list | str | int | float | bool | None] = mapped_column(
+        JSON, nullable=True
+    )
+    reason: Mapped[str] = mapped_column(Text, default="")
+    source_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
+    independent_signal_count: Mapped[int] = mapped_column(Integer, default=0)
+    direction_confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    status: Mapped[str] = mapped_column(String(32), default="proposed", index=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+
 class StrategyRecord(Base):
     __tablename__ = "strategy_records"
 

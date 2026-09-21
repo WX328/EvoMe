@@ -150,6 +150,41 @@ def show_evidence_summary(runtime: EvoMeRuntime) -> None:
         )
 
 
+def show_revision_analyses(runtime: EvoMeRuntime) -> None:
+    print("\n===== Revision Analyses =====")
+    items = runtime.list_revision_analyses()
+    if not items:
+        print("暂无 Revision Analysis")
+        return
+    for item in items:
+        verdict = "consistent" if item.consistent else "heterogeneous"
+        print(
+            f"RA#{item.id} -> H#{item.hypothesis_id}:r{item.base_revision} "
+            f"{item.dimension}/{item.operation}/{item.target_field} "
+            f"[{verdict}] confidence={item.direction_confidence:.2f}\n"
+            f"signals={item.signal_ids}\n"
+            f"reason: {item.reason}\n"
+        )
+
+
+def show_revision_proposals(runtime: EvoMeRuntime) -> None:
+    print("\n===== Revision Proposals =====")
+    items = runtime.list_revision_proposals()
+    if not items:
+        print("暂无 Revision Proposal")
+        return
+    for item in items:
+        print(
+            f"RP#{item.id} [{item.status}] -> H#{item.hypothesis_id}:r{item.base_revision} "
+            f"{item.dimension}/{item.operation}/{item.target_field} "
+            f"confidence={item.direction_confidence:.2f}\n"
+            f"before: {item.before_data}\n"
+            f"after: {item.proposed_after_data}\n"
+            f"signals: {item.source_signal_ids} independent={item.independent_signal_count}\n"
+            f"reason: {item.reason}\n"
+        )
+
+
 def show_interactions(runtime: EvoMeRuntime) -> None:
     print("\n===== Audit Log =====")
     items = runtime.list_interactions()
@@ -185,16 +220,27 @@ def show_background_status(runtime: EvoMeRuntime) -> None:
         print(line)
         if job.status == "completed":
             result = job.result
-            print(
-                "  "
-                f"interaction={result.get('interaction_id')} "
-                f"score={float(result.get('evaluation_score', 0.0)):.2f} "
-                f"experience={result.get('experience_saved', False)} "
-                f"reflection={result.get('reflection_saved', False)} "
-                f"hypothesis={result.get('hypothesis_action', 'skipped')}:"
-                f"{result.get('hypothesis_id')} "
-                f"revision_signals={result.get('revision_signal_count', 0)}"
-            )
+            if job.kind == "revision_analysis":
+                print(
+                    "  "
+                    f"revision_analyses={result.get('revision_analysis_count', 0)} "
+                    f"revision_proposals={result.get('revision_proposal_count', 0)} "
+                    f"analysis_ids={result.get('analysis_ids', [])} "
+                    f"proposal_ids={result.get('proposal_ids', [])}"
+                )
+            else:
+                print(
+                    "  "
+                    f"interaction={result.get('interaction_id')} "
+                    f"score={float(result.get('evaluation_score', 0.0)):.2f} "
+                    f"experience={result.get('experience_saved', False)} "
+                    f"reflection={result.get('reflection_saved', False)} "
+                    f"hypothesis={result.get('hypothesis_action', 'skipped')}:"
+                    f"{result.get('hypothesis_id')} "
+                    f"revision_signals={result.get('revision_signal_count', 0)} "
+                    f"revision_analyses={result.get('revision_analysis_count', 0)} "
+                    f"revision_proposals={result.get('revision_proposal_count', 0)}"
+                )
         elif job.status == "failed":
             print(f"  error={job.error}")
 
@@ -203,7 +249,8 @@ def main() -> None:
     print("🌱 EvoMe V0.2.1-dev Core")
     print(
         "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
-        "/revision-signals  /revision-groups  /evidence-summary  /status  /audit  /skills  /exit\n"
+        "/revision-signals  /revision-groups  /evidence-summary  /revision-analyze  "
+        "/revision-analyses  /revision-proposals  /status  /audit  /skills  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -233,6 +280,17 @@ def main() -> None:
                 show_revision_groups(runtime); continue
             if user_input == "/evidence-summary":
                 show_evidence_summary(runtime); continue
+            if user_input == "/revision-analyze":
+                job_id = runtime.enqueue_revision_analysis()
+                if job_id is None:
+                    print("Revision Analyzer 已同步执行完成。")
+                else:
+                    print(f"Revision Analyzer 已进入后台队列：{job_id}")
+                continue
+            if user_input == "/revision-analyses":
+                show_revision_analyses(runtime); continue
+            if user_input == "/revision-proposals":
+                show_revision_proposals(runtime); continue
             if user_input == "/status":
                 show_background_status(runtime); continue
             if user_input == "/audit":
