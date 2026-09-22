@@ -1,0 +1,1041 @@
+diff --git a/app/config.py b/app/config.py
+index 7933a8d..5b23e70 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -16,3 +16,5 @@ HYPOTHESIS_RELATION_CONFIDENCE = float(os.getenv("HYPOTHESIS_RELATION_CONFIDENCE
+ REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS = int(os.getenv("REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS", "2"))
+ 
+ REVISION_ANALYSIS_MAX_PER_RUN = int(os.getenv("REVISION_ANALYSIS_MAX_PER_RUN", "2"))
++REVISION_CANDIDATE_MAX_PER_RUN = int(os.getenv("REVISION_CANDIDATE_MAX_PER_RUN", "2"))
++REVISION_CANDIDATE_MAX_EVIDENCE = int(os.getenv("REVISION_CANDIDATE_MAX_EVIDENCE", "8"))
+diff --git a/app/hypothesis/candidate_revision.py b/app/hypothesis/candidate_revision.py
+new file mode 100644
+index 0000000..15be1cf
+--- /dev/null
++++ b/app/hypothesis/candidate_revision.py
+@@ -0,0 +1,554 @@
++from __future__ import annotations
++
++import copy
++import json
++from dataclasses import dataclass
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.context.schema import sanitize_applicable_context
++from app.models import (
++    CandidateRevision,
++    Experience,
++    HypothesisEvidence,
++    HypothesisRevision,
++    ReflectionRecord,
++    RevisionProposal,
++    RevisionSignal,
++)
++
++
++RELATION_WEIGHTS = {
++    "SUPPORTS": 1.0,
++    "REFINES": -0.35,
++    "CONFLICTS": -1.0,
++    "UNRELATED": -0.50,
++}
++
++OPERATION_RISK = {
++    "NARROW": 0.05,
++    "SPECIALIZE": 0.08,
++    "ADD_CONDITION": 0.08,
++    "CHANGE": 0.20,
++    "EXPAND": 0.18,
++    "REMOVE_CONDITION": 0.25,
++    "GENERALIZE": 0.30,
++}
++
++DIMENSION_RISK = {
++    "CONTEXT": 0.10,
++    "ACTION": 0.15,
++    "OUTCOME": 0.03,
++    "ABSTRACTION": 0.25,
++}
++
++DIMENSION_TARGET = {
++    "CONTEXT": "when_data",
++    "ACTION": "do_data",
++    "OUTCOME": "expect_data",
++}
++
++DIMENSION_ALIAS = {
++    "CONTEXT": "when",
++    "ACTION": "do",
++    "OUTCOME": "expect",
++}
++
++
++@dataclass(frozen=True)
++class CandidateEvaluationResult:
++    candidate: CandidateRevision
++    llm_called: bool
++
++
++class CandidateRevisionService:
++    """Phase 5: build and evaluate candidate hypothesis revisions.
++
++    A CandidateRevision is an experiment, not an active HypothesisRevision.
++    The service never changes StrategyHypothesis.current_revision and never
++    creates a new HypothesisRevision. One proposal maps to at most one
++    candidate, making evaluation idempotent.
++    """
++
++    def __init__(
++        self,
++        db: Session,
++        llm,
++        *,
++        max_evidence: int = 8,
++    ) -> None:
++        self.db = db
++        self.llm = llm
++        self.max_evidence = max(1, int(max_evidence))
++
++    @staticmethod
++    def _clamp(value: Any, default: float = 0.0) -> float:
++        try:
++            parsed = float(value)
++        except (TypeError, ValueError):
++            parsed = default
++        return max(0.0, min(1.0, parsed))
++
++    @staticmethod
++    def _compact_text(value: Any, limit: int = 420) -> str:
++        text = str(value or "").strip()
++        return text if len(text) <= limit else text[: limit - 1] + "…"
++
++    @staticmethod
++    def _canonical_signal(
++        when_data: dict[str, Any],
++        do_data: dict[str, Any],
++        expect_data: dict[str, Any],
++    ) -> str:
++        return json.dumps(
++            {
++                "when": when_data,
++                "do": do_data,
++                "expect": expect_data,
++            },
++            ensure_ascii=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++
++    @classmethod
++    def _complexity_of(cls, value: Any, *, depth: int = 0) -> int:
++        if value is None:
++            return 0
++        if isinstance(value, dict):
++            if not value:
++                return 0
++            child_score = sum(cls._complexity_of(item, depth=depth + 1) for item in value.values())
++            return len(value) + child_score + (1 if depth >= 2 else 0)
++        if isinstance(value, (list, tuple, set)):
++            if not value:
++                return 0
++            return len(value) + sum(cls._complexity_of(item, depth=depth + 1) for item in value)
++        if isinstance(value, str):
++            if not value.strip():
++                return 0
++            return 1 + min(2, len(value) // 180)
++        return 1
++
++    @classmethod
++    def _revision_complexity(
++        cls,
++        when_data: dict[str, Any],
++        do_data: dict[str, Any],
++        expect_data: dict[str, Any],
++    ) -> int:
++        return (
++            cls._complexity_of(when_data)
++            + cls._complexity_of(do_data)
++            + cls._complexity_of(expect_data)
++        )
++
++    @staticmethod
++    def _extract_patch_value(proposal: RevisionProposal) -> tuple[str, Any]:
++        dimension = str(proposal.dimension).upper()
++        alias = DIMENSION_ALIAS.get(dimension)
++        data = proposal.proposed_after_data
++
++        if isinstance(data, dict):
++            if alias and alias in data and isinstance(data[alias], dict):
++                return "merge", copy.deepcopy(data[alias])
++            if proposal.target_field in data:
++                return "field", copy.deepcopy(data[proposal.target_field])
++            # Phase 4 commonly returns metadata plus a field carrying the delta.
++            non_meta = {
++                key: value
++                for key, value in data.items()
++                if key not in {"target_field", "operation", "dimension"}
++            }
++            if len(non_meta) == 1:
++                key, value = next(iter(non_meta.items()))
++                if key == proposal.target_field:
++                    return "field", copy.deepcopy(value)
++
++        return "field", copy.deepcopy(data)
++
++    def _build_candidate_data(
++        self,
++        base: HypothesisRevision,
++        proposal: RevisionProposal,
++    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
++        when_data = copy.deepcopy(base.when_data or {})
++        do_data = copy.deepcopy(base.do_data or {})
++        expect_data = copy.deepcopy(base.expect_data or {})
++
++        dimension = str(proposal.dimension).upper()
++        if dimension == "ABSTRACTION":
++            data = proposal.proposed_after_data
++            if not isinstance(data, dict):
++                raise ValueError("ABSTRACTION Proposal 必须提供结构化 when/do/expect patch")
++            if isinstance(data.get("when"), dict):
++                when_data.update(copy.deepcopy(data["when"]))
++            if isinstance(data.get("do"), dict):
++                do_data.update(copy.deepcopy(data["do"]))
++            if isinstance(data.get("expect"), dict):
++                expect_data.update(copy.deepcopy(data["expect"]))
++            if not any(key in data for key in ("when", "do", "expect")):
++                raise ValueError("ABSTRACTION Proposal 缺少 when/do/expect patch")
++            return when_data, do_data, expect_data
++
++        target_name = DIMENSION_TARGET.get(dimension)
++        if target_name is None:
++            raise ValueError(f"不支持的 Revision dimension: {dimension}")
++
++        target = {
++            "when_data": when_data,
++            "do_data": do_data,
++            "expect_data": expect_data,
++        }[target_name]
++        patch_mode, patch_value = self._extract_patch_value(proposal)
++        if patch_mode == "merge" and isinstance(patch_value, dict):
++            target.update(patch_value)
++        else:
++            target[proposal.target_field] = patch_value
++
++        return when_data, do_data, expect_data
++
++    def _source_evidence_ids(self, proposal: RevisionProposal) -> set[int]:
++        ids = [int(item) for item in (proposal.source_signal_ids or []) if item is not None]
++        if not ids:
++            return set()
++        signals = self.db.scalars(
++            select(RevisionSignal).where(RevisionSignal.id.in_(ids))
++        ).all()
++        return {
++            int(signal.evidence_id)
++            for signal in signals
++            if signal.evidence_id is not None
++        }
++
++    def _evidence_rows(
++        self,
++        proposal: RevisionProposal,
++    ) -> list[tuple[HypothesisEvidence, ReflectionRecord, Experience | None]]:
++        stmt = (
++            select(HypothesisEvidence, ReflectionRecord, Experience)
++            .join(ReflectionRecord, ReflectionRecord.id == HypothesisEvidence.reflection_id)
++            .outerjoin(Experience, Experience.id == ReflectionRecord.experience_id)
++            .where(
++                HypothesisEvidence.hypothesis_id == proposal.hypothesis_id,
++                HypothesisEvidence.hypothesis_revision == proposal.base_revision,
++            )
++        )
++        rows = list(self.db.execute(stmt).all())
++        source_ids = self._source_evidence_ids(proposal)
++        relation_priority = {
++            "CONFLICTS": 0,
++            "REFINES": 1,
++            "SUPPORTS": 2,
++            "UNRELATED": 3,
++        }
++        rows.sort(
++            key=lambda row: (
++                0 if int(row[0].id) in source_ids else 1,
++                relation_priority.get(str(row[0].relation_type).upper(), 9),
++                int(row[0].id),
++            )
++        )
++        return rows[: self.max_evidence]
++
++    def _compact_evidence(
++        self,
++        rows: list[tuple[HypothesisEvidence, ReflectionRecord, Experience | None]],
++    ) -> list[dict[str, Any]]:
++        items: list[dict[str, Any]] = []
++        for evidence, reflection, experience in rows:
++            context = sanitize_applicable_context(reflection.applicable_context or {})
++            if not context and experience is not None:
++                context = sanitize_applicable_context(experience.context_data or {})
++            items.append(
++                {
++                    "evidence_id": int(evidence.id),
++                    "reflection_id": int(reflection.id),
++                    "relation_to_base": str(evidence.relation_type).upper(),
++                    "base_relation_confidence": float(evidence.relation_confidence),
++                    "context": context,
++                    "signal": self._compact_text(
++                        reflection.canonical_signal
++                        or reflection.strategy_signal
++                        or reflection.insight
++                        or reflection.lesson
++                    ),
++                    "expected_effect": self._compact_text(reflection.expected_effect),
++                }
++            )
++        return items
++
++    def _reevaluate(
++        self,
++        candidate: dict[str, Any],
++        evidence: list[dict[str, Any]],
++    ) -> dict[str, Any]:
++        messages = [
++            {
++                "role": "system",
++                "content": (
++                    "Evaluate a candidate Strategy Hypothesis against compact historical evidence. "
++                    "Judge each evidence independently against the candidate, not against the old hypothesis. "
++                    "Allowed relations: SUPPORTS, REFINES, CONFLICTS, UNRELATED. "
++                    "Do not invent evidence or broaden context. Return JSON with one key `relations`, "
++                    "a list of objects: evidence_id, relation, confidence (0..1), reason."
++                ),
++            },
++            {
++                "role": "user",
++                "content": json.dumps(
++                    {"candidate": candidate, "evidence": evidence},
++                    ensure_ascii=False,
++                    sort_keys=True,
++                ),
++            },
++        ]
++        result = self.llm.json_chat(messages, temperature=0.1)
++        return result if isinstance(result, dict) else {}
++
++    @staticmethod
++    def _normalize_relations(
++        raw: dict[str, Any],
++        evidence_ids: set[int],
++    ) -> list[dict[str, Any]]:
++        result: list[dict[str, Any]] = []
++        seen: set[int] = set()
++        rows = raw.get("relations", [])
++        if not isinstance(rows, list):
++            return result
++        for item in rows:
++            if not isinstance(item, dict):
++                continue
++            try:
++                evidence_id = int(item.get("evidence_id"))
++            except (TypeError, ValueError):
++                continue
++            if evidence_id not in evidence_ids or evidence_id in seen:
++                continue
++            relation = str(item.get("relation", "")).upper().strip()
++            if relation not in RELATION_WEIGHTS:
++                continue
++            seen.add(evidence_id)
++            try:
++                confidence = float(item.get("confidence", 0.0))
++            except (TypeError, ValueError):
++                confidence = 0.0
++            result.append(
++                {
++                    "evidence_id": evidence_id,
++                    "relation": relation,
++                    "confidence": max(0.0, min(1.0, confidence)),
++                    "reason": str(item.get("reason", "")).strip(),
++                }
++            )
++        return result
++
++    @staticmethod
++    def _fit_score(relations: list[dict[str, Any]]) -> float:
++        if not relations:
++            return 0.0
++        total_weight = 0.0
++        weighted = 0.0
++        for item in relations:
++            confidence = max(0.05, float(item.get("confidence", 0.0)))
++            weighted += RELATION_WEIGHTS.get(str(item.get("relation", "")).upper(), -0.5) * confidence
++            total_weight += confidence
++        raw = weighted / total_weight if total_weight else -1.0
++        return round(max(0.0, min(1.0, (raw + 1.0) / 2.0)), 4)
++
++    @classmethod
++    def _base_relations(
++        cls,
++        rows: list[tuple[HypothesisEvidence, ReflectionRecord, Experience | None]],
++    ) -> list[dict[str, Any]]:
++        return [
++            {
++                "evidence_id": int(evidence.id),
++                "relation": str(evidence.relation_type).upper(),
++                "confidence": float(evidence.relation_confidence),
++            }
++            for evidence, _reflection, _experience in rows
++        ]
++
++    @staticmethod
++    def _relation_counts(relations: list[dict[str, Any]]) -> dict[str, int]:
++        counts = {"SUPPORTS": 0, "REFINES": 0, "CONFLICTS": 0, "UNRELATED": 0}
++        for item in relations:
++            relation = str(item.get("relation", "")).upper()
++            if relation in counts:
++                counts[relation] += 1
++        return counts
++
++    @staticmethod
++    def _risk(
++        proposal: RevisionProposal,
++        complexity_delta: int,
++    ) -> tuple[float, str]:
++        score = OPERATION_RISK.get(str(proposal.operation).upper(), 0.25)
++        score += DIMENSION_RISK.get(str(proposal.dimension).upper(), 0.20)
++        if complexity_delta > 3:
++            score += 0.08
++        if complexity_delta > 8:
++            score += 0.10
++        score = max(0.0, min(1.0, score))
++        if score <= 0.30:
++            return round(score, 4), "LOW"
++        if score <= 0.60:
++            return round(score, 4), "MEDIUM"
++        return round(score, 4), "HIGH"
++
++    @staticmethod
++    def _status(
++        *,
++        fit_gain: float,
++        utility: float,
++        risk_level: str,
++        coverage: float,
++        base_counts: dict[str, int],
++        candidate_counts: dict[str, int],
++    ) -> str:
++        if coverage < 0.80:
++            return "needs_review"
++        if candidate_counts.get("CONFLICTS", 0) > base_counts.get("CONFLICTS", 0):
++            return "rejected"
++        if fit_gain <= 0.02:
++            return "rejected"
++        if risk_level == "LOW" and utility >= 0.08:
++            return "ready_to_apply"
++        return "needs_review"
++
++    def evaluate_proposal(self, proposal: RevisionProposal) -> CandidateEvaluationResult:
++        existing = self.db.scalar(
++            select(CandidateRevision).where(
++                CandidateRevision.source_proposal_id == proposal.id
++            )
++        )
++        if existing is not None:
++            return CandidateEvaluationResult(existing, llm_called=False)
++
++        base = self.db.scalar(
++            select(HypothesisRevision).where(
++                HypothesisRevision.hypothesis_id == proposal.hypothesis_id,
++                HypothesisRevision.revision_number == proposal.base_revision,
++            )
++        )
++        if base is None:
++            raise ValueError(
++                f"H#{proposal.hypothesis_id}:r{proposal.base_revision} 不存在"
++            )
++
++        when_data, do_data, expect_data = self._build_candidate_data(base, proposal)
++        base_complexity = self._revision_complexity(
++            base.when_data or {}, base.do_data or {}, base.expect_data or {}
++        )
++        candidate_complexity = self._revision_complexity(
++            when_data, do_data, expect_data
++        )
++        complexity_delta = candidate_complexity - base_complexity
++
++        rows = self._evidence_rows(proposal)
++        compact = self._compact_evidence(rows)
++        evidence_ids = {int(item["evidence_id"]) for item in compact}
++        raw = self._reevaluate(
++            {
++                "hypothesis_id": proposal.hypothesis_id,
++                "base_revision": proposal.base_revision,
++                "source_proposal_id": proposal.id,
++                "when": when_data,
++                "do": do_data,
++                "expect": expect_data,
++            },
++            compact,
++        )
++        candidate_relations = self._normalize_relations(raw, evidence_ids)
++        coverage = round(
++            len(candidate_relations) / len(compact), 4
++        ) if compact else 0.0
++
++        base_relations = self._base_relations(rows)
++        base_fit = self._fit_score(base_relations)
++        candidate_fit = self._fit_score(candidate_relations)
++        fit_gain = round(candidate_fit - base_fit, 4)
++
++        complexity_penalty = round(
++            min(0.15, max(0, complexity_delta) * 0.01), 4
++        )
++        risk_score, risk_level = self._risk(proposal, complexity_delta)
++        risk_penalty = round(risk_score * 0.20, 4)
++        utility = round(fit_gain - complexity_penalty - risk_penalty, 4)
++
++        base_counts = self._relation_counts(base_relations)
++        candidate_counts = self._relation_counts(candidate_relations)
++        status = self._status(
++            fit_gain=fit_gain,
++            utility=utility,
++            risk_level=risk_level,
++            coverage=coverage,
++            base_counts=base_counts,
++            candidate_counts=candidate_counts,
++        )
++
++        candidate = CandidateRevision(
++            hypothesis_id=proposal.hypothesis_id,
++            base_revision=proposal.base_revision,
++            source_proposal_id=proposal.id,
++            title=base.title,
++            insight=base.insight,
++            when_data=when_data,
++            do_data=do_data,
++            expect_data=expect_data,
++            canonical_signal=self._canonical_signal(when_data, do_data, expect_data),
++            status=status,
++            base_fit_score=base_fit,
++            candidate_fit_score=candidate_fit,
++            fit_gain=fit_gain,
++            base_complexity_score=base_complexity,
++            complexity_score=candidate_complexity,
++            complexity_delta=complexity_delta,
++            risk_level=risk_level,
++            risk_score=risk_score,
++            utility_score=utility,
++            evidence_ids=sorted(evidence_ids),
++            evaluation_data={
++                "coverage": coverage,
++                "base_relations": base_relations,
++                "candidate_relations": candidate_relations,
++                "base_counts": base_counts,
++                "candidate_counts": candidate_counts,
++                "complexity_penalty": complexity_penalty,
++                "risk_penalty": risk_penalty,
++            },
++        )
++        self.db.add(candidate)
++        self.db.commit()
++        self.db.refresh(candidate)
++        return CandidateEvaluationResult(candidate, llm_called=True)
++
++    def evaluate_pending(self, *, max_candidates: int = 2) -> list[CandidateEvaluationResult]:
++        limit = max(0, int(max_candidates))
++        if limit == 0:
++            return []
++        stmt = (
++            select(RevisionProposal)
++            .where(RevisionProposal.status == "proposed")
++            .order_by(RevisionProposal.id.asc())
++        )
++        results: list[CandidateEvaluationResult] = []
++        for proposal in self.db.scalars(stmt).all():
++            exists = self.db.scalar(
++                select(CandidateRevision.id).where(
++                    CandidateRevision.source_proposal_id == proposal.id
++                )
++            )
++            if exists is not None:
++                continue
++            results.append(self.evaluate_proposal(proposal))
++            if len(results) >= limit:
++                break
++        return results
++
++    def list_candidates(self) -> list[CandidateRevision]:
++        stmt = select(CandidateRevision).order_by(CandidateRevision.id.desc())
++        return list(self.db.scalars(stmt).all())
+diff --git a/app/models.py b/app/models.py
+index bc28707..55bdee6 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -292,6 +292,53 @@ class RevisionProposal(Base):
+     )
+ 
+ 
++class CandidateRevision(Base):
++    """RevisionProposal 应用到正式 base revision 后形成的实验性候选。
++
++    Candidate 不是正式 HypothesisRevision，不会改变 current_revision。Phase 5
++    只负责构建、Evidence Re-evaluation、Utility/Risk 分类。
++    """
++    __tablename__ = "candidate_revisions"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    hypothesis_id: Mapped[int] = mapped_column(
++        ForeignKey("strategy_hypotheses.id"), index=True
++    )
++    base_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
++    source_proposal_id: Mapped[int] = mapped_column(
++        ForeignKey("revision_proposals.id"), unique=True, index=True
++    )
++
++    title: Mapped[str] = mapped_column(String(200), default="")
++    insight: Mapped[str] = mapped_column(Text, default="")
++    when_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    do_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    expect_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    canonical_signal: Mapped[str] = mapped_column(Text, default="")
++
++    status: Mapped[str] = mapped_column(String(32), default="validating", index=True)
++
++    base_fit_score: Mapped[float] = mapped_column(Float, default=0.0)
++    candidate_fit_score: Mapped[float] = mapped_column(Float, default=0.0)
++    fit_gain: Mapped[float] = mapped_column(Float, default=0.0)
++
++    base_complexity_score: Mapped[int] = mapped_column(Integer, default=0)
++    complexity_score: Mapped[int] = mapped_column(Integer, default=0)
++    complexity_delta: Mapped[int] = mapped_column(Integer, default=0)
++
++    risk_level: Mapped[str] = mapped_column(String(16), default="MEDIUM", index=True)
++    risk_score: Mapped[float] = mapped_column(Float, default=0.0)
++    utility_score: Mapped[float] = mapped_column(Float, default=0.0)
++
++    evidence_ids: Mapped[list] = mapped_column(JSON, default=list)
++    evaluation_data: Mapped[dict] = mapped_column(JSON, default=dict)
++
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime, default=datetime.now, onupdate=datetime.now
++    )
++
++
+ class StrategyRecord(Base):
+     __tablename__ = "strategy_records"
+ 
+diff --git a/app/runtime.py b/app/runtime.py
+index e6741e7..b7daac6 100644
+--- a/app/runtime.py
++++ b/app/runtime.py
+@@ -16,6 +16,8 @@ from app.config import (
+     HYPOTHESIS_TOP_K,
+     REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
+     REVISION_ANALYSIS_MAX_PER_RUN,
++    REVISION_CANDIDATE_MAX_EVIDENCE,
++    REVISION_CANDIDATE_MAX_PER_RUN,
+ )
+ from app.context.builder import ContextBuilder
+ from app.evaluation.service import EvaluationService
+@@ -23,6 +25,7 @@ from app.evolution.service import EvolutionMemoryService
+ from app.gates.experience_gate import ExperienceGate
+ from app.gates.personal_memory_gate import PersonalMemoryGate
+ from app.hypothesis.aggregator import HypothesisAggregator
++from app.hypothesis.candidate_revision import CandidateRevisionService
+ from app.hypothesis.relation_judge import HypothesisRelationJudge
+ from app.hypothesis.revision_aggregation import RevisionAggregationService
+ from app.hypothesis.revision_analyzer import RevisionAnalysisService
+@@ -76,6 +79,11 @@ class EvoMeRuntime:
+             self.llm,
+             min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
+         )
++        self.candidate_revision_service = CandidateRevisionService(
++            db,
++            self.llm,
++            max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
++        )
+ 
+         self.personal_memory_gate = PersonalMemoryGate(self.llm)
+         self.experience_gate = ExperienceGate(self.llm)
+@@ -237,6 +245,7 @@ class EvoMeRuntime:
+             "revision_signal_count": int(state.get("revision_signal_count", 0)),
+             "revision_analysis_count": int(state.get("revision_analysis_count", 0)),
+             "revision_proposal_count": int(state.get("revision_proposal_count", 0)),
++            "candidate_revision_count": int(state.get("candidate_revision_count", 0)),
+         }
+ 
+     def run(self, user_input: str) -> dict:
+@@ -249,6 +258,10 @@ class EvoMeRuntime:
+         state["revision_proposal_count"] = sum(
+             1 for item in analysis_results if item.proposal is not None
+         )
++        candidate_results = self.candidate_revision_service.evaluate_pending(
++            max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
++        )
++        state["candidate_revision_count"] = len(candidate_results)
+         evaluation = state.get("evaluation", {})
+         score = float(evaluation.get("score", 0.0))
+         success = bool(evaluation.get("success", False))
+@@ -278,6 +291,32 @@ class EvoMeRuntime:
+                 ],
+             }
+ 
++    def _process_candidate_validation_job(self) -> dict[str, Any]:
++        """Run pending Phase 5 candidate validation in the background."""
++        with self._background_session_factory() as db:
++            llm = self._new_background_llm()
++            service = CandidateRevisionService(
++                db,
++                llm,
++                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
++            )
++            results = service.evaluate_pending(
++                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
++            )
++            return {
++                "candidate_revision_count": len(results),
++                "candidate_ids": [item.candidate.id for item in results],
++                "ready_to_apply": sum(
++                    1 for item in results if item.candidate.status == "ready_to_apply"
++                ),
++                "needs_review": sum(
++                    1 for item in results if item.candidate.status == "needs_review"
++                ),
++                "rejected": sum(
++                    1 for item in results if item.candidate.status == "rejected"
++                ),
++            }
++
+     def _process_slow_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+         with self._background_session_factory() as db:
+             llm = self._new_background_llm()
+@@ -311,6 +350,16 @@ class EvoMeRuntime:
+                 1 for item in analysis_results if item.proposal is not None
+             )
+ 
++            candidate_service = CandidateRevisionService(
++                db,
++                llm,
++                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
++            )
++            candidate_results = candidate_service.evaluate_pending(
++                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
++            )
++            state["candidate_revision_count"] = len(candidate_results)
++
+             evaluation = state.get("evaluation", {})
+             score = float(evaluation.get("score", 0.0))
+             success = bool(evaluation.get("success", False))
+@@ -387,6 +436,18 @@ class EvoMeRuntime:
+         self._last_background_job_id = job_id
+         return job_id
+ 
++    def enqueue_candidate_validation(self) -> str | None:
++        """Queue Phase 5 candidate evaluation explicitly."""
++        if self.background_queue is None:
++            self._process_candidate_validation_job()
++            return None
++        job_id = self.background_queue.submit(
++            kind="candidate_validation",
++            fn=self._process_candidate_validation_job,
++        )
++        self._last_background_job_id = job_id
++        return job_id
++
+     def list_background_jobs(self, limit: int = 10):
+         if self.background_queue is None:
+             return []
+@@ -456,6 +517,10 @@ class EvoMeRuntime:
+         self.db.expire_all()
+         return self.revision_analysis_service.list_proposals()
+ 
++    def list_candidate_revisions(self):
++        self.db.expire_all()
++        return self.candidate_revision_service.list_candidates()
++
+     def list_interactions(self, limit: int = 20):
+         self.db.expire_all()
+         return self.audit_service.list_recent(limit=limit)
+diff --git a/main.py b/main.py
+index 7a66cdf..1e8ff56 100644
+--- a/main.py
++++ b/main.py
+@@ -185,6 +185,29 @@ def show_revision_proposals(runtime: EvoMeRuntime) -> None:
+         )
+ 
+ 
++def show_candidates(runtime: EvoMeRuntime) -> None:
++    print("\n===== Candidate Revisions =====")
++    items = runtime.list_candidate_revisions()
++    if not items:
++        print("暂无 Candidate Revision")
++        return
++    for item in items:
++        coverage = float((item.evaluation_data or {}).get("coverage", 0.0))
++        print(
++            f"CR#{item.id} [{item.status}] -> H#{item.hypothesis_id}:r{item.base_revision} "
++            f"<- RP#{item.source_proposal_id}\n"
++            f"fit: {item.base_fit_score:.3f} -> {item.candidate_fit_score:.3f} "
++            f"gain={item.fit_gain:+.3f} coverage={coverage:.2f}\n"
++            f"complexity: {item.base_complexity_score} -> {item.complexity_score} "
++            f"delta={item.complexity_delta:+d}\n"
++            f"risk={item.risk_level}({item.risk_score:.2f}) "
++            f"utility={item.utility_score:+.3f}\n"
++            f"WHEN: {item.when_data or {}}\n"
++            f"DO: {item.do_data or {}}\n"
++            f"EXPECT: {item.expect_data or {}}\n"
++        )
++
++
+ def show_interactions(runtime: EvoMeRuntime) -> None:
+     print("\n===== Audit Log =====")
+     items = runtime.list_interactions()
+@@ -228,6 +251,15 @@ def show_background_status(runtime: EvoMeRuntime) -> None:
+                     f"analysis_ids={result.get('analysis_ids', [])} "
+                     f"proposal_ids={result.get('proposal_ids', [])}"
+                 )
++            elif job.kind == "candidate_validation":
++                print(
++                    "  "
++                    f"candidates={result.get('candidate_revision_count', 0)} "
++                    f"candidate_ids={result.get('candidate_ids', [])} "
++                    f"ready={result.get('ready_to_apply', 0)} "
++                    f"review={result.get('needs_review', 0)} "
++                    f"rejected={result.get('rejected', 0)}"
++                )
+             else:
+                 print(
+                     "  "
+@@ -239,7 +271,8 @@ def show_background_status(runtime: EvoMeRuntime) -> None:
+                     f"{result.get('hypothesis_id')} "
+                     f"revision_signals={result.get('revision_signal_count', 0)} "
+                     f"revision_analyses={result.get('revision_analysis_count', 0)} "
+-                    f"revision_proposals={result.get('revision_proposal_count', 0)}"
++                    f"revision_proposals={result.get('revision_proposal_count', 0)} "
++                    f"candidates={result.get('candidate_revision_count', 0)}"
+                 )
+         elif job.status == "failed":
+             print(f"  error={job.error}")
+@@ -250,7 +283,8 @@ def main() -> None:
+     print(
+         "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
+         "/revision-signals  /revision-groups  /evidence-summary  /revision-analyze  "
+-        "/revision-analyses  /revision-proposals  /status  /audit  /skills  /exit\n"
++        "/revision-analyses  /revision-proposals  /candidate-evaluate  /candidates  "
++        "/status  /audit  /skills  /exit\n"
+     )
+ 
+     with SessionLocal() as db:
+@@ -291,6 +325,15 @@ def main() -> None:
+                 show_revision_analyses(runtime); continue
+             if user_input == "/revision-proposals":
+                 show_revision_proposals(runtime); continue
++            if user_input == "/candidate-evaluate":
++                job_id = runtime.enqueue_candidate_validation()
++                if job_id is None:
++                    print("Candidate Evaluator 已同步执行完成。")
++                else:
++                    print(f"Candidate Evaluator 已进入后台队列：{job_id}")
++                continue
++            if user_input == "/candidates":
++                show_candidates(runtime); continue
+             if user_input == "/status":
+                 show_background_status(runtime); continue
+             if user_input == "/audit":
+diff --git a/tests/test_candidate_revision.py b/tests/test_candidate_revision.py
+new file mode 100644
+index 0000000..5d859f0
+--- /dev/null
++++ b/tests/test_candidate_revision.py
+@@ -0,0 +1,189 @@
++import json
++
++from sqlalchemy import select
++
++from app.hypothesis.candidate_revision import CandidateRevisionService
++from app.models import (
++    CandidateRevision,
++    HypothesisRevision,
++    RevisionAnalysisRecord,
++    RevisionProposal,
++)
++from tests.test_revision_aggregation import _add_refine_signal, _seed_hypothesis
++
++
++class FakeCandidateLLM:
++    def __init__(self, *, only_first=False):
++        self.calls = 0
++        self.only_first = only_first
++
++    def json_chat(self, messages, temperature=0.1):
++        self.calls += 1
++        payload = json.loads(messages[-1]["content"])
++        evidence = payload["evidence"]
++        if self.only_first:
++            evidence = evidence[:1]
++        return {
++            "relations": [
++                {
++                    "evidence_id": item["evidence_id"],
++                    "relation": "SUPPORTS",
++                    "confidence": 0.95,
++                    "reason": "candidate explains this evidence",
++                }
++                for item in evidence
++            ]
++        }
++
++
++def _make_proposal(
++    db,
++    *,
++    dimension,
++    target_field,
++    proposed_after_data,
++    signal_count=2,
++):
++    hypothesis = _seed_hypothesis(db)
++    signals = []
++    for index in range(signal_count):
++        signals.append(
++            _add_refine_signal(
++                db,
++                hypothesis,
++                interaction_id=1000 + index,
++                reflection_seed=f"evidence-{index}",
++                target_field="scope_alignment",
++            )
++        )
++
++    analysis = RevisionAnalysisRecord(
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        dimension=dimension,
++        operation="EXPAND",
++        target_field=target_field,
++        signal_ids=[item.id for item in signals],
++        candidate_fingerprint=f"test-{dimension}-{target_field}-{hypothesis.id}",
++        consistent=True,
++        direction_confidence=0.9,
++        reason="same direction",
++    )
++    db.add(analysis)
++    db.flush()
++    proposal = RevisionProposal(
++        analysis_id=analysis.id,
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        dimension=dimension,
++        operation="EXPAND",
++        target_field=target_field,
++        before_data=[],
++        proposed_after_data=proposed_after_data,
++        reason="test proposal",
++        source_signal_ids=[item.id for item in signals],
++        independent_signal_count=signal_count,
++        direction_confidence=0.9,
++        status="proposed",
++    )
++    db.add(proposal)
++    db.commit()
++    db.refresh(proposal)
++    return hypothesis, proposal
++
++
++def test_phase5_outcome_patch_is_low_risk_and_ready_without_mutating_revision(db):
++    hypothesis, proposal = _make_proposal(
++        db,
++        dimension="OUTCOME",
++        target_field="scope_drift",
++        proposed_after_data={
++            "expect": {
++                "text": "improve clarity; reduce scope drift",
++            }
++        },
++        signal_count=2,
++    )
++    llm = FakeCandidateLLM()
++    service = CandidateRevisionService(db, llm, max_evidence=8)
++
++    result = service.evaluate_proposal(proposal)
++    candidate = result.candidate
++
++    assert llm.calls == 1
++    assert candidate.expect_data["text"] == "improve clarity; reduce scope drift"
++    assert candidate.when_data == {"task_type": "architecture_design", "complexity": "high", "interaction_mode": "collaborative"}
++    assert candidate.do_data == {"text": "analyze responsibilities and boundaries"}
++    assert candidate.risk_level == "LOW"
++    assert candidate.status == "ready_to_apply"
++    assert candidate.fit_gain > 0
++
++    db.refresh(hypothesis)
++    assert hypothesis.current_revision == 1
++    revisions = list(db.scalars(select(HypothesisRevision).where(HypothesisRevision.hypothesis_id == hypothesis.id)).all())
++    assert len(revisions) == 1
++
++
++def test_phase5_action_expansion_can_improve_fit_but_require_review_for_complexity(db):
++    _hypothesis, proposal = _make_proposal(
++        db,
++        dimension="ACTION",
++        target_field="response_structure",
++        proposed_after_data={
++            "target_field": "response_structure",
++            "operation": "EXPAND",
++            "response_structure": {
++                "ordered_sections": ["responsibility matrix", "data flow", "interface draft", "pending decisions"],
++                "checks": ["boundary", "call relation", "anti-pattern"],
++                "evidence": ["supported", "unsupported", "confidence", "next step"],
++            },
++        },
++        signal_count=3,
++    )
++    llm = FakeCandidateLLM()
++    service = CandidateRevisionService(db, llm, max_evidence=8)
++
++    candidate = service.evaluate_proposal(proposal).candidate
++
++    assert candidate.do_data["response_structure"]["ordered_sections"][0] == "responsibility matrix"
++    assert candidate.fit_gain > 0
++    assert candidate.complexity_delta > 3
++    assert candidate.risk_level == "MEDIUM"
++    assert candidate.status == "needs_review"
++
++
++def test_phase5_one_proposal_maps_to_one_candidate_and_does_not_spend_token_twice(db):
++    _hypothesis, proposal = _make_proposal(
++        db,
++        dimension="OUTCOME",
++        target_field="scope_drift",
++        proposed_after_data={"expect": {"text": "reduce scope drift"}},
++    )
++    llm = FakeCandidateLLM()
++    service = CandidateRevisionService(db, llm)
++
++    first = service.evaluate_proposal(proposal)
++    second = service.evaluate_proposal(proposal)
++
++    assert first.candidate.id == second.candidate.id
++    assert first.llm_called is True
++    assert second.llm_called is False
++    assert llm.calls == 1
++    assert db.query(CandidateRevision).count() == 1
++
++
++def test_phase5_incomplete_reevaluation_coverage_cannot_be_ready_to_apply(db):
++    _hypothesis, proposal = _make_proposal(
++        db,
++        dimension="OUTCOME",
++        target_field="scope_drift",
++        proposed_after_data={"expect": {"text": "reduce scope drift"}},
++        signal_count=2,
++    )
++    llm = FakeCandidateLLM(only_first=True)
++    service = CandidateRevisionService(db, llm)
++
++    candidate = service.evaluate_proposal(proposal).candidate
++
++    assert candidate.evaluation_data["coverage"] == 0.5
++    assert candidate.status == "needs_review"

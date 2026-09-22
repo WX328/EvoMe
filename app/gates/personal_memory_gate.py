@@ -10,6 +10,7 @@ PERSONAL_MEMORY_GATE_PROMPT = """
 允许 memory_type：fact / preference / goal / project / decision / knowledge
 
 值得保存：长期目标、重要项目、明确决策、稳定偏好、明确完成/掌握的重要阶段、长期重要背景。
+特别注意：用户明确说“以后/今后给我……”“这样我更容易理解”“默认按……”时，若表达的是未来跨会话可复用的交互/讲解偏好，应保存为 preference；只保存用户偏好本身，不把 AI 的回复细节扩写成用户事实。
 通常不保存：普通知识问题、一次性临时请求、当前情绪、没有新增信息的旧事实。
 
 严格 JSON：

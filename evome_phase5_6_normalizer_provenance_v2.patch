@@ -1,0 +1,500 @@
+diff --git a/app/hypothesis/candidate_revision.py b/app/hypothesis/candidate_revision.py
+index c732687..e2712a4 100644
+--- a/app/hypothesis/candidate_revision.py
++++ b/app/hypothesis/candidate_revision.py
+@@ -135,7 +135,13 @@ class SemanticComplexityV2:
+ 
+     @classmethod
+     def _policy_score(cls, policy: dict[str, Any]) -> int:
+-        base_order = policy.get("base_order") if isinstance(policy.get("base_order"), list) else []
++        base_order_spec = policy.get("base_order")
++        if isinstance(base_order_spec, dict):
++            base_steps = base_order_spec.get("steps")
++            base_order = base_steps if isinstance(base_steps, list) else []
++        else:
++            # Read-only compatibility for historical normalization v1 policies.
++            base_order = base_order_spec if isinstance(base_order_spec, list) else []
+         unique_base, base_duplicates = cls._unique(base_order)
+         score = 1 + len(unique_base)  # one base behaviour plus its ordered steps
+         duplicate_count = base_duplicates
+diff --git a/app/hypothesis/policy_normalizer.py b/app/hypothesis/policy_normalizer.py
+index b202f1d..d1e7a19 100644
+--- a/app/hypothesis/policy_normalizer.py
++++ b/app/hypothesis/policy_normalizer.py
+@@ -22,7 +22,7 @@ from app.models import (
+ )
+ 
+ 
+-NORMALIZATION_VERSION = 1
++NORMALIZATION_VERSION = 2
+ CONDITIONAL_POLICY_KIND = "conditional_policy"
+ RAW_PROPOSAL_KIND = "raw"
+ SUPERSEDED_STATUS = "superseded_by_normalized_proposal"
+@@ -52,8 +52,8 @@ class ProposalPolicyNormalizer:
+ 
+     The normalizer deliberately receives compact signal/reflection context and
+     provenance only.  It never loads InteractionRecord or chat history.  One
+-    source proposal can produce at most one audit record and therefore at most
+-    one normalization LLM call.
++    A source proposal can produce at most one audit record per normalization
++    version and therefore at most one normalization LLM call per version.
+     """
+ 
+     def __init__(self, db: Session, llm) -> None:
+@@ -151,24 +151,30 @@ class ProposalPolicyNormalizer:
+             )
+         )
+ 
++        compact_provenance = dict(provenance)
++        compact_provenance.update(
++            {
++                "explicit_user_feedback": explicit_feedback,
++                "explicit_user_instruction": explicit_instruction,
++                "durable_preference": durable_preference,
++            }
++        )
++
+         return {
+             "signal_id": int(signal.id),
++            "dimension": str(signal.dimension).upper(),
++            "operation": str(signal.operation).upper(),
++            "target_field": str(signal.target_field),
+             "reflection_id": int(signal.reflection_id),
+             "evidence_id": int(signal.evidence_id) if signal.evidence_id is not None else None,
+             "independent": bool(evidence.is_independent) if evidence is not None else False,
+-            "before": signal.before_data,
+-            "observed": signal.observed_data,
++            "before_data": signal.before_data,
++            "observed_data": signal.observed_data,
+             "canonical_change": self._compact_text(signal.canonical_change),
+             "confidence": float(signal.confidence),
+-            "applicable_context": context,
++            "compact_applicable_context": context,
+             "reflection_signal": reflection_signal,
+-            "provenance": {
+-                "explicit_user_feedback": explicit_feedback,
+-                "explicit_user_instruction": explicit_instruction,
+-                "durable_preference": durable_preference,
+-                "source_interaction_id": provenance.get("source_interaction_id"),
+-                "context_evidence_basis": provenance.get("context_evidence_basis"),
+-            },
++            "provenance": compact_provenance,
+         }
+ 
+     @staticmethod
+@@ -282,7 +288,7 @@ class ProposalPolicyNormalizer:
+                 kind = str(expected).strip().lower()
+                 source_texts = [
+                     str(
+-                        f"{item.get('observed', '')} "
++                        f"{item.get('observed_data', '')} "
+                         f"{item.get('canonical_change', '')} "
+                         f"{item.get('reflection_signal', '')}"
+                     ).lower()
+@@ -298,20 +304,12 @@ class ProposalPolicyNormalizer:
+                     for text in source_texts
+                 ):
+                     continue
+-                if kind == "evidence_oriented_request" and any(
+-                    any(
+-                        token in text
+-                        for token in ("evidence", "confidence", "unsupported", "证据", "置信")
+-                    )
+-                    for text in source_texts
+-                ):
+-                    continue
+                 raise UnsupportedPolicyCondition(f"unsupported_condition_kind:{kind}")
+ 
+             if not any(
+-                field in (item.get("applicable_context") or {})
++                field in (item.get("compact_applicable_context") or {})
+                 and cls._value_supported(
+-                    (item.get("applicable_context") or {}).get(field), expected, operator
++                    (item.get("compact_applicable_context") or {}).get(field), expected, operator
+                 )
+                 for item in source_items
+             ):
+@@ -340,13 +338,19 @@ class ProposalPolicyNormalizer:
+         compact_signals: list[dict[str, Any]],
+         proposal_signal_ids: list[int],
+     ) -> dict[str, Any]:
++        if raw.get("cannot_normalize") is True:
++            reason = str(raw.get("reason") or "llm_cannot_normalize").strip()
++            raise UnsupportedPolicyCondition(f"llm_cannot_normalize:{reason}")
+         base_order = raw.get("base_order")
+-        if not isinstance(base_order, list) or not base_order:
+-            raise UnsupportedPolicyCondition("base_order_must_be_non_empty_list")
++        if not isinstance(base_order, dict):
++            raise UnsupportedPolicyCondition("base_order_must_be_object")
++        base_steps = base_order.get("steps")
++        if not isinstance(base_steps, list) or not base_steps:
++            raise UnsupportedPolicyCondition("base_order_steps_must_be_non_empty_list")
+ 
+         by_id = {int(item["signal_id"]): item for item in compact_signals}
+         allowed_ids = set(proposal_signal_ids)
+-        base_source_ids = self._parse_ids(raw.get("base_order_source_signal_ids"))
++        base_source_ids = self._parse_ids(base_order.get("source_signal_ids"))
+         if not base_source_ids or not set(base_source_ids).issubset(allowed_ids):
+             raise UnsupportedPolicyCondition("base_order_requires_source_signals")
+ 
+@@ -417,8 +421,10 @@ class ProposalPolicyNormalizer:
+         rules.sort(key=lambda item: (-int(item["priority"]), item["rule_type"]))
+         return {
+             "policy_version": NORMALIZATION_VERSION,
+-            "base_order": base_order,
+-            "base_order_source_signal_ids": base_source_ids,
++            "base_order": {
++                "steps": base_steps,
++                "source_signal_ids": base_source_ids,
++            },
+             "rules": rules,
+             "annotations": annotations,
+             "source_signal_ids": proposal_signal_ids,
+@@ -459,24 +465,62 @@ class ProposalPolicyNormalizer:
+                 "model inference",
+             ],
+         }
++        output_example = {
++            "base_order": {
++                "steps": ["summary", "details"],
++                "source_signal_ids": [101],
++            },
++            "rules": [
++                {
++                    "rule_type": "contextual_checks",
++                    "condition": {
++                        "field": "task_type",
++                        "operator": "equals",
++                        "value": "architecture_design",
++                    },
++                    "effect": {
++                        "replace_order": [],
++                        "append_sections": [],
++                        "add_checks": ["boundaries"],
++                    },
++                    "priority": 100,
++                    "source_signal_ids": [102],
++                }
++            ],
++            "annotations": [
++                {
++                    "text": "mark historical assumptions",
++                    "source_signal_ids": [103],
++                }
++            ],
++            "reason": "each component cites only its local supporting signal",
++        }
+         messages = [
+             {
+                 "role": "system",
+                 "content": (
+                     "Normalize a merged ACTION/response_structure proposal into a conditional "
+                     "response policy. Do not union every observed section into an always-on list. "
+-                    "Return JSON only with base_order, base_order_source_signal_ids, rules, "
+-                    "annotations, and reason. Each rule must contain rule_type, condition, effect "
+-                    "(replace_order/append_sections/add_checks arrays), and non-empty "
+-                    "source_signal_ids. Conditions may use only exact applicable_context facts "
+-                    "from their cited signals, or kind=explicit_user_instruction / "
+-                    "explicit_user_preference when cited provenance supports it, or "
+-                    "kind=evidence_oriented_request when the cited signal explicitly asks for "
+-                    "evidence/confidence reporting. Put a historical "
+-                    "default in base_order; put explicit order preferences in replace_order; put "
+-                    "scenario-specific sections/checks in conditional rules. Every source signal "
+-                    "must be represented by base order, a rule, or an evidence-backed annotation. "
+-                    "Never invent a condition."
++                    "Return JSON only. base_order MUST be an object with non-empty steps and "
++                    "non-empty source_signal_ids. Every conditional rule and every behavior "
++                    "annotation MUST also have non-empty source_signal_ids. Every cited id must be "
++                    "a subset of raw_proposal.source_signal_ids. Map evidence locally: do not attach "
++                    "all proposal signal ids to every component merely because all signals target "
++                    "response_structure. The input signals explicitly include signal_id, dimension, "
++                    "operation, target_field, observed_data, canonical_change, provenance, and "
++                    "compact_applicable_context. Put a historical default in base_order, explicit "
++                    "order preferences in replace_order, and scenario-specific sections/checks in "
++                    "conditional rules only when their cited evidence supports the condition. "
++                    "Conditions may use only exact compact_applicable_context facts from cited "
++                    "signals, or kind=explicit_user_instruction / explicit_user_preference when "
++                    "cited provenance supports it. Never invent labels such as evidence_oriented "
++                    "or boundary_analysis. If a conditional component lacks a supported condition, "
++                    "omit it only when the remaining policy is semantically complete; otherwise "
++                    "return {\"cannot_normalize\":true,\"reason\":\"...\"}. Every proposal "
++                    "source signal must be represented by base_order, a rule, or a sourced "
++                    "annotation. The ids in this example are illustrative; copy actual ids from "
++                    "the input: "
++                    + json.dumps(output_example, ensure_ascii=False, separators=(",", ":"))
+                 ),
+             },
+             {
+@@ -514,7 +558,9 @@ class ProposalPolicyNormalizer:
+     def normalize_proposal(self, proposal: RevisionProposal) -> PolicyNormalizationResult:
+         existing = self.db.scalar(
+             select(ProposalNormalizationRecord).where(
+-                ProposalNormalizationRecord.source_proposal_id == proposal.id
++                ProposalNormalizationRecord.source_proposal_id == proposal.id,
++                ProposalNormalizationRecord.normalization_version
++                == NORMALIZATION_VERSION,
+             )
+         )
+         if existing is not None:
+@@ -576,7 +622,11 @@ class ProposalPolicyNormalizer:
+             )
+ 
+         fingerprint_payload = json.dumps(
+-            {"parent": int(proposal.id), "policy": policy},
++            {
++                "parent": int(proposal.id),
++                "normalization_version": NORMALIZATION_VERSION,
++                "policy": policy,
++            },
+             ensure_ascii=False,
+             sort_keys=True,
+             separators=(",", ":"),
+@@ -664,7 +714,9 @@ class ProposalPolicyNormalizer:
+         for proposal in rows:
+             exists = self.db.scalar(
+                 select(ProposalNormalizationRecord.id).where(
+-                    ProposalNormalizationRecord.source_proposal_id == proposal.id
++                    ProposalNormalizationRecord.source_proposal_id == proposal.id,
++                    ProposalNormalizationRecord.normalization_version
++                    == NORMALIZATION_VERSION,
+                 )
+             )
+             if exists is not None:
+diff --git a/app/migrations.py b/app/migrations.py
+index 053f4ce..69ba087 100644
+--- a/app/migrations.py
++++ b/app/migrations.py
+@@ -6,7 +6,11 @@ from datetime import datetime
+ from sqlalchemy import inspect, text
+ from sqlalchemy.engine import Engine
+ 
+-from app.models import HypothesisEvidence, HypothesisRevision
++from app.models import (
++    HypothesisEvidence,
++    HypothesisRevision,
++    ProposalNormalizationRecord,
++)
+ 
+ 
+ V0_2_SQLITE_COLUMNS = {
+@@ -359,6 +363,81 @@ def _backfill_revision_lineage_and_signal_resolution(engine: Engine) -> None:
+                 )
+ 
+ 
++def _sqlite_upgrade_proposal_normalization_versioning(engine: Engine) -> None:
++    """Replace the Phase 5.6 v1 source-only UNIQUE with source+version.
++
++    Existing PN rows, including failed v1 attempts, retain their ids and audit
++    payloads. The rebuild changes only the idempotency key so v2 can create a
++    new record for the same source proposal.
++    """
++    inspector = inspect(engine)
++    table_name = "proposal_normalization_records"
++    if table_name not in inspector.get_table_names():
++        return
++
++    unique_constraints = inspector.get_unique_constraints(table_name)
++    has_versioned_unique = any(
++        set(item.get("column_names") or [])
++        == {"source_proposal_id", "normalization_version"}
++        for item in unique_constraints
++    )
++    has_source_only_unique = any(
++        set(item.get("column_names") or []) == {"source_proposal_id"}
++        for item in unique_constraints
++    )
++    if has_versioned_unique and not has_source_only_unique:
++        return
++
++    backup = "proposal_normalization_records_v1_backup"
++    with engine.begin() as conn:
++        conn.execute(text("PRAGMA foreign_keys=OFF"))
++        conn.execute(text(f'DROP TABLE IF EXISTS "{backup}"'))
++        conn.execute(text(f'ALTER TABLE "{table_name}" RENAME TO "{backup}"'))
++
++        backup_inspector = inspect(conn)
++        for index in backup_inspector.get_indexes(backup):
++            name = index.get("name")
++            if name:
++                safe_name = str(name).replace('"', '""')
++                conn.execute(text(f'DROP INDEX IF EXISTS "{safe_name}"'))
++
++        ProposalNormalizationRecord.__table__.create(bind=conn, checkfirst=False)
++        conn.execute(
++            text(
++                f'''
++                INSERT INTO {table_name} (
++                    id,
++                    source_proposal_id,
++                    normalized_proposal_id,
++                    normalization_version,
++                    status,
++                    rule_count,
++                    source_signal_ids,
++                    reason,
++                    normalization_data,
++                    created_at,
++                    updated_at
++                )
++                SELECT
++                    id,
++                    source_proposal_id,
++                    normalized_proposal_id,
++                    COALESCE(normalization_version, 1),
++                    status,
++                    rule_count,
++                    source_signal_ids,
++                    reason,
++                    normalization_data,
++                    created_at,
++                    updated_at
++                FROM "{backup}"
++                '''
++            )
++        )
++        conn.execute(text(f'DROP TABLE "{backup}"'))
++        conn.execute(text("PRAGMA foreign_keys=ON"))
++
++
+ def migrate_v0_2_1(engine: Engine) -> None:
+     """V0.2 -> V0.2.1 第一阶段迁移：Hypothesis revision-aware schema。
+ 
+@@ -406,3 +485,4 @@ def migrate_v0_2_1(engine: Engine) -> None:
+     _sqlite_rebuild_hypothesis_evidence(engine)
+     _backfill_hypothesis_revisions(engine)
+     _backfill_revision_lineage_and_signal_resolution(engine)
++    _sqlite_upgrade_proposal_normalization_versioning(engine)
+diff --git a/app/models.py b/app/models.py
+index a95d93b..2ef7043 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -368,19 +368,27 @@ class RevisionProposal(Base):
+ class ProposalNormalizationRecord(Base):
+     """Immutable audit trail for a raw proposal -> conditional-policy proposal.
+ 
+-    A failed normalization is recorded too, so retrying the same raw proposal
+-    does not spend another LLM call or silently invent a different condition.
++    A failed normalization is recorded too. Idempotency is scoped by
++    (source_proposal_id, normalization_version), allowing a corrected contract
++    to retry without overwriting an earlier audit result.
+     """
+     __tablename__ = "proposal_normalization_records"
++    __table_args__ = (
++        UniqueConstraint(
++            "source_proposal_id",
++            "normalization_version",
++            name="uq_proposal_normalization_version",
++        ),
++    )
+ 
+     id: Mapped[int] = mapped_column(primary_key=True)
+     source_proposal_id: Mapped[int] = mapped_column(
+-        ForeignKey("revision_proposals.id"), unique=True, index=True
++        ForeignKey("revision_proposals.id"), index=True
+     )
+     normalized_proposal_id: Mapped[int | None] = mapped_column(
+         ForeignKey("revision_proposals.id"), nullable=True, unique=True, index=True
+     )
+-    normalization_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
++    normalization_version: Mapped[int] = mapped_column(Integer, default=2, index=True)
+     status: Mapped[str] = mapped_column(String(32), index=True)
+     rule_count: Mapped[int] = mapped_column(Integer, default=0)
+     source_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
+diff --git a/tests/test_policy_normalizer.py b/tests/test_policy_normalizer.py
+index a80048e..ae74618 100644
+--- a/tests/test_policy_normalizer.py
++++ b/tests/test_policy_normalizer.py
+@@ -7,6 +7,7 @@ from app.hypothesis.revision_commit import RevisionCommitService
+ from app.models import (
+     CandidateRevision,
+     Experience,
++    ProposalNormalizationRecord,
+     ReflectionRecord,
+     RevisionAnalysisRecord,
+     RevisionProposal,
+@@ -30,13 +31,15 @@ class PolicyLLM:
+             else {"kind": "explicit_user_instruction"}
+         )
+         return {
+-            "base_order": [
+-                "responsibility matrix",
+-                "data flow",
+-                "interface draft",
+-                "pending decisions",
+-            ],
+-            "base_order_source_signal_ids": [signal_ids[3]],
++            "base_order": {
++                "steps": [
++                    "responsibility matrix",
++                    "data flow",
++                    "interface draft",
++                    "pending decisions",
++                ],
++                "source_signal_ids": [signal_ids[3]],
++            },
+             "rules": [
+                 {
+                     "rule_type": "explicit_order_override",
+@@ -198,17 +201,19 @@ def test_phase5_6_normalizes_union_into_evidence_backed_conditional_policy(db):
+     assert first.record.rule_count == 3
+     assert first.proposal.parent_proposal_id == raw_proposal.id
+     assert first.proposal.proposal_kind == "conditional_policy"
+-    assert first.proposal.normalization_version == 1
++    assert first.record.normalization_version == 2
++    assert first.proposal.normalization_version == 2
+     assert first.proposal.base_revision == hypothesis.current_revision
+ 
+     policy = first.proposal.proposed_after_data["response_structure"]
+-    assert policy["base_order"] == [
++    assert policy["base_order"]["steps"] == [
+         "responsibility matrix",
+         "data flow",
+         "interface draft",
+         "pending decisions",
+     ]
+-    assert "evidence" not in policy["base_order"]
++    assert policy["base_order"]["source_signal_ids"] == [signals[3].id]
++    assert "evidence" not in policy["base_order"]["steps"]
+     assert len(policy["rules"]) == 3
+     assert all(rule["source_signal_ids"] for rule in policy["rules"])
+     assert set(policy["source_signal_ids"]) == {item.id for item in signals}
+@@ -227,6 +232,34 @@ def test_phase5_6_normalizes_union_into_evidence_backed_conditional_policy(db):
+     assert raw_proposal.status == "superseded_by_normalized_proposal"
+ 
+ 
++def test_phase5_6_v2_preserves_v1_failure_and_retries_same_proposal(db):
++    _hypothesis, raw_proposal, _signals = _raw_response_structure_proposal(db)
++    v1 = ProposalNormalizationRecord(
++        source_proposal_id=raw_proposal.id,
++        normalized_proposal_id=None,
++        normalization_version=1,
++        status="cannot_normalize",
++        rule_count=0,
++        source_signal_ids=raw_proposal.source_signal_ids,
++        reason="base_order_requires_source_signals",
++        normalization_data={"error": "base_order_requires_source_signals"},
++    )
++    db.add(v1)
++    db.commit()
++    v1_id = v1.id
++
++    llm = PolicyLLM()
++    result = ProposalPolicyNormalizer(db, llm).normalize_proposal(raw_proposal)
++
++    assert llm.calls == 1
++    assert result.record.id != v1_id
++    assert result.record.normalization_version == 2
++    assert result.record.status == "normalized"
++    db.refresh(v1)
++    assert v1.status == "cannot_normalize"
++    assert v1.reason == "base_order_requires_source_signals"
++
++
+ def test_phase5_6_unsupported_condition_is_rejected_without_child_proposal(db):
+     _hypothesis, raw_proposal, _signals = _raw_response_structure_proposal(db)
+     llm = PolicyLLM(unsupported=True)
+@@ -336,4 +369,3 @@ def test_phase5_6_conditional_policy_cannot_auto_apply_even_if_status_is_forced_
+     assert results == []
+     db.refresh(hypothesis)
+     assert hypothesis.current_revision == 1
+-

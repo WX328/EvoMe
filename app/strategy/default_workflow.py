@@ -29,6 +29,7 @@ class DefaultConversationStrategy:
         audit_service,
         personal_memory_service,
         personal_memory_gate,
+        learning_eligibility_gate,
         experience_gate,
         context_builder,
         evolution_memory_service,
@@ -41,6 +42,7 @@ class DefaultConversationStrategy:
         self.audit_service = audit_service
         self.personal_memory_service = personal_memory_service
         self.personal_memory_gate = personal_memory_gate
+        self.learning_eligibility_gate = learning_eligibility_gate
         self.experience_gate = experience_gate
         self.context_builder = context_builder
         self.evolution_memory_service = evolution_memory_service
@@ -95,6 +97,29 @@ class DefaultConversationStrategy:
         if response:
             yield response
 
+    def _classify_learning_eligibility(self, state: EvoMeState) -> dict:
+        result = self.learning_eligibility_gate.classify(state["user_input"])
+        return {"learning_eligibility": result}
+
+    @staticmethod
+    def _route_after_eligibility(state: EvoMeState) -> str:
+        eligibility = state.get("learning_eligibility", {})
+        return "evaluate" if eligibility.get("allow_evolution") else "record_interaction"
+
+    @staticmethod
+    def _route_after_interaction(state: EvoMeState) -> str:
+        eligibility = state.get("learning_eligibility", {})
+        if eligibility.get("allow_personal_memory"):
+            return "personal_memory_gate"
+        if eligibility.get("allow_evolution"):
+            return "experience_gate"
+        return "end"
+
+    @staticmethod
+    def _route_after_personal_memory(state: EvoMeState) -> str:
+        eligibility = state.get("learning_eligibility", {})
+        return "experience_gate" if eligibility.get("allow_evolution") else "end"
+
     def _evaluate(self, state: EvoMeState) -> dict:
         return {
             "evaluation": self.evaluation_service.evaluate(
@@ -105,15 +130,20 @@ class DefaultConversationStrategy:
         }
 
     def _record_interaction(self, state: EvoMeState) -> dict:
+        metadata = {
+            "skills_used": state.get("skills_used", []),
+            "learning_eligibility": state.get("learning_eligibility", {}),
+        }
+        evaluation = state.get("evaluation")
+        if evaluation:
+            metadata["evaluation"] = evaluation
+
         record = self.audit_service.save_interaction(
             session_id=state["session_id"],
             user_input=state["user_input"],
             assistant_response=state["response"],
             strategy_name=f"{self.name}_v{self.version}",
-            record_metadata={
-                "evaluation": state["evaluation"],
-                "skills_used": state.get("skills_used", []),
-            },
+            record_metadata=metadata,
         )
         return {"interaction_id": record.id}
 
@@ -276,6 +306,8 @@ class DefaultConversationStrategy:
             "relevant_memories": [],
             "memory_quality": 0.0,
             "skills_used": [],
+            "learning_eligibility": {},
+            "evaluation": {},
             "personal_memory_candidates": [],
             "personal_memories_saved": 0,
             "context_data": {},
@@ -295,12 +327,30 @@ class DefaultConversationStrategy:
         return state
 
     def process_slow_state(self, state: EvoMeState) -> EvoMeState:
-        """Post-response learning path. Safe to execute asynchronously."""
+        """Post-response learning path. Safe to execute asynchronously.
+
+        Learning Eligibility is the first Slow-Path boundary. Every turn may be
+        audited, but only eligible lanes are allowed to touch PersonalMemory or
+        the Experience -> Reflection -> Hypothesis evolution chain.
+        """
         state = dict(state)
-        state.update(self._evaluate(state))
+        state.update(self._classify_learning_eligibility(state))
+        eligibility = state["learning_eligibility"]
+
+        if eligibility.get("allow_evolution"):
+            state.update(self._evaluate(state))
+
+        # InteractionRecord is append-only audit and is intentionally written
+        # even when both learning lanes are closed.
         state.update(self._record_interaction(state))
-        state.update(self._extract_personal_memory(state))
-        state.update(self._write_personal_memory(state))
+
+        if eligibility.get("allow_personal_memory"):
+            state.update(self._extract_personal_memory(state))
+            state.update(self._write_personal_memory(state))
+
+        if not eligibility.get("allow_evolution"):
+            return state
+
         state.update(self._experience_gate(state))
         state.update(self._build_context(state))
         state.update(self._write_experience(state))
@@ -319,6 +369,7 @@ class DefaultConversationStrategy:
         builder = StateGraph(EvoMeState)
         builder.add_node("retrieve_personal_memory", self._retrieve_memory)
         builder.add_node("respond", self._respond)
+        builder.add_node("learning_eligibility_gate", self._classify_learning_eligibility)
         builder.add_node("evaluate", self._evaluate)
         builder.add_node("record_interaction", self._record_interaction)
         builder.add_node("personal_memory_gate", self._extract_personal_memory)
@@ -332,11 +383,28 @@ class DefaultConversationStrategy:
 
         builder.add_edge(START, "retrieve_personal_memory")
         builder.add_edge("retrieve_personal_memory", "respond")
-        builder.add_edge("respond", "evaluate")
+        builder.add_edge("respond", "learning_eligibility_gate")
+        builder.add_conditional_edges(
+            "learning_eligibility_gate",
+            self._route_after_eligibility,
+            {"evaluate": "evaluate", "record_interaction": "record_interaction"},
+        )
         builder.add_edge("evaluate", "record_interaction")
-        builder.add_edge("record_interaction", "personal_memory_gate")
+        builder.add_conditional_edges(
+            "record_interaction",
+            self._route_after_interaction,
+            {
+                "personal_memory_gate": "personal_memory_gate",
+                "experience_gate": "experience_gate",
+                "end": END,
+            },
+        )
         builder.add_edge("personal_memory_gate", "write_personal_memory")
-        builder.add_edge("write_personal_memory", "experience_gate")
+        builder.add_conditional_edges(
+            "write_personal_memory",
+            self._route_after_personal_memory,
+            {"experience_gate": "experience_gate", "end": END},
+        )
         builder.add_edge("experience_gate", "build_context")
         builder.add_edge("build_context", "write_experience")
         builder.add_conditional_edges(

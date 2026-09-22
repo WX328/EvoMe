@@ -16,22 +16,38 @@ from app.config import (
     HYPOTHESIS_TOP_K,
     REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
     REVISION_ANALYSIS_MAX_PER_RUN,
+    REVISION_CANDIDATE_MAX_EVIDENCE,
+    REVISION_CANDIDATE_MAX_PER_RUN,
+    REVISION_AUTO_APPLY_MIN_UTILITY,
+    REVISION_AUTO_APPLY_BUDGET_HOURS,
+    REVISION_AUTO_APPLY_PER_HYPOTHESIS,
+    REVISION_AUTO_APPLY_MAX_PER_RUN,
+    REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH,
+    REVISION_REVALIDATION_MAX_HYPOTHESES_PER_RUN,
 )
 from app.context.builder import ContextBuilder
 from app.evaluation.service import EvaluationService
 from app.evolution.service import EvolutionMemoryService
 from app.gates.experience_gate import ExperienceGate
+from app.gates.learning_eligibility_gate import LearningEligibilityGate
 from app.gates.personal_memory_gate import PersonalMemoryGate
 from app.hypothesis.aggregator import HypothesisAggregator
+from app.hypothesis.ancestor_revalidation import AncestorSignalRevalidationService
+from app.hypothesis.candidate_rebase import CandidateRebaseService
+from app.hypothesis.candidate_revision import CandidateRevisionService
+from app.hypothesis.policy_normalizer import ProposalPolicyNormalizer
 from app.hypothesis.relation_judge import HypothesisRelationJudge
 from app.hypothesis.revision_aggregation import RevisionAggregationService
 from app.hypothesis.revision_analyzer import RevisionAnalysisService
+from app.hypothesis.revision_commit import RevisionCommitService
+from app.hypothesis.revision_reconciliation import RevisionReconciliationService
 from app.hypothesis.retriever import HybridHypothesisRetriever
 from app.hypothesis.revision_signal import RevisionSignalService
 from app.hypothesis.service import HypothesisService
+from app.learning.invalidation import LearningInvalidationService
 from app.llm import DeepSeekClient
 from app.memory.service import PersonalMemoryService
-from app.models import StrategyRecord
+from app.models import CandidateRevision, RevisionProposal, StrategyHypothesis, StrategyRecord
 from app.reflection.service import ReflectionService
 from app.skills.builtin import build_default_skill_registry
 from app.strategy.default_workflow import DefaultConversationStrategy
@@ -68,6 +84,8 @@ class EvoMeRuntime:
         self.evolution_memory_service = EvolutionMemoryService(db)
         self.hypothesis_service = HypothesisService(db)
         self.revision_signal_service = RevisionSignalService(db)
+        self.revision_reconciliation_service = RevisionReconciliationService(db)
+        self.learning_invalidation_service = LearningInvalidationService(db)
         self.revision_aggregation_service = RevisionAggregationService(
             db, min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS
         )
@@ -76,8 +94,36 @@ class EvoMeRuntime:
             self.llm,
             min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
         )
+        self.policy_normalizer_service = ProposalPolicyNormalizer(db, self.llm)
+        self.candidate_revision_service = CandidateRevisionService(
+            db,
+            self.llm,
+            max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
+        )
+        self.ancestor_revalidation_service = AncestorSignalRevalidationService(
+            db,
+            self.llm,
+            max_signals_per_batch=REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH,
+        )
+        self.candidate_rebase_service = CandidateRebaseService(
+            db,
+            self.llm,
+            max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
+        )
+        self.revision_commit_service = RevisionCommitService(
+            db,
+            auto_min_utility=REVISION_AUTO_APPLY_MIN_UTILITY,
+            auto_budget_hours=REVISION_AUTO_APPLY_BUDGET_HOURS,
+            auto_per_hypothesis=REVISION_AUTO_APPLY_PER_HYPOTHESIS,
+        )
+        # Phase 5.4 is deterministic and idempotent. This also upgrades an
+        # already-running Phase 5.3 database where r2/events existed before
+        # RevisionSignal resolution metadata was introduced.
+        self.revision_reconciliation_service.reconcile_existing_events()
+        self.hypothesis_service.recalculate_all()
 
         self.personal_memory_gate = PersonalMemoryGate(self.llm)
+        self.learning_eligibility_gate = LearningEligibilityGate(self.llm)
         self.experience_gate = ExperienceGate(self.llm)
         self.context_builder = ContextBuilder(self.llm, model_name=DEEPSEEK_MODEL)
         self.reflection_service = ReflectionService(self.llm)
@@ -119,6 +165,7 @@ class EvoMeRuntime:
         hypothesis_retriever: HybridHypothesisRetriever,
     ) -> DefaultConversationStrategy:
         personal_memory_gate = PersonalMemoryGate(llm)
+        learning_eligibility_gate = LearningEligibilityGate(llm)
         experience_gate = ExperienceGate(llm)
         context_builder = ContextBuilder(llm, model_name=DEEPSEEK_MODEL)
         reflection_service = ReflectionService(llm)
@@ -138,6 +185,7 @@ class EvoMeRuntime:
             audit_service=audit_service,
             personal_memory_service=personal_memory_service,
             personal_memory_gate=personal_memory_gate,
+            learning_eligibility_gate=learning_eligibility_gate,
             experience_gate=experience_gate,
             context_builder=context_builder,
             evolution_memory_service=evolution_memory_service,
@@ -219,11 +267,18 @@ class EvoMeRuntime:
     @staticmethod
     def _result_from_state(state: dict[str, Any], *, strategy_name: str) -> dict[str, Any]:
         evaluation = state.get("evaluation", {})
+        eligibility = state.get("learning_eligibility", {})
         return {
             "response": state.get("response", ""),
             "strategy_name": strategy_name,
             "evaluation_score": float(evaluation.get("score", 0.0)),
             "evaluation": evaluation,
+            "learning_category": str(eligibility.get("category", "unknown")),
+            "learning_eligible": bool(eligibility.get("learning_eligible", False)),
+            "allow_personal_memory": bool(eligibility.get("allow_personal_memory", False)),
+            "allow_evolution": bool(eligibility.get("allow_evolution", False)),
+            "learning_gate_source": str(eligibility.get("decision_source", "unknown")),
+            "learning_gate_reason": str(eligibility.get("reason", "")),
             "interaction_id": state.get("interaction_id"),
             "personal_memories_saved": state.get("personal_memories_saved", 0),
             "experience_saved": bool(state.get("experience_saved", False)),
@@ -237,22 +292,53 @@ class EvoMeRuntime:
             "revision_signal_count": int(state.get("revision_signal_count", 0)),
             "revision_analysis_count": int(state.get("revision_analysis_count", 0)),
             "revision_proposal_count": int(state.get("revision_proposal_count", 0)),
+            "proposal_normalization_count": int(state.get("proposal_normalization_count", 0)),
+            "candidate_revision_count": int(state.get("candidate_revision_count", 0)),
+            "revision_auto_apply_count": int(state.get("revision_auto_apply_count", 0)),
         }
 
     def run(self, user_input: str) -> dict:
         """Legacy synchronous path retained for tests and batch callers."""
         state = self.strategy.invoke(user_input=user_input, session_id=self.session_id)
-        analysis_results = self.revision_analysis_service.analyze_pending(
-            max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
-        )
-        state["revision_analysis_count"] = len(analysis_results)
-        state["revision_proposal_count"] = sum(
-            1 for item in analysis_results if item.proposal is not None
-        )
-        evaluation = state.get("evaluation", {})
-        score = float(evaluation.get("score", 0.0))
-        success = bool(evaluation.get("success", False))
-        self._record_strategy_result(score, success)
+        eligibility = state.get("learning_eligibility", {})
+
+        if eligibility.get("allow_evolution"):
+            analysis_results = self.revision_analysis_service.analyze_pending(
+                max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
+            )
+            state["revision_analysis_count"] = len(analysis_results)
+            state["revision_proposal_count"] = sum(
+                1 for item in analysis_results if item.proposal is not None
+            )
+            normalization_results = self.policy_normalizer_service.normalize_pending(
+                max_normalizations=REVISION_CANDIDATE_MAX_PER_RUN
+            )
+            state["proposal_normalization_count"] = len(normalization_results)
+            candidate_results = self.candidate_revision_service.evaluate_pending(
+                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
+            )
+            state["candidate_revision_count"] = len(candidate_results)
+            commit_results = self.revision_commit_service.auto_apply_ready(
+                max_candidates=REVISION_AUTO_APPLY_MAX_PER_RUN
+            )
+            state["revision_auto_apply_count"] = len(commit_results)
+            for item in commit_results:
+                if item.event is not None:
+                    hypothesis = self.hypothesis_service.get(item.event.hypothesis_id)
+                    if hypothesis is not None:
+                        self.hypothesis_retriever.index(hypothesis)
+
+            evaluation = state.get("evaluation", {})
+            score = float(evaluation.get("score", 0.0))
+            success = bool(evaluation.get("success", False))
+            self._record_strategy_result(score, success)
+        else:
+            state["revision_analysis_count"] = 0
+            state["revision_proposal_count"] = 0
+            state["proposal_normalization_count"] = 0
+            state["candidate_revision_count"] = 0
+            state["revision_auto_apply_count"] = 0
+
         return self._result_from_state(state, strategy_name=self.strategy_full_name)
 
     def _process_revision_analysis_job(self) -> dict[str, Any]:
@@ -278,6 +364,147 @@ class EvoMeRuntime:
                 ],
             }
 
+    def _process_candidate_validation_job(self) -> dict[str, Any]:
+        """Run pending Phase 5 candidate validation in the background."""
+        with self._background_session_factory() as db:
+            llm = self._new_background_llm()
+            normalizer = ProposalPolicyNormalizer(db, llm)
+            normalization_results = normalizer.normalize_pending(
+                max_normalizations=REVISION_CANDIDATE_MAX_PER_RUN
+            )
+            service = CandidateRevisionService(
+                db,
+                llm,
+                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
+            )
+            results = service.evaluate_pending(
+                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
+            )
+            commit_service = RevisionCommitService(
+                db,
+                auto_min_utility=REVISION_AUTO_APPLY_MIN_UTILITY,
+                auto_budget_hours=REVISION_AUTO_APPLY_BUDGET_HOURS,
+                auto_per_hypothesis=REVISION_AUTO_APPLY_PER_HYPOTHESIS,
+            )
+            commit_results = commit_service.auto_apply_ready(
+                max_candidates=REVISION_AUTO_APPLY_MAX_PER_RUN
+            )
+            retriever = self.hypothesis_retriever.for_session(db)
+            for item in commit_results:
+                if item.event is None:
+                    continue
+                hypothesis = db.get(StrategyHypothesis, item.event.hypothesis_id)
+                if hypothesis is not None:
+                    retriever.index(hypothesis)
+            return {
+                "proposal_normalization_count": len(normalization_results),
+                "normalized_proposal_ids": [
+                    item.proposal.id
+                    for item in normalization_results
+                    if item.proposal is not None
+                ],
+                "candidate_revision_count": len(results),
+                "candidate_ids": [item.candidate.id for item in results],
+                "ready_to_apply": sum(
+                    1 for item in results if item.candidate.status == "ready_to_apply"
+                ),
+                "needs_review": sum(
+                    1 for item in results if item.candidate.status == "needs_review"
+                ),
+                "rejected": sum(
+                    1 for item in results if item.candidate.status == "rejected"
+                ),
+                "auto_applied": len(commit_results),
+                "revision_event_ids": [
+                    item.event.id for item in commit_results if item.event is not None
+                ],
+                "new_revisions": [
+                    item.event.to_revision for item in commit_results if item.event is not None
+                ],
+            }
+
+    def _process_ancestor_revalidation_job(self) -> dict[str, Any]:
+        """Revalidate ancestor-open signals against current heads in the background."""
+        with self._background_session_factory() as db:
+            llm = self._new_background_llm()
+            service = AncestorSignalRevalidationService(
+                db,
+                llm,
+                max_signals_per_batch=REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH,
+            )
+            results = service.revalidate_pending(
+                max_hypotheses=REVISION_REVALIDATION_MAX_HYPOTHESES_PER_RUN
+            )
+            hypothesis_service = HypothesisService(db)
+            for item in results:
+                hypothesis_service.recalculate(item.hypothesis_id, commit=False)
+            if results:
+                db.commit()
+            return {
+                "revalidation_batches": len(results),
+                "hypothesis_ids": [item.hypothesis_id for item in results],
+                "target_revisions": [item.target_revision for item in results],
+                "record_ids": [rid for item in results for rid in item.record_ids],
+                "rebased_signal_ids": [sid for item in results for sid in item.rebased_signal_ids],
+                "resolved_signal_ids": [sid for item in results for sid in item.resolved_signal_ids],
+                "superseded_signal_ids": [sid for item in results for sid in item.superseded_signal_ids],
+                "uncertain_signal_ids": [sid for item in results for sid in item.uncertain_signal_ids],
+            }
+
+    def _process_candidate_rebase_job(self, candidate_id: int) -> dict[str, Any]:
+        """Three-way rebase one stale Candidate onto the current revision."""
+        with self._background_session_factory() as db:
+            llm = self._new_background_llm()
+            service = CandidateRebaseService(
+                db,
+                llm,
+                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
+            )
+            result = service.rebase_candidate(int(candidate_id))
+            return {
+                "source_candidate_id": int(candidate_id),
+                "candidate_rebase_record_id": int(result.record.id),
+                "rebase_status": str(result.record.status),
+                "target_revision": int(result.record.target_revision),
+                "rebased_proposal_id": result.record.rebased_proposal_id,
+                "rebased_candidate_id": result.record.rebased_candidate_id,
+                "candidate_status": (result.candidate.status if result.candidate is not None else None),
+                "llm_called": bool(result.llm_called),
+                "reason": str(result.record.reason),
+            }
+
+    def _process_revision_auto_apply_job(self) -> dict[str, Any]:
+        """Apply already-validated LOW-risk Candidates without another LLM call."""
+        with self._background_session_factory() as db:
+            service = RevisionCommitService(
+                db,
+                auto_min_utility=REVISION_AUTO_APPLY_MIN_UTILITY,
+                auto_budget_hours=REVISION_AUTO_APPLY_BUDGET_HOURS,
+                auto_per_hypothesis=REVISION_AUTO_APPLY_PER_HYPOTHESIS,
+            )
+            results = service.auto_apply_ready(
+                max_candidates=REVISION_AUTO_APPLY_MAX_PER_RUN
+            )
+            retriever = self.hypothesis_retriever.for_session(db)
+            for item in results:
+                if item.event is None:
+                    continue
+                hypothesis = db.get(StrategyHypothesis, item.event.hypothesis_id)
+                if hypothesis is not None:
+                    retriever.index(hypothesis)
+            return {
+                "auto_applied": len(results),
+                "candidate_ids": [
+                    item.candidate.id for item in results if item.candidate is not None
+                ],
+                "revision_event_ids": [
+                    item.event.id for item in results if item.event is not None
+                ],
+                "new_revisions": [
+                    item.event.to_revision for item in results if item.event is not None
+                ],
+            }
+
     def _process_slow_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._background_session_factory() as db:
             llm = self._new_background_llm()
@@ -294,6 +521,18 @@ class EvoMeRuntime:
                 hypothesis_retriever=retriever,
             )
             state = strategy.process_slow_state(dict(payload))
+            eligibility = state.get("learning_eligibility", {})
+
+            if not eligibility.get("allow_evolution"):
+                state["revision_analysis_count"] = 0
+                state["revision_proposal_count"] = 0
+                state["proposal_normalization_count"] = 0
+                state["candidate_revision_count"] = 0
+                state["revision_auto_apply_count"] = 0
+                return self._result_from_state(
+                    state,
+                    strategy_name=f"{strategy.name}_v{strategy.version}",
+                )
 
             # Phase 4 stays entirely on the Slow Path. Only deterministic
             # analysis candidates are considered, and unchanged candidate
@@ -310,6 +549,39 @@ class EvoMeRuntime:
             state["revision_proposal_count"] = sum(
                 1 for item in analysis_results if item.proposal is not None
             )
+
+            normalizer = ProposalPolicyNormalizer(db, llm)
+            normalization_results = normalizer.normalize_pending(
+                max_normalizations=REVISION_CANDIDATE_MAX_PER_RUN
+            )
+            state["proposal_normalization_count"] = len(normalization_results)
+
+            candidate_service = CandidateRevisionService(
+                db,
+                llm,
+                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
+            )
+            candidate_results = candidate_service.evaluate_pending(
+                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
+            )
+            state["candidate_revision_count"] = len(candidate_results)
+
+            commit_service = RevisionCommitService(
+                db,
+                auto_min_utility=REVISION_AUTO_APPLY_MIN_UTILITY,
+                auto_budget_hours=REVISION_AUTO_APPLY_BUDGET_HOURS,
+                auto_per_hypothesis=REVISION_AUTO_APPLY_PER_HYPOTHESIS,
+            )
+            commit_results = commit_service.auto_apply_ready(
+                max_candidates=REVISION_AUTO_APPLY_MAX_PER_RUN
+            )
+            state["revision_auto_apply_count"] = len(commit_results)
+            for item in commit_results:
+                if item.event is None:
+                    continue
+                hypothesis = db.get(StrategyHypothesis, item.event.hypothesis_id)
+                if hypothesis is not None:
+                    retriever.index(hypothesis)
 
             evaluation = state.get("evaluation", {})
             score = float(evaluation.get("score", 0.0))
@@ -387,6 +659,54 @@ class EvoMeRuntime:
         self._last_background_job_id = job_id
         return job_id
 
+    def enqueue_candidate_validation(self) -> str | None:
+        """Queue Phase 5 candidate evaluation explicitly."""
+        if self.background_queue is None:
+            self._process_candidate_validation_job()
+            return None
+        job_id = self.background_queue.submit(
+            kind="candidate_validation",
+            fn=self._process_candidate_validation_job,
+        )
+        self._last_background_job_id = job_id
+        return job_id
+
+    def enqueue_revision_auto_apply(self) -> str | None:
+        """Queue deterministic Phase 5.3 auto-apply for existing ready Candidates."""
+        if self.background_queue is None:
+            self._process_revision_auto_apply_job()
+            return None
+        job_id = self.background_queue.submit(
+            kind="revision_auto_apply",
+            fn=self._process_revision_auto_apply_job,
+        )
+        self._last_background_job_id = job_id
+        return job_id
+
+    def enqueue_ancestor_revalidation(self) -> str | None:
+        """Queue Phase 5.5 ancestor signal revalidation."""
+        if self.background_queue is None:
+            self._process_ancestor_revalidation_job()
+            return None
+        job_id = self.background_queue.submit(
+            kind="ancestor_revalidation",
+            fn=self._process_ancestor_revalidation_job,
+        )
+        self._last_background_job_id = job_id
+        return job_id
+
+    def enqueue_candidate_rebase(self, candidate_id: int) -> str | None:
+        """Queue Phase 5.5 stale Candidate rebase and re-evaluation."""
+        if self.background_queue is None:
+            self._process_candidate_rebase_job(int(candidate_id))
+            return None
+        job_id = self.background_queue.submit(
+            kind="candidate_rebase",
+            fn=lambda: self._process_candidate_rebase_job(int(candidate_id)),
+        )
+        self._last_background_job_id = job_id
+        return job_id
+
     def list_background_jobs(self, limit: int = 10):
         if self.background_queue is None:
             return []
@@ -437,6 +757,12 @@ class EvoMeRuntime:
         self.db.expire_all()
         return self.revision_signal_service.count_invalid()
 
+    def get_revision_pressure(self, hypothesis_id: int, revision_number: int | None = None):
+        self.db.expire_all()
+        return self.revision_reconciliation_service.pressure_summary(
+            hypothesis_id, revision_number
+        )
+
     def list_revision_signal_groups(self, hypothesis_id: int | None = None):
         self.db.expire_all()
         return self.revision_aggregation_service.group_signals(hypothesis_id=hypothesis_id)
@@ -455,6 +781,97 @@ class EvoMeRuntime:
     def list_revision_proposals(self):
         self.db.expire_all()
         return self.revision_analysis_service.list_proposals()
+
+    def normalize_proposal(self, proposal_id: int):
+        self.db.expire_all()
+        return self.policy_normalizer_service.normalize_by_id(int(proposal_id))
+
+    def list_proposal_normalizations(self):
+        self.db.expire_all()
+        return self.policy_normalizer_service.list_records()
+
+    def get_response_policy(self, candidate_id: int) -> dict[str, Any]:
+        self.db.expire_all()
+        candidate = self.db.get(CandidateRevision, int(candidate_id))
+        if candidate is None:
+            raise ValueError(f"CR#{candidate_id} does not exist")
+        proposal = self.db.get(RevisionProposal, int(candidate.source_proposal_id))
+        if proposal is None or str(proposal.proposal_kind or "raw") != "conditional_policy":
+            raise ValueError(f"CR#{candidate_id} is not a conditional-policy candidate")
+        policy = (candidate.do_data or {}).get("response_structure")
+        if not isinstance(policy, dict):
+            raise ValueError(f"CR#{candidate_id} has no response policy")
+        return policy
+
+    def list_candidate_revisions(self):
+        self.db.expire_all()
+        return self.candidate_revision_service.list_candidates()
+
+    def list_signal_revalidations(self, limit: int = 100):
+        self.db.expire_all()
+        return self.ancestor_revalidation_service.list_records(limit=limit)
+
+    def list_candidate_rebases(self, limit: int = 100):
+        self.db.expire_all()
+        return self.candidate_rebase_service.list_records(limit=limit)
+
+    def approve_candidate(self, candidate_id: int, *, reason: str = "human_approved"):
+        self.db.expire_all()
+        result = self.revision_commit_service.approve_candidate(candidate_id, reason=reason)
+        if result.event is not None:
+            hypothesis = self.hypothesis_service.get(result.event.hypothesis_id)
+            if hypothesis is not None:
+                self.hypothesis_retriever.index(hypothesis)
+        return result
+
+    def reject_candidate(self, candidate_id: int, *, reason: str = "human_rejected"):
+        self.db.expire_all()
+        return self.revision_commit_service.reject_candidate(candidate_id, reason=reason)
+
+    def rollback_revision(
+        self,
+        hypothesis_id: int,
+        target_revision: int,
+        *,
+        reason: str = "human_rollback",
+    ):
+        self.db.expire_all()
+        result = self.revision_commit_service.rollback(
+            hypothesis_id,
+            target_revision,
+            reason=reason,
+        )
+        if result.event is not None:
+            hypothesis = self.hypothesis_service.get(result.event.hypothesis_id)
+            if hypothesis is not None:
+                self.hypothesis_retriever.index(hypothesis)
+        return result
+
+    def list_revision_events(self, limit: int = 50):
+        self.db.expire_all()
+        return self.revision_commit_service.list_events(limit=limit)
+
+    def invalidate_learning_from_interaction(
+        self,
+        interaction_id: int,
+        *,
+        reason: str = "operator_marked_non_learning",
+    ):
+        self.db.expire_all()
+        event = self.learning_invalidation_service.invalidate_interaction(
+            interaction_id, reason=reason
+        )
+        # Invalidation may alter current Hypothesis statistics/status. Refresh
+        # the semantic index so retrieval sees the recalculated projection.
+        for hypothesis_id in (event.event_data or {}).get("recalculated_hypothesis_ids", []):
+            hypothesis = self.hypothesis_service.get(int(hypothesis_id))
+            if hypothesis is not None:
+                self.hypothesis_retriever.index(hypothesis)
+        return event
+
+    def list_learning_invalidations(self, limit: int = 50):
+        self.db.expire_all()
+        return self.learning_invalidation_service.list_events(limit=limit)
 
     def list_interactions(self, limit: int = 20):
         self.db.expire_all()

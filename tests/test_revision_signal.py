@@ -329,3 +329,162 @@ def test_phase21_existing_invalid_signal_is_hidden_not_deleted(db):
     assert service.list_all() == []
     assert service.count_invalid() == 1
     assert len(service.list_all(valid_only=False)) == 1
+
+
+def test_context_expansion_rejects_incidental_complexity_from_real_interaction(db):
+    from app.audit.service import AuditService
+    from app.evolution.service import EvolutionMemoryService
+
+    audit = AuditService(db)
+    interaction = audit.save_interaction(
+        session_id="ctx-leak",
+        user_input="你以后给我设计架构时，先讲数据流，再讲模块接口，这样我更容易理解。",
+        assistant_response="好的",
+        strategy_name="default_conversation_strategy_v2",
+        record_metadata={"learning_eligibility": {"category": "natural"}},
+    )
+    evolution = EvolutionMemoryService(db)
+    experience = evolution.save_experience(
+        interaction_id=interaction.id,
+        task_type="architecture_design",
+        strategy_name="default_conversation_strategy",
+        strategy_version=2,
+        skills_used=[],
+        result_summary="preference-feedback",
+        success=True,
+        score=0.95,
+        context_data={
+            "task_type": "architecture_design",
+            "complexity": "low",
+            "interaction_mode": "direct",
+        },
+    )
+    reflection = evolution.save_reflection(
+        experience_id=experience.id,
+        reflection_type="success",
+        observation="用户明确给出输出顺序偏好",
+        insight="明确输出顺序偏好可改善理解",
+        applicable_context={
+            "task_type": "architecture_design",
+            "complexity": "low",
+            "interaction_mode": "direct",
+        },
+        expected_effect="提高理解度",
+        canonical_signal="preference-order",
+        strategy_signal="按数据流 -> 模块接口组织回答",
+        confidence=0.9,
+    )
+
+    service = HypothesisService(db)
+    base = _make_reflection(db, interaction_id=901, complexity="high", seed="base-high")
+    hypothesis = service.create_from_reflection(
+        reflection=base,
+        canonical_signal=base.canonical_signal,
+    )
+    judge = HypothesisRelationJudge(
+        RelationLLM(
+            {
+                "relation": "REFINES",
+                "confidence": 0.95,
+                "reason": "preference improves response structure",
+                "revision_signals": [
+                    {
+                        "dimension": "CONTEXT",
+                        "operation": "EXPAND",
+                        "target_field": "complexity",
+                        "before_data": ["high"],
+                        "observed_data": ["low"],
+                        "canonical_change": "complexity: high -> include observed low",
+                        "confidence": 0.88,
+                    },
+                    {
+                        "dimension": "CONTEXT",
+                        "operation": "EXPAND",
+                        "target_field": "interaction_mode",
+                        "before_data": ["collaborative"],
+                        "observed_data": ["direct"],
+                        "canonical_change": "interaction mode: collaborative -> include direct",
+                        "confidence": 0.86,
+                    },
+                    {
+                        "dimension": "ACTION",
+                        "operation": "EXPAND",
+                        "target_field": "response_structure",
+                        "before_data": "existing structure",
+                        "observed_data": "数据流 -> 模块接口 -> 内部实现",
+                        "canonical_change": "add explicit user-preferred response order",
+                        "confidence": 0.9,
+                    },
+                ],
+            }
+        )
+    )
+    aggregator = HypothesisAggregator(
+        db,
+        relation_judge=judge,
+        retriever=StaticRetriever(hypothesis.id),
+        score_threshold=0.0,
+    )
+
+    result = aggregator.process(reflection)
+    signals = RevisionSignalService(db).list_all(hypothesis_id=hypothesis.id)
+
+    assert result["revision_signal_count"] == 1
+    assert [(s.dimension, s.target_field) for s in signals] == [
+        ("ACTION", "response_structure")
+    ]
+    assert signals[0].provenance_data["source_interaction_id"] == interaction.id
+
+
+def test_context_expansion_allows_explicit_user_scope(db):
+    from app.audit.service import AuditService
+    from app.evolution.service import EvolutionMemoryService
+
+    interaction = AuditService(db).save_interaction(
+        session_id="ctx-explicit",
+        user_input="无论简单任务还是高复杂度架构设计，都按这个顺序讲。",
+        assistant_response="好的",
+        strategy_name="default_conversation_strategy_v2",
+    )
+    evolution = EvolutionMemoryService(db)
+    experience = evolution.save_experience(
+        interaction_id=interaction.id,
+        task_type="architecture_design",
+        strategy_name="default_conversation_strategy",
+        strategy_version=2,
+        skills_used=[],
+        result_summary="explicit complexity scope",
+        success=True,
+        score=0.9,
+        context_data={"task_type": "architecture_design", "complexity": "low"},
+    )
+    reflection = evolution.save_reflection(
+        experience_id=experience.id,
+        reflection_type="success",
+        observation="用户显式扩大适用复杂度",
+        insight="该顺序适用于简单任务",
+        applicable_context={"task_type": "architecture_design", "complexity": "low"},
+        expected_effect="一致讲解顺序",
+        canonical_signal="explicit-low",
+        strategy_signal="简单和复杂任务都使用该结构",
+        confidence=0.9,
+    )
+    service = HypothesisService(db)
+    base = _make_reflection(db, interaction_id=902, complexity="high", seed="base-high-explicit")
+    hypothesis = service.create_from_reflection(reflection=base, canonical_signal=base.canonical_signal)
+    judge = HypothesisRelationJudge(RelationLLM({
+        "relation": "REFINES", "confidence": 0.93, "reason": "explicit scope",
+        "revision_signals": [{
+            "dimension": "CONTEXT", "operation": "EXPAND", "target_field": "complexity",
+            "before_data": ["high"], "observed_data": ["low"],
+            "canonical_change": "complexity: high -> include observed low", "confidence": 0.9,
+        }],
+    }))
+    result = HypothesisAggregator(
+        db, relation_judge=judge, retriever=StaticRetriever(hypothesis.id), score_threshold=0.0
+    ).process(reflection)
+
+    signals = RevisionSignalService(db).list_all(hypothesis_id=hypothesis.id)
+    assert result["revision_signal_count"] == 1
+    assert signals[0].target_field == "complexity"
+    assert signals[0].provenance_data["context_evidence_basis"] == "explicit_user_scope"

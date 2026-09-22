@@ -44,3 +44,17 @@ python main.py
 - 自动修改代码
 
 它们会在当前核心闭环稳定后逐层加入。
+
+## V0.2.1 Phase 5.4.1：Learning Eligibility Boundary
+
+Slow Loop 在写入 PersonalMemory / Experience 之前增加 `LearningEligibilityGate`：
+
+- `operational`：命令/状态操作，只审计，不学习。
+- `noise`：乱码/误按，只审计，不学习。
+- `testing`：模拟/测试输入默认不学习；显式要求记录测试结果时只允许 Evolution，禁止模拟事实进入 PersonalMemory。
+- `meta`：仅观察 EvoMe 当前 Memory/Hypothesis/状态时只审计；真实设计/修复任务仍可进入 Evolution。
+- `natural`：再按 `allow_personal_memory` 与 `allow_evolution` 两条独立通道进入后续 Gate。
+
+已知 CLI 命令可省略 `/`，例如 `revision-signals` 会自动规范化为 `/revision-signals`。未知 `/xxx` 会被 CLI 拦截，不发送给 LLM，也不进入学习系统。
+
+原则：**Audit is broad; learning is selective.**

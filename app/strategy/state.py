@@ -11,6 +11,7 @@ class EvoMeState(TypedDict, total=False):
     memory_quality: float
     skills_used: list[str]
     response: str
+    learning_eligibility: dict[str, Any]
     evaluation: dict[str, Any]
     interaction_id: int
 

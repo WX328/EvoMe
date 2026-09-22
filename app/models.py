@@ -134,6 +134,9 @@ class HypothesisRevision(Base):
         ForeignKey("strategy_hypotheses.id"), index=True
     )
     revision_number: Mapped[int] = mapped_column(Integer, index=True)
+    # Parent revision records lineage explicitly so rollback/new branches can
+    # reconcile signal resolution against the active ancestry.
+    parent_revision: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
     title: Mapped[str] = mapped_column(String(200))
     canonical_signal: Mapped[str] = mapped_column(Text)
@@ -222,6 +225,65 @@ class RevisionSignal(Base):
     )
     canonical_change: Mapped[str] = mapped_column(Text)
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    provenance_data: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    # Resolution is historical metadata. Whether a resolved signal still counts
+    # as resolved for the current head is determined from revision lineage.
+    resolution_status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    resolved_by_candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate_revisions.id"), nullable=True, index=True
+    )
+    resolved_by_revision: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Ancestor revalidation may either carry the same semantic signal forward to
+    # a descendant revision or retire it for that branch. Supersession is also
+    # lineage-aware: rolling back before superseded_by_revision re-opens the
+    # original signal instead of erasing history.
+    superseded_by_signal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_signals.id"), nullable=True, index=True
+    )
+    superseded_by_revision: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution_note: Mapped[str] = mapped_column(Text, default="")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class RevisionSignalRevalidation(Base):
+    """Audit record for re-checking one ancestor RevisionSignal against a newer head.
+
+    Revalidation is immutable per evaluator version. A STILL_APPLIES result may
+    materialize a new RevisionSignal on target_revision; the source signal stays
+    historically intact and is only branch-superseded.
+    """
+    __tablename__ = "revision_signal_revalidations"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_signal_id",
+            "target_revision",
+            "evaluation_version",
+            name="uq_revision_signal_revalidation_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    source_signal_id: Mapped[int] = mapped_column(
+        ForeignKey("revision_signals.id"), index=True
+    )
+    source_revision: Mapped[int] = mapped_column(Integer, index=True)
+    target_revision: Mapped[int] = mapped_column(Integer, index=True)
+    evaluation_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    outcome: Mapped[str] = mapped_column(String(32), index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    rebased_signal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_signals.id"), nullable=True, index=True
+    )
+    evaluation_data: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
 
@@ -286,10 +348,204 @@ class RevisionProposal(Base):
     direction_confidence: Mapped[float] = mapped_column(Float, default=0.5)
     status: Mapped[str] = mapped_column(String(32), default="proposed", index=True)
 
+    # Phase 5.6 keeps the analyzer's raw proposal immutable and writes policy
+    # normalization as a child proposal.  Existing proposals backfill to the
+    # legacy/raw kind instead of being rewritten in place.
+    parent_proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_proposals.id"), nullable=True, index=True
+    )
+    proposal_kind: Mapped[str] = mapped_column(
+        String(32), default="raw", index=True
+    )
+    normalization_version: Mapped[int] = mapped_column(Integer, default=0, index=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now
     )
+
+
+class ProposalNormalizationRecord(Base):
+    """Immutable audit trail for a raw proposal -> conditional-policy proposal.
+
+    A failed normalization is recorded too. Idempotency is scoped by
+    (source_proposal_id, normalization_version), allowing a corrected contract
+    to retry without overwriting an earlier audit result.
+    """
+    __tablename__ = "proposal_normalization_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_proposal_id",
+            "normalization_version",
+            name="uq_proposal_normalization_version",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    source_proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("revision_proposals.id"), index=True
+    )
+    normalized_proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_proposals.id"), nullable=True, unique=True, index=True
+    )
+    normalization_version: Mapped[int] = mapped_column(Integer, default=2, index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    rule_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    normalization_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+
+class CandidateRevision(Base):
+    """RevisionProposal 应用到正式 base revision 后形成的实验性候选。
+
+    Candidate 不是正式 HypothesisRevision，不会改变 current_revision。Phase 5
+    只负责构建、Evidence Re-evaluation、Utility/Risk 分类。
+    """
+    __tablename__ = "candidate_revisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    base_revision: Mapped[int] = mapped_column(Integer, default=1, index=True)
+    source_proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("revision_proposals.id"), unique=True, index=True
+    )
+
+    title: Mapped[str] = mapped_column(String(200), default="")
+    insight: Mapped[str] = mapped_column(Text, default="")
+    when_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    do_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    expect_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    canonical_signal: Mapped[str] = mapped_column(Text, default="")
+
+    status: Mapped[str] = mapped_column(String(32), default="validating", index=True)
+
+    base_fit_score: Mapped[float] = mapped_column(Float, default=0.0)
+    candidate_fit_score: Mapped[float] = mapped_column(Float, default=0.0)
+    fit_gain: Mapped[float] = mapped_column(Float, default=0.0)
+
+    base_complexity_score: Mapped[int] = mapped_column(Integer, default=0)
+    complexity_score: Mapped[int] = mapped_column(Integer, default=0)
+    complexity_delta: Mapped[int] = mapped_column(Integer, default=0)
+
+    risk_level: Mapped[str] = mapped_column(String(16), default="MEDIUM", index=True)
+    risk_score: Mapped[float] = mapped_column(Float, default=0.0)
+    utility_score: Mapped[float] = mapped_column(Float, default=0.0)
+    evaluation_version: Mapped[int] = mapped_column(Integer, default=3, index=True)
+    # Legacy candidates keep v1. Conditional response-policy candidates use the
+    # semantic scorer introduced in Phase 5.6 and are never retroactively
+    # re-scored.
+    complexity_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
+
+    evidence_ids: Mapped[list] = mapped_column(JSON, default=list)
+    evaluation_data: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+
+class CandidateRebaseRecord(Base):
+    """Audit record for carrying a stale Candidate onto the current revision.
+
+    A clean rebase is only allowed when every source signal was revalidated as
+    STILL_APPLIES and the proposal target field did not change between the old
+    base and the current head. The rebased Candidate is always re-evaluated.
+    """
+    __tablename__ = "candidate_rebase_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_candidate_id",
+            "target_revision",
+            name="uq_candidate_rebase_target",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    source_candidate_id: Mapped[int] = mapped_column(
+        ForeignKey("candidate_revisions.id"), index=True
+    )
+    source_proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("revision_proposals.id"), index=True
+    )
+    from_revision: Mapped[int] = mapped_column(Integer, index=True)
+    target_revision: Mapped[int] = mapped_column(Integer, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+
+    source_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
+    target_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
+    rebased_analysis_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_analysis_records.id"), nullable=True, index=True
+    )
+    rebased_proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_proposals.id"), nullable=True, index=True
+    )
+    rebased_candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate_revisions.id"), nullable=True, index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, default="")
+    rebase_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now
+    )
+
+
+class RevisionApplicationEvent(Base):
+    """Hypothesis Revision 的应用/回滚/人工拒绝审计事件。
+
+    Revision 本身保持不可变；这个表记录 current head 为什么、由谁/哪条 Candidate
+    发生了变化。AUTO_APPLY 也受 change budget 约束。
+    """
+    __tablename__ = "revision_application_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    hypothesis_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_hypotheses.id"), index=True
+    )
+    from_revision: Mapped[int] = mapped_column(Integer, index=True)
+    to_revision: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+    candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("candidate_revisions.id"), nullable=True, index=True
+    )
+    proposal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("revision_proposals.id"), nullable=True, index=True
+    )
+
+    action: Mapped[str] = mapped_column(String(32), index=True)
+    risk_level: Mapped[str] = mapped_column(String(16), default="", index=True)
+    utility_score: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    event_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
+class LearningInvalidationEvent(Base):
+    """Operator-confirmed invalidation of learning derived from one interaction.
+
+    The source InteractionRecord is never deleted. This event records which derived
+    artifacts were retired so contamination cleanup remains auditable.
+    """
+    __tablename__ = "learning_invalidation_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        ForeignKey("interaction_records.id"), index=True
+    )
+    reason: Mapped[str] = mapped_column(Text, default="")
+    event_data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
 
 class StrategyRecord(Base):

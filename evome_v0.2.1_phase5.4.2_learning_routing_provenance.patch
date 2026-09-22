@@ -1,0 +1,1150 @@
+diff --git a/app/cli_commands.py b/app/cli_commands.py
+index 48cbaa9..ea456aa 100644
+--- a/app/cli_commands.py
++++ b/app/cli_commands.py
+@@ -4,7 +4,7 @@ from __future__ import annotations
+ # Central command vocabulary used by both the CLI and Learning Eligibility Gate.
+ # Keeping this in one place prevents an operational command typo from becoming a
+ # learning sample simply because the slash was omitted.
+-PARAM_COMMAND_NAMES = frozenset({"candidate-approve", "candidate-reject", "revision-rollback"})
++PARAM_COMMAND_NAMES = frozenset({"candidate-approve", "candidate-reject", "revision-rollback", "learning-invalidate"})
+ 
+ COMMAND_NAMES = frozenset(
+     {
+@@ -27,6 +27,8 @@ COMMAND_NAMES = frozenset(
+         "candidate-reject",
+         "revision-events",
+         "revision-rollback",
++        "learning-invalidate",
++        "learning-invalidations",
+         "status",
+         "audit",
+         "skills",
+diff --git a/app/gates/learning_eligibility_gate.py b/app/gates/learning_eligibility_gate.py
+index e1226de..f0310d4 100644
+--- a/app/gates/learning_eligibility_gate.py
++++ b/app/gates/learning_eligibility_gate.py
+@@ -20,6 +20,7 @@ MODULE: LEARNING_ELIGIBILITY_GATE
+ 5. testing：假设数据、模拟用户事实、仅用于测试的输入。默认只审计；若用户明确要求“把测试结果作为系统经验记录”，只允许 evolution，不允许把模拟事实写入 PersonalMemory。
+ 6. meta：只是询问 EvoMe 当前记忆、Hypothesis、状态、内部概念或观察系统本身。默认只审计。真正的设计/修复/实现任务不属于 meta。
+ 7. 用户明确纠正 EvoMe、描述真实偏好/目标/项目/决策，或执行真实复杂任务，可以进入相应学习通道。
++8. “以后/今后给我……”“这样我更容易理解”“以后默认……”这类明确的未来交互偏好，同时属于用户长期偏好和 EvoMe 执行反馈：allow_personal_memory=true 且 allow_evolution=true。
+ 
+ 两个通道必须分开：
+ - allow_personal_memory：是否允许 PersonalMemory Gate 从当前用户输入提取真实长期用户信息。
+@@ -93,6 +94,24 @@ class LearningEligibilityGate:
+         "太简略",
+     )
+ 
++    _DURABLE_PREFERENCE_MARKERS = (
++        "以后给我",
++        "你以后给我",
++        "今后给我",
++        "以后帮我",
++        "今后帮我",
++        "以后默认",
++        "今后默认",
++        "默认按",
++        "默认先",
++        "我更容易理解",
++        "这样我更容易",
++        "这样更适合我",
++        "对我更有帮助",
++        "以后都",
++        "今后都",
++    )
++
+     _PERSONAL_WORLD_MARKERS = (
+         "我喜欢",
+         "我不喜欢",
+@@ -240,6 +259,18 @@ class LearningEligibilityGate:
+             return False
+         return cls._contains_any(text, cls._ORDINARY_QA_MARKERS)
+ 
++    @classmethod
++    def _looks_durable_preference(cls, text: str) -> bool:
++        if cls._contains_any(text, cls._DURABLE_PREFERENCE_MARKERS):
++            return True
++        lowered = text.lower()
++        # Conservative future-default pattern: require both a future marker and
++        # a user-facing reference so generic statements about the future do not
++        # become PersonalMemory.
++        has_future = ("以后" in lowered) or ("今后" in lowered)
++        has_user_reference = any(marker in lowered for marker in ("给我", "帮我", "我更", "对我", "我希望"))
++        return has_future and has_user_reference
++
+     def _deterministic_decision(self, user_input: str) -> dict[str, Any] | None:
+         text = self._normalize(user_input)
+ 
+@@ -281,12 +312,25 @@ class LearningEligibilityGate:
+ 
+         has_personal = self._contains_any(text, self._PERSONAL_WORLD_MARKERS)
+         has_feedback = self._contains_any(text, self._CORRECTION_OR_FEEDBACK_MARKERS)
++        durable_preference = self._looks_durable_preference(text)
++        if durable_preference:
++            return self._result(
++                category="natural",
++                allow_personal_memory=True,
++                allow_evolution=True,
++                reason="deterministic: explicit durable preference + execution feedback; route to both lanes",
++                decision_source="deterministic_hard_pass",
++            )
+         if has_feedback:
+             return self._result(
+                 category="natural",
+-                allow_personal_memory=has_personal,
++                allow_personal_memory=bool(has_personal or durable_preference),
+                 allow_evolution=True,
+-                reason="deterministic: explicit real feedback/correction has learning value",
++                reason=(
++                    "deterministic: explicit durable preference + execution feedback; route to both lanes"
++                    if durable_preference
++                    else "deterministic: explicit real feedback/correction has learning value"
++                ),
+                 decision_source="deterministic_hard_pass",
+             )
+ 
+diff --git a/app/gates/personal_memory_gate.py b/app/gates/personal_memory_gate.py
+index 7d67e81..faf5e1a 100644
+--- a/app/gates/personal_memory_gate.py
++++ b/app/gates/personal_memory_gate.py
+@@ -10,6 +10,7 @@ PERSONAL_MEMORY_GATE_PROMPT = """
+ 允许 memory_type：fact / preference / goal / project / decision / knowledge
+ 
+ 值得保存：长期目标、重要项目、明确决策、稳定偏好、明确完成/掌握的重要阶段、长期重要背景。
++特别注意：用户明确说“以后/今后给我……”“这样我更容易理解”“默认按……”时，若表达的是未来跨会话可复用的交互/讲解偏好，应保存为 preference；只保存用户偏好本身，不把 AI 的回复细节扩写成用户事实。
+ 通常不保存：普通知识问题、一次性临时请求、当前情绪、没有新增信息的旧事实。
+ 
+ 严格 JSON：
+diff --git a/app/hypothesis/relation_judge.py b/app/hypothesis/relation_judge.py
+index 6803f57..0a2528e 100644
+--- a/app/hypothesis/relation_judge.py
++++ b/app/hypothesis/relation_judge.py
+@@ -33,6 +33,7 @@ operation 必须同时符合 dimension 的兼容矩阵：
+ - ABSTRACTION: GENERALIZE / SPECIALIZE
+ 例如“给执行流程增加一步”属于 ACTION/EXPAND，不要写 ACTION/ADD_CONDITION。
+ before_data 写当前 Hypothesis 里的现有值；observed_data 只写这条 Reflection 真正观察到的新信息；不得提前生成最终 after。
++CONTEXT 特别保守：不要因为某次成功交互“恰好”是 low/high complexity、direct/collaborative 或 low/high risk，就扩展 Hypothesis 的适用边界。只有用户明确把这些条件说成适用范围/偏好条件时，才输出对应 CONTEXT signal。
+ user_satisfaction 只有存在明确用户反馈时才允许输出；不得从 evaluator score 推断。
+ 最多输出 5 条原子 Signal。relation 不是 REFINES 时 revision_signals 必须为空数组。
+ 
+diff --git a/app/hypothesis/revision_signal.py b/app/hypothesis/revision_signal.py
+index 719ee2f..3a3a000 100644
+--- a/app/hypothesis/revision_signal.py
++++ b/app/hypothesis/revision_signal.py
+@@ -2,8 +2,8 @@ from __future__ import annotations
+ from typing import Any
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
+-from app.hypothesis.signal_quality import normalize_revision_signal, persisted_signal_payload
+-from app.models import Experience,HypothesisEvidence,HypothesisRevision,ReflectionRecord,RevisionSignal,StrategyHypothesis
++from app.hypothesis.signal_quality import context_evidence_basis, normalize_revision_signal, persisted_signal_payload
++from app.models import Experience,HypothesisEvidence,HypothesisRevision,InteractionRecord,ReflectionRecord,RevisionSignal,StrategyHypothesis
+ 
+ class RevisionSignalService:
+     def __init__(self,db:Session)->None: self.db=db
+@@ -14,17 +14,23 @@ class RevisionSignalService:
+     def _revision_payload(revision:HypothesisRevision|None)->dict[str,Any]:
+         if revision is None:return {}
+         return {"revision":revision.revision_number,"insight":revision.insight,"when_data":revision.when_data or {},"do_data":revision.do_data or {},"expect_data":revision.expect_data or {},"applicable_context":revision.when_data or {},"proposed_change":(revision.do_data or {}).get("text",revision.do_data or {}),"expected_effect":(revision.expect_data or {}).get("text",revision.expect_data or {}),"canonical_signal":revision.canonical_signal}
+-    def _validation_context(self,*,hypothesis_id:int,base_revision:int,reflection_id:int)->tuple[dict[str,Any],dict[str,Any],bool]:
++    def _validation_context(self,*,hypothesis_id:int,base_revision:int,reflection_id:int)->tuple[dict[str,Any],dict[str,Any],bool,str,dict[str,Any]]:
+         reflection=self.db.get(ReflectionRecord,reflection_id)
+         revision=self.db.scalar(select(HypothesisRevision).where(HypothesisRevision.hypothesis_id==hypothesis_id,HypothesisRevision.revision_number==base_revision))
+-        explicit_feedback=False
++        explicit_feedback=False; source_user_input=""; interaction_metadata={}
+         if reflection is not None and reflection.experience_id is not None:
+             experience=self.db.get(Experience,reflection.experience_id)
+             explicit_feedback=bool(experience is not None and experience.user_feedback and str(experience.user_feedback).strip())
+-        return (self._reflection_payload(reflection) if reflection is not None else {},self._revision_payload(revision),explicit_feedback)
++            if experience is not None and experience.interaction_id is not None:
++                interaction=self.db.get(InteractionRecord,experience.interaction_id)
++                if interaction is not None:
++                    source_user_input=str(interaction.user_input or "")
++                    interaction_metadata=dict(interaction.record_metadata or {})
++        return (self._reflection_payload(reflection) if reflection is not None else {},self._revision_payload(revision),explicit_feedback,source_user_input,interaction_metadata)
+     def _is_valid_persisted(self,signal:RevisionSignal)->tuple[bool,str]:
+-        rp,hp,feedback=self._validation_context(hypothesis_id=signal.hypothesis_id,base_revision=signal.base_revision,reflection_id=signal.reflection_id)
+-        normalized,reason=normalize_revision_signal(persisted_signal_payload(signal),reflection_payload=rp,hypothesis_payload=hp,explicit_user_feedback=feedback)
++        if str(signal.resolution_status or "open").lower()=="invalid": return False,"signal explicitly invalidated"
++        rp,hp,feedback,source_user_input,_=self._validation_context(hypothesis_id=signal.hypothesis_id,base_revision=signal.base_revision,reflection_id=signal.reflection_id)
++        normalized,reason=normalize_revision_signal(persisted_signal_payload(signal),reflection_payload=rp,hypothesis_payload=hp,explicit_user_feedback=feedback,source_user_input=source_user_input)
+         return normalized is not None,reason
+     def list_all(self,*,hypothesis_id:int|None=None,base_revision:int|None=None,valid_only:bool=True)->list[RevisionSignal]:
+         stmt=select(RevisionSignal)
+@@ -44,20 +50,33 @@ class RevisionSignalService:
+         if evidence.relation_type!="REFINES": return []
+         target_revision=int(evidence.hypothesis_revision)
+         revision=self.db.scalar(select(HypothesisRevision).where(HypothesisRevision.hypothesis_id==hypothesis.id,HypothesisRevision.revision_number==target_revision))
+-        experience=None;interaction_id=None;explicit_feedback=False
++        experience=None;interaction_id=None;explicit_feedback=False;source_user_input="";interaction_metadata={}
+         if reflection.experience_id is not None:
+             experience=self.db.get(Experience,reflection.experience_id)
+             if experience is not None:
+                 interaction_id=experience.interaction_id
+                 explicit_feedback=bool(experience.user_feedback and str(experience.user_feedback).strip())
++                interaction=self.db.get(InteractionRecord,experience.interaction_id) if experience.interaction_id is not None else None
++                if interaction is not None:
++                    source_user_input=str(interaction.user_input or "")
++                    interaction_metadata=dict(interaction.record_metadata or {})
+         rp=self._reflection_payload(reflection);hp=self._revision_payload(revision);created=[]
+         for raw in raw_signals:
+-            normalized,_=normalize_revision_signal(raw,reflection_payload=rp,hypothesis_payload=hp,explicit_user_feedback=explicit_feedback)
++            normalized,_=normalize_revision_signal(raw,reflection_payload=rp,hypothesis_payload=hp,explicit_user_feedback=explicit_feedback,source_user_input=source_user_input)
+             if normalized is None: continue
+             dimension=normalized["dimension"];operation=normalized["operation"];target_field=normalized["target_field"]
+             existing=self.db.scalar(select(RevisionSignal).where(RevisionSignal.hypothesis_id==hypothesis.id,RevisionSignal.base_revision==target_revision,RevisionSignal.reflection_id==reflection.id,RevisionSignal.dimension==dimension,RevisionSignal.operation==operation,RevisionSignal.target_field==target_field))
+             if existing is not None: continue
+-            signal=RevisionSignal(hypothesis_id=hypothesis.id,base_revision=target_revision,reflection_id=reflection.id,evidence_id=evidence.id,interaction_id=interaction_id,dimension=dimension,operation=operation,target_field=target_field,before_data=normalized["before_data"],observed_data=normalized["observed_data"],canonical_change=normalized["canonical_change"],confidence=normalized["confidence"])
++            basis,basis_reason=context_evidence_basis(target_field,normalized["observed_data"],source_user_input=source_user_input) if dimension=="CONTEXT" else ("reflection_signal","non-context signal")
++            provenance={
++                "source_interaction_id": interaction_id,
++                "source_user_excerpt": source_user_input[:240],
++                "learning_category": ((interaction_metadata.get("learning_eligibility") or {}).get("category") if interaction_metadata else None),
++                "context_evidence_basis": basis,
++                "context_evidence_reason": basis_reason,
++                "explicit_user_feedback": explicit_feedback,
++            }
++            signal=RevisionSignal(hypothesis_id=hypothesis.id,base_revision=target_revision,reflection_id=reflection.id,evidence_id=evidence.id,interaction_id=interaction_id,dimension=dimension,operation=operation,target_field=target_field,before_data=normalized["before_data"],observed_data=normalized["observed_data"],canonical_change=normalized["canonical_change"],confidence=normalized["confidence"],provenance_data=provenance)
+             self.db.add(signal);created.append(signal)
+         if created:
+             self.db.commit()
+diff --git a/app/hypothesis/service.py b/app/hypothesis/service.py
+index 1ecee8a..2a40226 100644
+--- a/app/hypothesis/service.py
++++ b/app/hypothesis/service.py
+@@ -187,6 +187,7 @@ class HypothesisService:
+             .where(
+                 HypothesisEvidence.hypothesis_id == hypothesis_id,
+                 HypothesisEvidence.hypothesis_revision == revision_number,
++                ReflectionRecord.status == "active",
+             )
+         )
+         return {int(item) for item in self.db.scalars(stmt).all() if item is not None}
+@@ -269,6 +270,7 @@ class HypothesisService:
+             .where(
+                 HypothesisEvidence.hypothesis_id == hypothesis_id,
+                 HypothesisEvidence.hypothesis_revision == revision_number,
++                ReflectionRecord.status == "active",
+             )
+         )
+         return list(self.db.execute(stmt).all())
+diff --git a/app/hypothesis/signal_quality.py b/app/hypothesis/signal_quality.py
+index 868dbb4..32fa2ad 100644
+--- a/app/hypothesis/signal_quality.py
++++ b/app/hypothesis/signal_quality.py
+@@ -84,6 +84,64 @@ GENERIC_TARGET_FIELDS = {
+     "outcome",
+ }
+ 
++# These applicability fields are especially easy to leak from one execution
++# snapshot into a global Hypothesis boundary. For a single-turn RevisionSignal
++# they require explicit user/task wording; merely observing that the successful
++# turn happened to be low-complexity/direct/low-risk is not enough.
++INCIDENTAL_CONTEXT_FIELDS = {"complexity", "risk_level", "interaction_mode"}
++
++_CONTEXT_VALUE_MARKERS = {
++    "complexity": {
++        "low": ("低复杂度", "简单任务", "简单问题", "简单架构", "轻量"),
++        "medium": ("中等复杂度", "中复杂度", "中等难度"),
++        "high": ("高复杂度", "复杂任务", "复杂架构", "复杂问题"),
++    },
++    "risk_level": {
++        "low": ("低风险",),
++        "medium": ("中风险", "中等风险"),
++        "high": ("高风险", "高危"),
++    },
++    "interaction_mode": {
++        "direct": ("直接回答", "直接给", "直接讲", "直接模式"),
++        "collaborative": ("协作", "和我一起", "一起讨论", "共同"),
++        "teaching": ("教学", "教我", "一步一步讲", "讲解模式"),
++        "exploratory": ("探索", "探索式", "一起想", "发散"),
++    },
++}
++
++
++def _observed_scalar_values(value: Any) -> list[str]:
++    values = value if isinstance(value, list) else [value]
++    return [str(item).strip().lower() for item in values if not _is_empty(item)]
++
++
++def context_evidence_basis(
++    field: str,
++    observed_data: Any,
++    *,
++    source_user_input: str = "",
++) -> tuple[str, str]:
++    """Classify whether a CONTEXT signal is explicitly supported or incidental."""
++    if field not in INCIDENTAL_CONTEXT_FIELDS:
++        return "derived_context", "field is not in the high-leakage incidental set"
++
++    text = str(source_user_input or "").lower()
++    if not text:
++        # Legacy/unit-test path: absence of the source interaction should not
++        # retroactively invalidate historical data solely because old rows do
++        # not carry enough provenance. Real runtime interactions always exist.
++        return "legacy_unknown", "source user input unavailable"
++
++    markers_by_value = _CONTEXT_VALUE_MARKERS.get(field, {})
++    for value in _observed_scalar_values(observed_data):
++        markers = markers_by_value.get(value, ())
++        if any(marker.lower() in text for marker in markers):
++            return "explicit_user_scope", f"user input explicitly supports {field}={value}"
++
++    return "incidental_execution_context", (
++        f"{field} was observed in this turn but the user did not explicitly scope the strategy to it"
++    )
++
+ 
+ def _clamp_confidence(value: Any, default: float = 0.5) -> float:
+     try:
+@@ -150,6 +208,7 @@ def normalize_revision_signal(
+     reflection_payload: dict[str, Any] | None = None,
+     hypothesis_payload: dict[str, Any] | None = None,
+     explicit_user_feedback: bool = False,
++    source_user_input: str = "",
+ ) -> tuple[dict[str, Any] | None, str]:
+     """结构化校验 RevisionSignal；不调用 LLM。
+ 
+@@ -206,6 +265,14 @@ def normalize_revision_signal(
+             if not equivalent:
+                 return None, f"observed_data 与 Reflection Context.{target_field} 不一致"
+ 
++        basis, basis_reason = context_evidence_basis(
++            target_field,
++            observed_data,
++            source_user_input=source_user_input,
++        )
++        if basis == "incidental_execution_context":
++            return None, f"CONTEXT provenance rejected: {basis_reason}"
++
+         hypothesis_value = _context_value(hypothesis_payload, target_field)
+         if hypothesis_value is not None and not _is_empty(before_data):
+             equivalent_before = before_data == hypothesis_value or (
+diff --git a/app/learning/__init__.py b/app/learning/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/learning/invalidation.py b/app/learning/invalidation.py
+new file mode 100644
+index 0000000..d31953a
+--- /dev/null
++++ b/app/learning/invalidation.py
+@@ -0,0 +1,208 @@
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.hypothesis.service import HypothesisService
++from app.models import (
++    CandidateRevision,
++    Experience,
++    HypothesisEvidence,
++    InteractionRecord,
++    LearningInvalidationEvent,
++    PersonalMemory,
++    ReflectionRecord,
++    RevisionProposal,
++    RevisionSignal,
++)
++
++
++class LearningInvalidationService:
++    """Invalidate learning derived from a misclassified interaction without deleting audit history.
++
++    The source InteractionRecord remains append-only. Derived learning artifacts are marked inactive/
++    invalid, current Hypothesis statistics are recalculated, and any not-yet-applied Proposal/Candidate
++    that depends on invalidated signals is retired. Already-applied revisions are never auto-rolled back;
++    they are reported for explicit human review.
++    """
++
++    def __init__(self, db: Session) -> None:
++        self.db = db
++
++    def list_events(self, *, limit: int = 50) -> list[LearningInvalidationEvent]:
++        stmt = (
++            select(LearningInvalidationEvent)
++            .order_by(LearningInvalidationEvent.created_at.desc(), LearningInvalidationEvent.id.desc())
++            .limit(max(1, int(limit)))
++        )
++        return list(self.db.scalars(stmt).all())
++
++    def invalidate_interaction(
++        self,
++        interaction_id: int,
++        *,
++        reason: str = "operator_marked_non_learning",
++    ) -> LearningInvalidationEvent:
++        interaction = self.db.get(InteractionRecord, int(interaction_id))
++        if interaction is None:
++            raise ValueError(f"Interaction #{interaction_id} 不存在")
++
++        # Idempotent operator UX: do not create repeated invalidation events for
++        # an interaction that has already been explicitly invalidated.
++        existing = self.db.scalar(
++            select(LearningInvalidationEvent)
++            .where(LearningInvalidationEvent.interaction_id == int(interaction_id))
++            .order_by(LearningInvalidationEvent.id.desc())
++        )
++        metadata = dict(interaction.record_metadata or {})
++        if metadata.get("learning_invalidated") and existing is not None:
++            return existing
++
++        experiences = list(
++            self.db.scalars(
++                select(Experience).where(Experience.interaction_id == int(interaction_id))
++            ).all()
++        )
++        experience_ids = [int(item.id) for item in experiences]
++
++        reflections: list[ReflectionRecord] = []
++        if experience_ids:
++            reflections = list(
++                self.db.scalars(
++                    select(ReflectionRecord).where(
++                        ReflectionRecord.experience_id.in_(experience_ids)
++                    )
++                ).all()
++            )
++        reflection_ids = [int(item.id) for item in reflections]
++
++        signals = list(
++            self.db.scalars(
++                select(RevisionSignal).where(
++                    (RevisionSignal.interaction_id == int(interaction_id))
++                    | (
++                        RevisionSignal.reflection_id.in_(reflection_ids)
++                        if reflection_ids
++                        else False
++                    )
++                )
++            ).all()
++        )
++        signal_ids = sorted({int(item.id) for item in signals})
++        hypothesis_ids = sorted({int(item.hypothesis_id) for item in signals})
++
++        # Include hypotheses that have evidence from an invalidated reflection,
++        # even when a legacy REFINE relation never produced a valid atomic signal.
++        if reflection_ids:
++            evidence_hids = self.db.scalars(
++                select(HypothesisEvidence.hypothesis_id).where(
++                    HypothesisEvidence.reflection_id.in_(reflection_ids)
++                )
++            ).all()
++            hypothesis_ids = sorted(
++                set(hypothesis_ids) | {int(item) for item in evidence_hids if item is not None}
++            )
++
++        invalidated_memory_ids: list[int] = []
++        for memory in self.db.scalars(
++            select(PersonalMemory).where(
++                PersonalMemory.source_interaction_id == int(interaction_id)
++            )
++        ).all():
++            if memory.status == "active":
++                memory.status = "invalid"
++            data = dict(memory.memory_data or {})
++            data["learning_invalidation"] = {"reason": reason}
++            memory.memory_data = data
++            invalidated_memory_ids.append(int(memory.id))
++
++        for experience in experiences:
++            data = dict(experience.experience_metadata or {})
++            data["learning_invalidated"] = True
++            data["learning_invalidation_reason"] = reason
++            experience.experience_metadata = data
++
++        for reflection in reflections:
++            reflection.status = "invalid"
++
++        for signal in signals:
++            signal.resolution_status = "invalid"
++            signal.resolution_note = f"learning_invalidated: {reason}"
++
++        invalidated_proposal_ids: list[int] = []
++        stale_candidate_ids: list[int] = []
++        applied_candidate_ids: list[int] = []
++        if signal_ids:
++            proposals = list(
++                self.db.scalars(select(RevisionProposal)).all()
++            )
++            affected_proposals = [
++                proposal
++                for proposal in proposals
++                if set(int(x) for x in (proposal.source_signal_ids or []) if str(x).isdigit())
++                & set(signal_ids)
++            ]
++            for proposal in affected_proposals:
++                if proposal.status not in {"applied", "rejected"}:
++                    proposal.status = "invalidated"
++                invalidated_proposal_ids.append(int(proposal.id))
++
++            if invalidated_proposal_ids:
++                candidates = list(
++                    self.db.scalars(
++                        select(CandidateRevision).where(
++                            CandidateRevision.source_proposal_id.in_(invalidated_proposal_ids)
++                        )
++                    ).all()
++                )
++                for candidate in candidates:
++                    data = dict(candidate.evaluation_data or {})
++                    data["source_invalidated"] = True
++                    data["source_invalidation_reason"] = reason
++                    if candidate.status == "applied":
++                        data["requires_manual_revision_review"] = True
++                        applied_candidate_ids.append(int(candidate.id))
++                    else:
++                        candidate.status = "stale"
++                        data["stale_reason"] = f"source_learning_invalidated_interaction_{interaction_id}"
++                        stale_candidate_ids.append(int(candidate.id))
++                    candidate.evaluation_data = data
++
++        # Flush invalid statuses before recalculating current-state statistics.
++        self.db.flush()
++        hypothesis_service = HypothesisService(self.db)
++        for hypothesis_id in hypothesis_ids:
++            try:
++                hypothesis_service.recalculate(hypothesis_id, commit=False)
++            except ValueError:
++                continue
++
++        event = LearningInvalidationEvent(
++            interaction_id=int(interaction_id),
++            reason=str(reason or "operator_marked_non_learning"),
++            event_data={
++                "experience_ids": experience_ids,
++                "reflection_ids": reflection_ids,
++                "revision_signal_ids": signal_ids,
++                "personal_memory_ids": sorted(invalidated_memory_ids),
++                "invalidated_proposal_ids": sorted(set(invalidated_proposal_ids)),
++                "stale_candidate_ids": sorted(set(stale_candidate_ids)),
++                "applied_candidate_ids_requiring_manual_review": sorted(set(applied_candidate_ids)),
++                "recalculated_hypothesis_ids": hypothesis_ids,
++            },
++            created_at=datetime.now(),
++        )
++        self.db.add(event)
++        self.db.flush()
++
++        metadata["learning_invalidated"] = True
++        metadata["learning_invalidation_reason"] = event.reason
++        metadata["learning_invalidation_event_id"] = int(event.id)
++        interaction.record_metadata = metadata
++
++        self.db.commit()
++        self.db.refresh(event)
++        return event
+diff --git a/app/migrations.py b/app/migrations.py
+index 904db37..0fd257b 100644
+--- a/app/migrations.py
++++ b/app/migrations.py
+@@ -39,6 +39,7 @@ V0_2_1_SQLITE_COLUMNS = {
+         "parent_revision": "INTEGER",
+     },
+     "revision_signals": {
++        "provenance_data": "JSON DEFAULT '{}'",
+         "resolution_status": "TEXT DEFAULT 'open'",
+         "resolved_by_candidate_id": "INTEGER",
+         "resolved_by_revision": "INTEGER",
+diff --git a/app/models.py b/app/models.py
+index c763a42..021629d 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -225,6 +225,7 @@ class RevisionSignal(Base):
+     )
+     canonical_change: Mapped[str] = mapped_column(Text)
+     confidence: Mapped[float] = mapped_column(Float, default=0.5)
++    provenance_data: Mapped[dict] = mapped_column(JSON, default=dict)
+ 
+     # Resolution is historical metadata. Whether a resolved signal still counts
+     # as resolved for the current head is determined from revision lineage.
+@@ -384,6 +385,23 @@ class RevisionApplicationEvent(Base):
+     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+ 
+ 
++class LearningInvalidationEvent(Base):
++    """Operator-confirmed invalidation of learning derived from one interaction.
++
++    The source InteractionRecord is never deleted. This event records which derived
++    artifacts were retired so contamination cleanup remains auditable.
++    """
++    __tablename__ = "learning_invalidation_events"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    interaction_id: Mapped[int] = mapped_column(
++        ForeignKey("interaction_records.id"), index=True
++    )
++    reason: Mapped[str] = mapped_column(Text, default="")
++    event_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
+ class StrategyRecord(Base):
+     __tablename__ = "strategy_records"
+ 
+diff --git a/app/runtime.py b/app/runtime.py
+index c8894f3..32ec78a 100644
+--- a/app/runtime.py
++++ b/app/runtime.py
+@@ -39,6 +39,7 @@ from app.hypothesis.revision_reconciliation import RevisionReconciliationService
+ from app.hypothesis.retriever import HybridHypothesisRetriever
+ from app.hypothesis.revision_signal import RevisionSignalService
+ from app.hypothesis.service import HypothesisService
++from app.learning.invalidation import LearningInvalidationService
+ from app.llm import DeepSeekClient
+ from app.memory.service import PersonalMemoryService
+ from app.models import StrategyHypothesis, StrategyRecord
+@@ -79,6 +80,7 @@ class EvoMeRuntime:
+         self.hypothesis_service = HypothesisService(db)
+         self.revision_signal_service = RevisionSignalService(db)
+         self.revision_reconciliation_service = RevisionReconciliationService(db)
++        self.learning_invalidation_service = LearningInvalidationService(db)
+         self.revision_aggregation_service = RevisionAggregationService(
+             db, min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS
+         )
+@@ -707,6 +709,28 @@ class EvoMeRuntime:
+         self.db.expire_all()
+         return self.revision_commit_service.list_events(limit=limit)
+ 
++    def invalidate_learning_from_interaction(
++        self,
++        interaction_id: int,
++        *,
++        reason: str = "operator_marked_non_learning",
++    ):
++        self.db.expire_all()
++        event = self.learning_invalidation_service.invalidate_interaction(
++            interaction_id, reason=reason
++        )
++        # Invalidation may alter current Hypothesis statistics/status. Refresh
++        # the semantic index so retrieval sees the recalculated projection.
++        for hypothesis_id in (event.event_data or {}).get("recalculated_hypothesis_ids", []):
++            hypothesis = self.hypothesis_service.get(int(hypothesis_id))
++            if hypothesis is not None:
++                self.hypothesis_retriever.index(hypothesis)
++        return event
++
++    def list_learning_invalidations(self, limit: int = 50):
++        self.db.expire_all()
++        return self.learning_invalidation_service.list_events(limit=limit)
++
+     def list_interactions(self, limit: int = 20):
+         self.db.expire_all()
+         return self.audit_service.list_recent(limit=limit)
+diff --git a/main.py b/main.py
+index 11a1285..c4db2a6 100644
+--- a/main.py
++++ b/main.py
+@@ -118,6 +118,7 @@ def show_revision_signals(runtime: EvoMeRuntime) -> None:
+             f"before: {signal.before_data}\n"
+             f"observed: {signal.observed_data}\n"
+             f"change: {signal.canonical_change}\n"
++            f"provenance: {signal.provenance_data or {}}\n"
+         )
+ 
+ 
+@@ -288,6 +289,20 @@ def show_interactions(runtime: EvoMeRuntime) -> None:
+         )
+ 
+ 
++def show_learning_invalidations(runtime: EvoMeRuntime) -> None:
++    print("\n===== Learning Invalidations =====")
++    items = runtime.list_learning_invalidations()
++    if not items:
++        print("暂无 Learning Invalidation Event")
++        return
++    for item in items:
++        print(
++            f"LI#{item.id} interaction=#{item.interaction_id}\n"
++            f"reason: {item.reason}\n"
++            f"data: {item.event_data or {}}\n"
++        )
++
++
+ def show_skills(runtime: EvoMeRuntime) -> None:
+     print("\n===== Skills =====")
+     for skill in runtime.skill_registry.list_skills():
+@@ -366,6 +381,7 @@ def main() -> None:
+         "/revision-analyses  /revision-proposals  /candidate-evaluate  /candidates  "
+         "/revision-apply-auto  /candidate-approve <id>  /candidate-reject <id>  "
+         "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
++        "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
+         "/status  /audit  /skills  /exit\n"
+     )
+ 
+@@ -474,6 +490,34 @@ def main() -> None:
+                 except Exception as exc:
+                     print(f"❌ Revision rollback failed: {exc}")
+                 continue
++            if user_input.startswith("/learning-invalidate "):
++                try:
++                    parts = user_input.split(maxsplit=2)
++                    if len(parts) < 2:
++                        raise ValueError("用法：/learning-invalidate <interaction_id> [reason]")
++                    interaction_id = int(parts[1])
++                    reason = parts[2].strip() if len(parts) >= 3 else "operator_marked_non_learning"
++                    event = runtime.invalidate_learning_from_interaction(
++                        interaction_id, reason=reason
++                    )
++                    review = (event.event_data or {}).get(
++                        "applied_candidate_ids_requiring_manual_review", []
++                    )
++                    print(
++                        f"已失效 Interaction #{interaction_id} 的派生学习：LI#{event.id} "
++                        f"signals={(event.event_data or {}).get('revision_signal_ids', [])} "
++                        f"stale_candidates={(event.event_data or {}).get('stale_candidate_ids', [])}"
++                    )
++                    if review:
++                        print(
++                            "⚠️ 已有正式 Revision 使用了受污染 Candidate，未自动回滚。"
++                            f"需要人工检查 Candidate：{review}"
++                        )
++                except Exception as exc:
++                    print(f"❌ Learning invalidation failed: {exc}")
++                continue
++            if user_input == "/learning-invalidations":
++                show_learning_invalidations(runtime); continue
+             if user_input == "/status":
+                 show_background_status(runtime); continue
+             if user_input == "/audit":
+diff --git a/tests/test_cli_commands.py b/tests/test_cli_commands.py
+index 91a92bd..35a8abf 100644
+--- a/tests/test_cli_commands.py
++++ b/tests/test_cli_commands.py
+@@ -13,3 +13,7 @@ def test_natural_language_is_not_rewritten():
+ 
+ def test_existing_slash_command_is_unchanged():
+     assert normalize_cli_input("/status") == "/status"
++
++
++def test_learning_invalidate_command_normalizes_without_slash():
++    assert normalize_cli_input("learning-invalidate 16 operational_input_misclassified") == "/learning-invalidate 16 operational_input_misclassified"
+diff --git a/tests/test_learning_eligibility_gate.py b/tests/test_learning_eligibility_gate.py
+index 30b9ca2..9f72d86 100644
+--- a/tests/test_learning_eligibility_gate.py
++++ b/tests/test_learning_eligibility_gate.py
+@@ -157,3 +157,16 @@ def test_real_debugging_question_is_not_mistaken_for_ordinary_qa():
+     assert result["category"] == "natural"
+     assert result["allow_evolution"] is True
+     assert llm.calls == 0
++
++
++def test_explicit_future_explanation_preference_routes_to_both_lanes():
++    llm = CountingLLM()
++    gate = LearningEligibilityGate(llm)
++
++    result = gate.classify("你以后给我设计架构时，先讲数据流，再讲模块接口，这样我更容易理解。")
++
++    assert result["category"] == "natural"
++    assert result["allow_personal_memory"] is True
++    assert result["allow_evolution"] is True
++    assert result["decision_source"] == "deterministic_hard_pass"
++    assert llm.calls == 0
+diff --git a/tests/test_learning_invalidation.py b/tests/test_learning_invalidation.py
+new file mode 100644
+index 0000000..c22ac74
+--- /dev/null
++++ b/tests/test_learning_invalidation.py
+@@ -0,0 +1,231 @@
++from app.audit.service import AuditService
++from app.evolution.service import EvolutionMemoryService
++from app.hypothesis.service import HypothesisService
++from app.learning.invalidation import LearningInvalidationService
++from app.memory.service import PersonalMemoryService
++from app.models import RevisionSignal
++
++
++def test_invalidate_interaction_retires_derived_learning_without_deleting_audit(db):
++    audit = AuditService(db)
++    interaction = audit.save_interaction(
++        session_id="pollution",
++        user_input="revision-signals",
++        assistant_response="mistaken natural-language answer",
++        strategy_name="default_conversation_strategy_v2",
++        record_metadata={
++            "learning_eligibility": {
++                "category": "natural",
++                "allow_personal_memory": True,
++                "allow_evolution": True,
++            }
++        },
++    )
++    memory = PersonalMemoryService(db).save(
++        memory_type="preference",
++        content="polluted preference",
++        source_interaction_id=interaction.id,
++    )
++    evolution = EvolutionMemoryService(db)
++    experience = evolution.save_experience(
++        interaction_id=interaction.id,
++        task_type="architecture_design",
++        strategy_name="default_conversation_strategy",
++        strategy_version=2,
++        skills_used=[],
++        result_summary="polluted experience",
++        success=True,
++        score=0.9,
++        context_data={"task_type": "architecture_design", "complexity": "high"},
++    )
++    reflection = evolution.save_reflection(
++        experience_id=experience.id,
++        reflection_type="success",
++        observation="polluted",
++        insight="polluted insight",
++        applicable_context={"task_type": "architecture_design", "complexity": "high"},
++        expected_effect="polluted",
++        canonical_signal="polluted signal",
++        strategy_signal="polluted change",
++        confidence=0.9,
++    )
++    hypothesis_service = HypothesisService(db)
++    hypothesis = hypothesis_service.create_from_reflection(
++        reflection=reflection,
++        canonical_signal=reflection.canonical_signal,
++    )
++    evidence = hypothesis_service.add_evidence(
++        hypothesis=hypothesis,
++        reflection=reflection,
++        relation_type="REFINES",
++        relation_confidence=0.9,
++        relation_reason="polluted refine",
++    )
++    signal = RevisionSignal(
++        hypothesis_id=hypothesis.id,
++        base_revision=hypothesis.current_revision,
++        reflection_id=reflection.id,
++        evidence_id=evidence.id,
++        interaction_id=interaction.id,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        before_data="old",
++        observed_data="polluted structure",
++        canonical_change="polluted expansion",
++        confidence=0.9,
++    )
++    db.add(signal)
++    db.commit()
++
++    event = LearningInvalidationService(db).invalidate_interaction(
++        interaction.id,
++        reason="operational_input_misclassified",
++    )
++
++    db.refresh(interaction)
++    db.refresh(memory)
++    db.refresh(reflection)
++    db.refresh(signal)
++    updated = hypothesis_service.get(hypothesis.id)
++
++    assert interaction.record_metadata["learning_invalidated"] is True
++    assert memory.status == "invalid"
++    assert reflection.status == "invalid"
++    assert signal.resolution_status == "invalid"
++    assert signal.id in event.event_data["revision_signal_ids"]
++    assert audit.get(interaction.id) is not None
++    # Inactive reflection evidence remains in the audit graph but no longer
++    # contributes to current hypothesis statistics.
++    assert updated.supporting_count == 0
++    assert updated.refinement_count == 0
++
++
++def test_learning_invalidation_is_idempotent(db):
++    interaction = AuditService(db).save_interaction(
++        session_id="idempotent",
++        user_input="hypothesis",
++        assistant_response="mistaken answer",
++        strategy_name="default_conversation_strategy_v2",
++    )
++    service = LearningInvalidationService(db)
++    first = service.invalidate_interaction(interaction.id, reason="operator mistake")
++    second = service.invalidate_interaction(interaction.id, reason="operator mistake again")
++    assert first.id == second.id
++
++
++def test_invalidation_stales_unapplied_candidate_based_on_polluted_signal(db):
++    from app.models import CandidateRevision, RevisionAnalysisRecord, RevisionProposal
++
++    interaction = AuditService(db).save_interaction(
++        session_id="candidate-pollution",
++        user_input="revision-signals",
++        assistant_response="mistaken answer",
++        strategy_name="default_conversation_strategy_v2",
++    )
++    evolution = EvolutionMemoryService(db)
++    experience = evolution.save_experience(
++        interaction_id=interaction.id,
++        task_type="architecture_design",
++        strategy_name="default_conversation_strategy",
++        strategy_version=2,
++        skills_used=[],
++        result_summary="polluted",
++        success=True,
++        score=0.9,
++        context_data={"task_type": "architecture_design"},
++    )
++    reflection = evolution.save_reflection(
++        experience_id=experience.id,
++        reflection_type="success",
++        observation="polluted",
++        insight="polluted",
++        applicable_context={"task_type": "architecture_design"},
++        expected_effect="polluted",
++        canonical_signal="polluted-canonical",
++        strategy_signal="polluted-action",
++        confidence=0.9,
++    )
++    hs = HypothesisService(db)
++    hypothesis = hs.create_from_reflection(reflection=reflection, canonical_signal=reflection.canonical_signal)
++    evidence = hs.add_evidence(
++        hypothesis=hypothesis,
++        reflection=reflection,
++        relation_type="REFINES",
++        relation_confidence=0.9,
++        relation_reason="polluted",
++    )
++    signal = RevisionSignal(
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        reflection_id=reflection.id,
++        evidence_id=evidence.id,
++        interaction_id=interaction.id,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        before_data="old",
++        observed_data="bad",
++        canonical_change="bad expansion",
++        confidence=0.9,
++    )
++    db.add(signal)
++    db.flush()
++    analysis = RevisionAnalysisRecord(
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        signal_ids=[signal.id],
++        candidate_fingerprint="polluted-fingerprint",
++        consistent=True,
++        direction_confidence=0.9,
++        reason="polluted",
++    )
++    db.add(analysis)
++    db.flush()
++    proposal = RevisionProposal(
++        analysis_id=analysis.id,
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        before_data="old",
++        proposed_after_data="bad",
++        reason="polluted",
++        source_signal_ids=[signal.id],
++        independent_signal_count=1,
++        direction_confidence=0.9,
++        status="proposed",
++    )
++    db.add(proposal)
++    db.flush()
++    candidate = CandidateRevision(
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        source_proposal_id=proposal.id,
++        title="polluted",
++        insight="polluted",
++        when_data={},
++        do_data={"text": "bad"},
++        expect_data={},
++        canonical_signal="bad",
++        status="ready_to_apply",
++        evaluation_version=3,
++        evaluation_data={"evaluation_valid": True},
++    )
++    db.add(candidate)
++    db.commit()
++
++    event = LearningInvalidationService(db).invalidate_interaction(
++        interaction.id, reason="operational_input_misclassified"
++    )
++    db.refresh(proposal)
++    db.refresh(candidate)
++
++    assert proposal.status == "invalidated"
++    assert candidate.status == "stale"
++    assert candidate.evaluation_data["source_invalidated"] is True
++    assert candidate.id in event.event_data["stale_candidate_ids"]
+diff --git a/tests/test_revision_signal.py b/tests/test_revision_signal.py
+index 9e91de9..31b5928 100644
+--- a/tests/test_revision_signal.py
++++ b/tests/test_revision_signal.py
+@@ -329,3 +329,162 @@ def test_phase21_existing_invalid_signal_is_hidden_not_deleted(db):
+     assert service.list_all() == []
+     assert service.count_invalid() == 1
+     assert len(service.list_all(valid_only=False)) == 1
++
++
++def test_context_expansion_rejects_incidental_complexity_from_real_interaction(db):
++    from app.audit.service import AuditService
++    from app.evolution.service import EvolutionMemoryService
++
++    audit = AuditService(db)
++    interaction = audit.save_interaction(
++        session_id="ctx-leak",
++        user_input="你以后给我设计架构时，先讲数据流，再讲模块接口，这样我更容易理解。",
++        assistant_response="好的",
++        strategy_name="default_conversation_strategy_v2",
++        record_metadata={"learning_eligibility": {"category": "natural"}},
++    )
++    evolution = EvolutionMemoryService(db)
++    experience = evolution.save_experience(
++        interaction_id=interaction.id,
++        task_type="architecture_design",
++        strategy_name="default_conversation_strategy",
++        strategy_version=2,
++        skills_used=[],
++        result_summary="preference-feedback",
++        success=True,
++        score=0.95,
++        context_data={
++            "task_type": "architecture_design",
++            "complexity": "low",
++            "interaction_mode": "direct",
++        },
++    )
++    reflection = evolution.save_reflection(
++        experience_id=experience.id,
++        reflection_type="success",
++        observation="用户明确给出输出顺序偏好",
++        insight="明确输出顺序偏好可改善理解",
++        applicable_context={
++            "task_type": "architecture_design",
++            "complexity": "low",
++            "interaction_mode": "direct",
++        },
++        expected_effect="提高理解度",
++        canonical_signal="preference-order",
++        strategy_signal="按数据流 -> 模块接口组织回答",
++        confidence=0.9,
++    )
++
++    service = HypothesisService(db)
++    base = _make_reflection(db, interaction_id=901, complexity="high", seed="base-high")
++    hypothesis = service.create_from_reflection(
++        reflection=base,
++        canonical_signal=base.canonical_signal,
++    )
++    judge = HypothesisRelationJudge(
++        RelationLLM(
++            {
++                "relation": "REFINES",
++                "confidence": 0.95,
++                "reason": "preference improves response structure",
++                "revision_signals": [
++                    {
++                        "dimension": "CONTEXT",
++                        "operation": "EXPAND",
++                        "target_field": "complexity",
++                        "before_data": ["high"],
++                        "observed_data": ["low"],
++                        "canonical_change": "complexity: high -> include observed low",
++                        "confidence": 0.88,
++                    },
++                    {
++                        "dimension": "CONTEXT",
++                        "operation": "EXPAND",
++                        "target_field": "interaction_mode",
++                        "before_data": ["collaborative"],
++                        "observed_data": ["direct"],
++                        "canonical_change": "interaction mode: collaborative -> include direct",
++                        "confidence": 0.86,
++                    },
++                    {
++                        "dimension": "ACTION",
++                        "operation": "EXPAND",
++                        "target_field": "response_structure",
++                        "before_data": "existing structure",
++                        "observed_data": "数据流 -> 模块接口 -> 内部实现",
++                        "canonical_change": "add explicit user-preferred response order",
++                        "confidence": 0.9,
++                    },
++                ],
++            }
++        )
++    )
++    aggregator = HypothesisAggregator(
++        db,
++        relation_judge=judge,
++        retriever=StaticRetriever(hypothesis.id),
++        score_threshold=0.0,
++    )
++
++    result = aggregator.process(reflection)
++    signals = RevisionSignalService(db).list_all(hypothesis_id=hypothesis.id)
++
++    assert result["revision_signal_count"] == 1
++    assert [(s.dimension, s.target_field) for s in signals] == [
++        ("ACTION", "response_structure")
++    ]
++    assert signals[0].provenance_data["source_interaction_id"] == interaction.id
++
++
++def test_context_expansion_allows_explicit_user_scope(db):
++    from app.audit.service import AuditService
++    from app.evolution.service import EvolutionMemoryService
++
++    interaction = AuditService(db).save_interaction(
++        session_id="ctx-explicit",
++        user_input="无论简单任务还是高复杂度架构设计，都按这个顺序讲。",
++        assistant_response="好的",
++        strategy_name="default_conversation_strategy_v2",
++    )
++    evolution = EvolutionMemoryService(db)
++    experience = evolution.save_experience(
++        interaction_id=interaction.id,
++        task_type="architecture_design",
++        strategy_name="default_conversation_strategy",
++        strategy_version=2,
++        skills_used=[],
++        result_summary="explicit complexity scope",
++        success=True,
++        score=0.9,
++        context_data={"task_type": "architecture_design", "complexity": "low"},
++    )
++    reflection = evolution.save_reflection(
++        experience_id=experience.id,
++        reflection_type="success",
++        observation="用户显式扩大适用复杂度",
++        insight="该顺序适用于简单任务",
++        applicable_context={"task_type": "architecture_design", "complexity": "low"},
++        expected_effect="一致讲解顺序",
++        canonical_signal="explicit-low",
++        strategy_signal="简单和复杂任务都使用该结构",
++        confidence=0.9,
++    )
++    service = HypothesisService(db)
++    base = _make_reflection(db, interaction_id=902, complexity="high", seed="base-high-explicit")
++    hypothesis = service.create_from_reflection(reflection=base, canonical_signal=base.canonical_signal)
++    judge = HypothesisRelationJudge(RelationLLM({
++        "relation": "REFINES", "confidence": 0.93, "reason": "explicit scope",
++        "revision_signals": [{
++            "dimension": "CONTEXT", "operation": "EXPAND", "target_field": "complexity",
++            "before_data": ["high"], "observed_data": ["low"],
++            "canonical_change": "complexity: high -> include observed low", "confidence": 0.9,
++        }],
++    }))
++    result = HypothesisAggregator(
++        db, relation_judge=judge, retriever=StaticRetriever(hypothesis.id), score_threshold=0.0
++    ).process(reflection)
++
++    signals = RevisionSignalService(db).list_all(hypothesis_id=hypothesis.id)
++    assert result["revision_signal_count"] == 1
++    assert signals[0].target_field == "complexity"
++    assert signals[0].provenance_data["context_evidence_basis"] == "explicit_user_scope"

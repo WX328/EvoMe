@@ -131,7 +131,7 @@ class HypothesisAggregator:
         for match in matches:
             hypothesis = self.service.get(match.hypothesis_id)
             if hypothesis is None or hypothesis.status not in {
-                "observing", "ready_for_review", "needs_revision"
+                "observing", "ready_for_review", "needs_revision", "needs_revalidation"
             }:
                 continue
             decision = self.relation_judge.judge(
@@ -169,6 +169,10 @@ class HypothesisAggregator:
                 evidence=evidence,
                 raw_signals=raw_revision_signals,
             )
+            # add_evidence() recalculates before REFINE signals exist. Phase 5.4
+            # status semantics are signal-pressure based, so recalculate once more
+            # after the atomic signals have been persisted.
+            self.service.recalculate(hypothesis.id)
             updated = self.service.get(hypothesis.id)
             if updated is not None:
                 self.retriever.index(updated)

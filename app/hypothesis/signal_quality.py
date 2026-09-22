@@ -84,6 +84,64 @@ GENERIC_TARGET_FIELDS = {
     "outcome",
 }
 
+# These applicability fields are especially easy to leak from one execution
+# snapshot into a global Hypothesis boundary. For a single-turn RevisionSignal
+# they require explicit user/task wording; merely observing that the successful
+# turn happened to be low-complexity/direct/low-risk is not enough.
+INCIDENTAL_CONTEXT_FIELDS = {"complexity", "risk_level", "interaction_mode"}
+
+_CONTEXT_VALUE_MARKERS = {
+    "complexity": {
+        "low": ("低复杂度", "简单任务", "简单问题", "简单架构", "轻量"),
+        "medium": ("中等复杂度", "中复杂度", "中等难度"),
+        "high": ("高复杂度", "复杂任务", "复杂架构", "复杂问题"),
+    },
+    "risk_level": {
+        "low": ("低风险",),
+        "medium": ("中风险", "中等风险"),
+        "high": ("高风险", "高危"),
+    },
+    "interaction_mode": {
+        "direct": ("直接回答", "直接给", "直接讲", "直接模式"),
+        "collaborative": ("协作", "和我一起", "一起讨论", "共同"),
+        "teaching": ("教学", "教我", "一步一步讲", "讲解模式"),
+        "exploratory": ("探索", "探索式", "一起想", "发散"),
+    },
+}
+
+
+def _observed_scalar_values(value: Any) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    return [str(item).strip().lower() for item in values if not _is_empty(item)]
+
+
+def context_evidence_basis(
+    field: str,
+    observed_data: Any,
+    *,
+    source_user_input: str = "",
+) -> tuple[str, str]:
+    """Classify whether a CONTEXT signal is explicitly supported or incidental."""
+    if field not in INCIDENTAL_CONTEXT_FIELDS:
+        return "derived_context", "field is not in the high-leakage incidental set"
+
+    text = str(source_user_input or "").lower()
+    if not text:
+        # Legacy/unit-test path: absence of the source interaction should not
+        # retroactively invalidate historical data solely because old rows do
+        # not carry enough provenance. Real runtime interactions always exist.
+        return "legacy_unknown", "source user input unavailable"
+
+    markers_by_value = _CONTEXT_VALUE_MARKERS.get(field, {})
+    for value in _observed_scalar_values(observed_data):
+        markers = markers_by_value.get(value, ())
+        if any(marker.lower() in text for marker in markers):
+            return "explicit_user_scope", f"user input explicitly supports {field}={value}"
+
+    return "incidental_execution_context", (
+        f"{field} was observed in this turn but the user did not explicitly scope the strategy to it"
+    )
+
 
 def _clamp_confidence(value: Any, default: float = 0.5) -> float:
     try:
@@ -150,6 +208,7 @@ def normalize_revision_signal(
     reflection_payload: dict[str, Any] | None = None,
     hypothesis_payload: dict[str, Any] | None = None,
     explicit_user_feedback: bool = False,
+    source_user_input: str = "",
 ) -> tuple[dict[str, Any] | None, str]:
     """结构化校验 RevisionSignal；不调用 LLM。
 
@@ -205,6 +264,14 @@ def normalize_revision_signal(
             )
             if not equivalent:
                 return None, f"observed_data 与 Reflection Context.{target_field} 不一致"
+
+        basis, basis_reason = context_evidence_basis(
+            target_field,
+            observed_data,
+            source_user_input=source_user_input,
+        )
+        if basis == "incidental_execution_context":
+            return None, f"CONTEXT provenance rejected: {basis_reason}"
 
         hypothesis_value = _context_value(hypothesis_payload, target_field)
         if hypothesis_value is not None and not _is_empty(before_data):

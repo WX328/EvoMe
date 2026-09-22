@@ -1,0 +1,1863 @@
+diff --git a/app/cli_commands.py b/app/cli_commands.py
+index ea456aa..ee478f6 100644
+--- a/app/cli_commands.py
++++ b/app/cli_commands.py
+@@ -4,7 +4,13 @@ from __future__ import annotations
+ # Central command vocabulary used by both the CLI and Learning Eligibility Gate.
+ # Keeping this in one place prevents an operational command typo from becoming a
+ # learning sample simply because the slash was omitted.
+-PARAM_COMMAND_NAMES = frozenset({"candidate-approve", "candidate-reject", "revision-rollback", "learning-invalidate"})
++PARAM_COMMAND_NAMES = frozenset({
++    "candidate-approve",
++    "candidate-reject",
++    "candidate-rebase",
++    "revision-rollback",
++    "learning-invalidate",
++})
+ 
+ COMMAND_NAMES = frozenset(
+     {
+@@ -16,12 +22,16 @@ COMMAND_NAMES = frozenset(
+         "revision-signals",
+         "revision-pressure",
+         "revision-groups",
++        "ancestor-revalidate",
++        "signal-revalidations",
+         "evidence-summary",
+         "revision-analyze",
+         "revision-analyses",
+         "revision-proposals",
+         "candidate-evaluate",
+         "candidates",
++        "candidate-rebase",
++        "candidate-rebases",
+         "revision-apply-auto",
+         "candidate-approve",
+         "candidate-reject",
+diff --git a/app/config.py b/app/config.py
+index c021d61..d9c8d91 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -22,3 +22,6 @@ REVISION_AUTO_APPLY_MIN_UTILITY = float(os.getenv("REVISION_AUTO_APPLY_MIN_UTILI
+ REVISION_AUTO_APPLY_BUDGET_HOURS = int(os.getenv("REVISION_AUTO_APPLY_BUDGET_HOURS", "24"))
+ REVISION_AUTO_APPLY_PER_HYPOTHESIS = int(os.getenv("REVISION_AUTO_APPLY_PER_HYPOTHESIS", "1"))
+ REVISION_AUTO_APPLY_MAX_PER_RUN = int(os.getenv("REVISION_AUTO_APPLY_MAX_PER_RUN", "2"))
++
++REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH = int(os.getenv("REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH", "16"))
++REVISION_REVALIDATION_MAX_HYPOTHESES_PER_RUN = int(os.getenv("REVISION_REVALIDATION_MAX_HYPOTHESES_PER_RUN", "2"))
+diff --git a/app/hypothesis/ancestor_revalidation.py b/app/hypothesis/ancestor_revalidation.py
+new file mode 100644
+index 0000000..f40efc1
+--- /dev/null
++++ b/app/hypothesis/ancestor_revalidation.py
+@@ -0,0 +1,517 @@
++from __future__ import annotations
++
++import copy
++import json
++import re
++from dataclasses import dataclass
++from datetime import datetime
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.context.schema import sanitize_applicable_context
++from app.hypothesis.revision_reconciliation import RevisionReconciliationService
++from app.hypothesis.revision_signal import RevisionSignalService
++from app.hypothesis.service import HypothesisService
++from app.models import (
++    Experience,
++    HypothesisEvidence,
++    HypothesisRevision,
++    InteractionRecord,
++    ReflectionRecord,
++    RevisionSignal,
++    RevisionSignalRevalidation,
++    StrategyHypothesis,
++)
++
++
++CURRENT_REVALIDATION_VERSION = 1
++
++OUTCOMES = {
++    "STILL_APPLIES",
++    "RESOLVED_BY_CURRENT",
++    "NO_LONGER_APPLIES",
++    "UNCERTAIN",
++}
++
++
++@dataclass(frozen=True)
++class AncestorRevalidationBatchResult:
++    hypothesis_id: int
++    target_revision: int
++    record_ids: list[int]
++    rebased_signal_ids: list[int]
++    resolved_signal_ids: list[int]
++    superseded_signal_ids: list[int]
++    uncertain_signal_ids: list[int]
++    llm_called: bool
++
++
++class AncestorSignalRevalidationService:
++    """Re-check ancestor-open signals against the current Hypothesis revision.
++
++    The service never reads raw conversation history. It sends only the current
++    immutable revision plus compact signal/reflection/provenance summaries to one
++    batch LLM call. A STILL_APPLIES result carries the signal forward to the
++    current revision; RESOLVED/NO_LONGER_APPLIES retire the ancestor pressure for
++    the current branch; UNCERTAIN leaves it open for later review.
++    """
++
++    def __init__(
++        self,
++        db: Session,
++        llm,
++        *,
++        max_signals_per_batch: int = 16,
++    ) -> None:
++        self.db = db
++        self.llm = llm
++        self.max_signals_per_batch = max(1, int(max_signals_per_batch))
++        self.signal_service = RevisionSignalService(db)
++        self.reconciliation = RevisionReconciliationService(db)
++
++    @staticmethod
++    def _compact_text(value: Any, limit: int = 360) -> str:
++        text = str(value or "").strip()
++        return text if len(text) <= limit else text[: limit - 1] + "…"
++
++    @staticmethod
++    def _parse_numeric_id(value: Any) -> int | None:
++        if isinstance(value, bool) or value is None:
++            return None
++        if isinstance(value, int):
++            return value
++        if isinstance(value, float) and value.is_integer():
++            return int(value)
++        text = str(value).strip()
++        if text.isdigit():
++            return int(text)
++        matches = re.findall(r"\d+", text)
++        return int(matches[0]) if len(matches) == 1 else None
++
++    @staticmethod
++    def _normalize_outcome(value: Any) -> str | None:
++        text = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
++        aliases = {
++            "STILL_APPLIES": "STILL_APPLIES",
++            "APPLIES": "STILL_APPLIES",
++            "STILL_VALID": "STILL_APPLIES",
++            "REBASE": "STILL_APPLIES",
++            "仍适用": "STILL_APPLIES",
++            "仍然适用": "STILL_APPLIES",
++            "RESOLVED_BY_CURRENT": "RESOLVED_BY_CURRENT",
++            "RESOLVED": "RESOLVED_BY_CURRENT",
++            "ALREADY_RESOLVED": "RESOLVED_BY_CURRENT",
++            "SATISFIED": "RESOLVED_BY_CURRENT",
++            "已解决": "RESOLVED_BY_CURRENT",
++            "NO_LONGER_APPLIES": "NO_LONGER_APPLIES",
++            "OBSOLETE": "NO_LONGER_APPLIES",
++            "SUPERSEDED": "NO_LONGER_APPLIES",
++            "NOT_APPLICABLE": "NO_LONGER_APPLIES",
++            "不再适用": "NO_LONGER_APPLIES",
++            "UNCERTAIN": "UNCERTAIN",
++            "UNKNOWN": "UNCERTAIN",
++            "REVIEW": "UNCERTAIN",
++            "不确定": "UNCERTAIN",
++        }
++        outcome = aliases.get(text)
++        return outcome if outcome in OUTCOMES else None
++
++    def _existing_record(
++        self,
++        source_signal_id: int,
++        target_revision: int,
++    ) -> RevisionSignalRevalidation | None:
++        return self.db.scalar(
++            select(RevisionSignalRevalidation).where(
++                RevisionSignalRevalidation.source_signal_id == int(source_signal_id),
++                RevisionSignalRevalidation.target_revision == int(target_revision),
++                RevisionSignalRevalidation.evaluation_version == CURRENT_REVALIDATION_VERSION,
++            )
++        )
++
++    def _ancestor_signals(
++        self,
++        hypothesis: StrategyHypothesis,
++        *,
++        max_signals: int,
++    ) -> list[RevisionSignal]:
++        current = int(hypothesis.current_revision or hypothesis.revision or 1)
++        pressure = self.reconciliation.pressure_summary(hypothesis.id, current)
++        ids = set(pressure.ancestor_open_ids)
++        if not ids:
++            return []
++        rows = [
++            item
++            for item in self.signal_service.list_all(hypothesis_id=hypothesis.id, valid_only=True)
++            if int(item.id) in ids
++            and self._existing_record(int(item.id), current) is None
++        ]
++        rows.sort(key=lambda item: (int(item.base_revision), int(item.id)))
++        return rows[: max(1, int(max_signals))]
++
++    def _compact_signal(self, signal: RevisionSignal) -> dict[str, Any]:
++        reflection = self.db.get(ReflectionRecord, int(signal.reflection_id))
++        experience = None
++        interaction = None
++        if reflection is not None and reflection.experience_id is not None:
++            experience = self.db.get(Experience, int(reflection.experience_id))
++        if experience is not None and experience.interaction_id is not None:
++            interaction = self.db.get(InteractionRecord, int(experience.interaction_id))
++
++        context = {}
++        if reflection is not None:
++            context = sanitize_applicable_context(reflection.applicable_context or {})
++        if not context and experience is not None:
++            context = sanitize_applicable_context(experience.context_data or {})
++
++        return {
++            "signal_id": int(signal.id),
++            "base_revision": int(signal.base_revision),
++            "dimension": str(signal.dimension).upper(),
++            "operation": str(signal.operation).upper(),
++            "target_field": str(signal.target_field),
++            "before": signal.before_data,
++            "observed": signal.observed_data,
++            "canonical_change": self._compact_text(signal.canonical_change),
++            "confidence": float(signal.confidence),
++            "context": context,
++            "reflection_signal": self._compact_text(
++                (reflection.canonical_signal if reflection is not None else "")
++                or (reflection.strategy_signal if reflection is not None else "")
++                or (reflection.insight if reflection is not None else "")
++            ),
++            "source_user_excerpt": self._compact_text(
++                (signal.provenance_data or {}).get("source_user_excerpt")
++                or (interaction.user_input if interaction is not None else ""),
++                240,
++            ),
++        }
++
++    def _call_llm(
++        self,
++        *,
++        revision: HypothesisRevision,
++        signals: list[RevisionSignal],
++    ) -> dict[str, Any]:
++        compact = [self._compact_signal(item) for item in signals]
++        messages = [
++            {
++                "role": "system",
++                "content": (
++                    "Revalidate ancestor RevisionSignals against the CURRENT immutable Hypothesis revision. "
++                    "Judge each signal independently and only from the supplied current revision and compact "
++                    "evidence. Outcomes: STILL_APPLIES when the refinement remains needed on the current head; "
++                    "RESOLVED_BY_CURRENT when the descendant revision already implements/satisfies it; "
++                    "NO_LONGER_APPLIES when the refinement became obsolete or incompatible with the current "
++                    "branch; UNCERTAIN when evidence is insufficient. Do not reinterpret unrelated signals, "
++                    "do not invent context, and do not treat a changed revision number alone as resolution. "
++                    "Return JSON only with key `assessments`. Every input signal_id must appear once. Example: "
++                    "{\"assessments\":[{\"signal_id\":7,\"outcome\":\"STILL_APPLIES\","
++                    "\"confidence\":0.9,\"reason\":\"...\"}]}"
++                ),
++            },
++            {
++                "role": "user",
++                "content": json.dumps(
++                    {
++                        "current_revision": {
++                            "hypothesis_id": int(revision.hypothesis_id),
++                            "revision": int(revision.revision_number),
++                            "when": revision.when_data or {},
++                            "do": revision.do_data or {},
++                            "expect": revision.expect_data or {},
++                        },
++                        "ancestor_signals": compact,
++                    },
++                    ensure_ascii=False,
++                    sort_keys=True,
++                ),
++            },
++        ]
++        raw = self.llm.json_chat(messages, temperature=0.1)
++        return raw if isinstance(raw, dict) else {}
++
++    @classmethod
++    def _normalize_assessments(
++        cls,
++        raw: dict[str, Any],
++        expected_ids: set[int],
++    ) -> list[dict[str, Any]]:
++        rows = raw.get("assessments")
++        if rows is None:
++            rows = raw.get("signal_assessments")
++        if rows is None:
++            rows = raw.get("revalidations")
++        if not isinstance(rows, list):
++            return []
++
++        result: list[dict[str, Any]] = []
++        seen: set[int] = set()
++        for item in rows:
++            if not isinstance(item, dict):
++                continue
++            signal_id = cls._parse_numeric_id(
++                item.get("signal_id", item.get("revision_signal_id", item.get("id")))
++            )
++            if signal_id is None or signal_id not in expected_ids or signal_id in seen:
++                continue
++            outcome = cls._normalize_outcome(
++                item.get("outcome", item.get("status", item.get("verdict")))
++            )
++            if outcome is None:
++                continue
++            try:
++                confidence = float(item.get("confidence", 0.0))
++            except (TypeError, ValueError):
++                confidence = 0.0
++            seen.add(signal_id)
++            result.append(
++                {
++                    "signal_id": signal_id,
++                    "outcome": outcome,
++                    "confidence": max(0.0, min(1.0, confidence)),
++                    "reason": str(item.get("reason", item.get("explanation", ""))).strip(),
++                }
++            )
++        return result
++
++    @staticmethod
++    def _target_before_data(revision: HypothesisRevision, signal: RevisionSignal) -> Any:
++        dimension = str(signal.dimension).upper()
++        field = str(signal.target_field)
++        if dimension == "CONTEXT":
++            return copy.deepcopy((revision.when_data or {}).get(field))
++        if dimension == "ACTION" and field in (revision.do_data or {}):
++            return copy.deepcopy((revision.do_data or {}).get(field))
++        if dimension == "OUTCOME" and field in (revision.expect_data or {}):
++            return copy.deepcopy((revision.expect_data or {}).get(field))
++        return copy.deepcopy(signal.before_data)
++
++    def _materialize_rebased_signal(
++        self,
++        *,
++        source: RevisionSignal,
++        target_revision: HypothesisRevision,
++        record: RevisionSignalRevalidation,
++    ) -> RevisionSignal:
++        existing = self.db.scalar(
++            select(RevisionSignal).where(
++                RevisionSignal.hypothesis_id == int(source.hypothesis_id),
++                RevisionSignal.base_revision == int(target_revision.revision_number),
++                RevisionSignal.reflection_id == int(source.reflection_id),
++                RevisionSignal.dimension == str(source.dimension),
++                RevisionSignal.operation == str(source.operation),
++                RevisionSignal.target_field == str(source.target_field),
++            )
++        )
++        if existing is not None:
++            return existing
++
++        evidence = self.db.scalar(
++            select(HypothesisEvidence).where(
++                HypothesisEvidence.hypothesis_id == int(source.hypothesis_id),
++                HypothesisEvidence.hypothesis_revision == int(target_revision.revision_number),
++                HypothesisEvidence.reflection_id == int(source.reflection_id),
++            )
++        )
++        provenance = dict(source.provenance_data or {})
++        provenance.update(
++            {
++                "rebased_from_signal_id": int(source.id),
++                "revalidated_from_revision": int(source.base_revision),
++                "revalidated_to_revision": int(target_revision.revision_number),
++                "revalidation_record_id": int(record.id),
++                "revalidation_confidence": float(record.confidence),
++                "revalidation_outcome": "STILL_APPLIES",
++            }
++        )
++        signal = RevisionSignal(
++            hypothesis_id=int(source.hypothesis_id),
++            base_revision=int(target_revision.revision_number),
++            reflection_id=int(source.reflection_id),
++            evidence_id=(int(evidence.id) if evidence is not None else None),
++            interaction_id=source.interaction_id,
++            dimension=str(source.dimension),
++            operation=str(source.operation),
++            target_field=str(source.target_field),
++            before_data=self._target_before_data(target_revision, source),
++            observed_data=copy.deepcopy(source.observed_data),
++            canonical_change=str(source.canonical_change),
++            confidence=min(float(source.confidence), max(0.5, float(record.confidence))),
++            provenance_data=provenance,
++            resolution_status="open",
++        )
++        self.db.add(signal)
++        self.db.flush()
++        return signal
++
++    def _apply_assessment(
++        self,
++        *,
++        source: RevisionSignal,
++        target_revision: HypothesisRevision,
++        assessment: dict[str, Any],
++        raw: dict[str, Any],
++    ) -> RevisionSignalRevalidation:
++        existing = self._existing_record(int(source.id), int(target_revision.revision_number))
++        if existing is not None:
++            return existing
++
++        outcome = str(assessment["outcome"])
++        record = RevisionSignalRevalidation(
++            hypothesis_id=int(source.hypothesis_id),
++            source_signal_id=int(source.id),
++            source_revision=int(source.base_revision),
++            target_revision=int(target_revision.revision_number),
++            evaluation_version=CURRENT_REVALIDATION_VERSION,
++            outcome=outcome,
++            confidence=float(assessment["confidence"]),
++            reason=str(assessment.get("reason", "")),
++            evaluation_data={"raw_batch_output": raw},
++        )
++        self.db.add(record)
++        self.db.flush()
++
++        now = datetime.now()
++        if outcome == "STILL_APPLIES":
++            rebased = self._materialize_rebased_signal(
++                source=source,
++                target_revision=target_revision,
++                record=record,
++            )
++            record.rebased_signal_id = int(rebased.id)
++            source.resolution_status = "superseded"
++            source.superseded_by_signal_id = int(rebased.id)
++            source.superseded_by_revision = int(target_revision.revision_number)
++            source.superseded_at = now
++            source.resolution_note = (
++                f"revalidated_still_applies_as_RS#{rebased.id}_on_r{target_revision.revision_number}"
++            )
++        elif outcome == "RESOLVED_BY_CURRENT":
++            source.resolution_status = "resolved"
++            source.resolved_by_candidate_id = None
++            source.resolved_by_revision = int(target_revision.revision_number)
++            source.resolved_at = now
++            source.resolution_note = (
++                f"ancestor_revalidation_resolved_by_r{target_revision.revision_number}"
++            )
++        elif outcome == "NO_LONGER_APPLIES":
++            source.resolution_status = "superseded"
++            source.superseded_by_signal_id = None
++            source.superseded_by_revision = int(target_revision.revision_number)
++            source.superseded_at = now
++            source.resolution_note = (
++                f"ancestor_revalidation_obsolete_on_r{target_revision.revision_number}"
++            )
++        # UNCERTAIN deliberately leaves the source signal open.
++
++        self.db.flush()
++        return record
++
++    def revalidate_hypothesis(
++        self,
++        hypothesis_id: int,
++        *,
++        max_signals: int | None = None,
++    ) -> AncestorRevalidationBatchResult:
++        hypothesis = self.db.get(StrategyHypothesis, int(hypothesis_id))
++        if hypothesis is None:
++            raise ValueError(f"H#{hypothesis_id} 不存在")
++        current = int(hypothesis.current_revision or hypothesis.revision or 1)
++        revision = self.db.scalar(
++            select(HypothesisRevision).where(
++                HypothesisRevision.hypothesis_id == int(hypothesis_id),
++                HypothesisRevision.revision_number == current,
++            )
++        )
++        if revision is None:
++            raise ValueError(f"H#{hypothesis_id}:r{current} 不存在")
++
++        signals = self._ancestor_signals(
++            hypothesis,
++            max_signals=(max_signals or self.max_signals_per_batch),
++        )
++        if not signals:
++            return AncestorRevalidationBatchResult(
++                hypothesis_id=int(hypothesis_id),
++                target_revision=current,
++                record_ids=[],
++                rebased_signal_ids=[],
++                resolved_signal_ids=[],
++                superseded_signal_ids=[],
++                uncertain_signal_ids=[],
++                llm_called=False,
++            )
++
++        raw = self._call_llm(revision=revision, signals=signals)
++        expected_ids = {int(item.id) for item in signals}
++        assessments = self._normalize_assessments(raw, expected_ids)
++        by_id = {int(item.id): item for item in signals}
++
++        record_ids: list[int] = []
++        rebased_signal_ids: list[int] = []
++        resolved_signal_ids: list[int] = []
++        superseded_signal_ids: list[int] = []
++        uncertain_signal_ids: list[int] = []
++
++        for assessment in assessments:
++            source = by_id[int(assessment["signal_id"])]
++            record = self._apply_assessment(
++                source=source,
++                target_revision=revision,
++                assessment=assessment,
++                raw=raw,
++            )
++            record_ids.append(int(record.id))
++            if record.outcome == "STILL_APPLIES" and record.rebased_signal_id is not None:
++                rebased_signal_ids.append(int(record.rebased_signal_id))
++            elif record.outcome == "RESOLVED_BY_CURRENT":
++                resolved_signal_ids.append(int(source.id))
++            elif record.outcome == "NO_LONGER_APPLIES":
++                superseded_signal_ids.append(int(source.id))
++            elif record.outcome == "UNCERTAIN":
++                uncertain_signal_ids.append(int(source.id))
++
++        # Recalculate the hypothesis only after branch-local signal state has
++        # been projected. This updates needs_revalidation/needs_revision without
++        # rewriting historical evidence.
++        HypothesisService(self.db).recalculate(int(hypothesis_id), commit=False)
++        self.db.commit()
++        return AncestorRevalidationBatchResult(
++            hypothesis_id=int(hypothesis_id),
++            target_revision=current,
++            record_ids=record_ids,
++            rebased_signal_ids=rebased_signal_ids,
++            resolved_signal_ids=resolved_signal_ids,
++            superseded_signal_ids=superseded_signal_ids,
++            uncertain_signal_ids=uncertain_signal_ids,
++            llm_called=True,
++        )
++
++    def revalidate_pending(self, *, max_hypotheses: int = 2) -> list[AncestorRevalidationBatchResult]:
++        results: list[AncestorRevalidationBatchResult] = []
++        hypotheses = list(
++            self.db.scalars(
++                select(StrategyHypothesis).order_by(StrategyHypothesis.id.asc())
++            ).all()
++        )
++        for hypothesis in hypotheses:
++            if len(results) >= max(0, int(max_hypotheses)):
++                break
++            pressure = self.reconciliation.pressure_summary(int(hypothesis.id))
++            if pressure.ancestor_open <= 0:
++                continue
++            result = self.revalidate_hypothesis(int(hypothesis.id))
++            if result.llm_called or result.record_ids:
++                results.append(result)
++        return results
++
++    def list_records(self, *, limit: int = 100) -> list[RevisionSignalRevalidation]:
++        stmt = (
++            select(RevisionSignalRevalidation)
++            .order_by(RevisionSignalRevalidation.created_at.desc(), RevisionSignalRevalidation.id.desc())
++            .limit(max(1, int(limit)))
++        )
++        return list(self.db.scalars(stmt).all())
+diff --git a/app/hypothesis/candidate_rebase.py b/app/hypothesis/candidate_rebase.py
+new file mode 100644
+index 0000000..acada08
+--- /dev/null
++++ b/app/hypothesis/candidate_rebase.py
+@@ -0,0 +1,440 @@
++from __future__ import annotations
++
++import copy
++import hashlib
++import json
++from dataclasses import dataclass
++from statistics import mean
++from typing import Any
++
++from sqlalchemy import select
++from sqlalchemy.orm import Session
++
++from app.hypothesis.ancestor_revalidation import CURRENT_REVALIDATION_VERSION
++from app.hypothesis.candidate_revision import CandidateRevisionService
++from app.hypothesis.revision_reconciliation import RevisionReconciliationService
++from app.hypothesis.revision_signal import RevisionSignalService
++from app.models import (
++    CandidateRebaseRecord,
++    CandidateRevision,
++    HypothesisRevision,
++    RevisionAnalysisRecord,
++    RevisionProposal,
++    RevisionSignal,
++    RevisionSignalRevalidation,
++    StrategyHypothesis,
++)
++
++
++@dataclass(frozen=True)
++class CandidateRebaseResult:
++    record: CandidateRebaseRecord
++    candidate: CandidateRevision | None
++    llm_called: bool
++
++
++class CandidateRebaseService:
++    """Three-way rebase for a stale CandidateRevision.
++
++    The old semantic direction is reused only when:
++    1) every source signal was revalidated as STILL_APPLIES on the current head;
++    2) the proposal's target field is unchanged between the stale base and head.
++
++    A clean rebase creates a fresh analysis/proposal on the current head and then
++    reruns CandidateRevision validation. Same-field changes are treated as a
++    deterministic conflict and are left for normal current-head analysis.
++    """
++
++    def __init__(
++        self,
++        db: Session,
++        llm,
++        *,
++        max_evidence: int = 8,
++    ) -> None:
++        self.db = db
++        self.llm = llm
++        self.max_evidence = max(1, int(max_evidence))
++        self.reconciliation = RevisionReconciliationService(db)
++        self.signal_service = RevisionSignalService(db)
++
++    @staticmethod
++    def _fingerprint(payload: dict[str, Any]) -> str:
++        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
++
++    @staticmethod
++    def _field_value(revision: HypothesisRevision, proposal: RevisionProposal) -> tuple[bool, Any]:
++        dimension = str(proposal.dimension).upper()
++        field = str(proposal.target_field)
++        if dimension == "CONTEXT":
++            data = revision.when_data or {}
++        elif dimension == "ACTION":
++            data = revision.do_data or {}
++        elif dimension == "OUTCOME":
++            data = revision.expect_data or {}
++        else:
++            return False, None
++        return field in data, copy.deepcopy(data.get(field))
++
++    def _existing_record(
++        self,
++        source_candidate_id: int,
++        target_revision: int,
++    ) -> CandidateRebaseRecord | None:
++        return self.db.scalar(
++            select(CandidateRebaseRecord).where(
++                CandidateRebaseRecord.source_candidate_id == int(source_candidate_id),
++                CandidateRebaseRecord.target_revision == int(target_revision),
++            )
++        )
++
++    def _source_revalidations(
++        self,
++        proposal: RevisionProposal,
++        target_revision: int,
++    ) -> tuple[list[int], list[RevisionSignalRevalidation], list[int]]:
++        source_ids = [int(x) for x in (proposal.source_signal_ids or []) if x is not None]
++        if not source_ids:
++            return [], [], []
++        rows = list(
++            self.db.scalars(
++                select(RevisionSignalRevalidation).where(
++                    RevisionSignalRevalidation.source_signal_id.in_(source_ids),
++                    RevisionSignalRevalidation.target_revision == int(target_revision),
++                    RevisionSignalRevalidation.evaluation_version == CURRENT_REVALIDATION_VERSION,
++                )
++            ).all()
++        )
++        by_source = {int(item.source_signal_id): item for item in rows}
++        ordered = [by_source[item] for item in source_ids if item in by_source]
++        missing = [item for item in source_ids if item not in by_source]
++        return source_ids, ordered, missing
++
++    @staticmethod
++    def _target_signal_ids(records: list[RevisionSignalRevalidation]) -> list[int]:
++        result: list[int] = []
++        for item in records:
++            if str(item.outcome) != "STILL_APPLIES" or item.rebased_signal_id is None:
++                continue
++            result.append(int(item.rebased_signal_id))
++        return result
++
++    def _upsert_record(
++        self,
++        *,
++        candidate: CandidateRevision,
++        proposal: RevisionProposal,
++        target_revision: int,
++        status: str,
++        source_signal_ids: list[int],
++        target_signal_ids: list[int],
++        reason: str,
++        rebase_data: dict[str, Any] | None = None,
++    ) -> CandidateRebaseRecord:
++        record = self._existing_record(int(candidate.id), int(target_revision))
++        if record is None:
++            record = CandidateRebaseRecord(
++                hypothesis_id=int(candidate.hypothesis_id),
++                source_candidate_id=int(candidate.id),
++                source_proposal_id=int(proposal.id),
++                from_revision=int(candidate.base_revision),
++                target_revision=int(target_revision),
++            )
++            self.db.add(record)
++        record.status = str(status)
++        record.source_signal_ids = list(source_signal_ids)
++        record.target_signal_ids = list(target_signal_ids)
++        record.reason = str(reason)
++        record.rebase_data = dict(rebase_data or {})
++        self.db.flush()
++        return record
++
++    def rebase_candidate(self, candidate_id: int) -> CandidateRebaseResult:
++        candidate = self.db.get(CandidateRevision, int(candidate_id))
++        if candidate is None:
++            raise ValueError(f"CR#{candidate_id} 不存在")
++        if str(candidate.status) != "stale":
++            raise ValueError(f"CR#{candidate_id} 当前状态为 {candidate.status}，只有 stale Candidate 可 rebase")
++
++        hypothesis = self.db.get(StrategyHypothesis, int(candidate.hypothesis_id))
++        if hypothesis is None:
++            raise ValueError(f"H#{candidate.hypothesis_id} 不存在")
++        target_revision_number = int(hypothesis.current_revision or hypothesis.revision or 1)
++        if target_revision_number == int(candidate.base_revision):
++            raise ValueError("Candidate base 已是 current revision，无需 rebase")
++
++        lineage = self.reconciliation.lineage(int(hypothesis.id), target_revision_number)
++        if int(candidate.base_revision) not in set(lineage):
++            raise ValueError(
++                f"CR#{candidate.id} base r{candidate.base_revision} 不在 current r{target_revision_number} lineage 中"
++            )
++
++        old_proposal = self.db.get(RevisionProposal, int(candidate.source_proposal_id))
++        if old_proposal is None:
++            raise ValueError(f"RP#{candidate.source_proposal_id} 不存在")
++
++        existing_record = self._existing_record(int(candidate.id), target_revision_number)
++        if (
++            existing_record is not None
++            and existing_record.status == "rebased"
++            and existing_record.rebased_candidate_id is not None
++        ):
++            rebased_candidate = self.db.get(CandidateRevision, int(existing_record.rebased_candidate_id))
++            return CandidateRebaseResult(existing_record, rebased_candidate, llm_called=False)
++
++        source_ids, revalidations, missing = self._source_revalidations(
++            old_proposal, target_revision_number
++        )
++        if not source_ids:
++            record = self._upsert_record(
++                candidate=candidate,
++                proposal=old_proposal,
++                target_revision=target_revision_number,
++                status="not_ready",
++                source_signal_ids=[],
++                target_signal_ids=[],
++                reason="source_proposal_has_no_signals",
++            )
++            self.db.commit()
++            return CandidateRebaseResult(record, None, llm_called=False)
++
++        non_applying = [
++            item
++            for item in revalidations
++            if str(item.outcome) != "STILL_APPLIES" or item.rebased_signal_id is None
++        ]
++        target_signal_ids = self._target_signal_ids(revalidations)
++        if missing or non_applying or len(target_signal_ids) != len(source_ids):
++            record = self._upsert_record(
++                candidate=candidate,
++                proposal=old_proposal,
++                target_revision=target_revision_number,
++                status="not_ready",
++                source_signal_ids=source_ids,
++                target_signal_ids=target_signal_ids,
++                reason="source_signals_not_fully_revalidated_as_still_applies",
++                rebase_data={
++                    "missing_revalidation_signal_ids": missing,
++                    "non_applying": [
++                        {
++                            "source_signal_id": int(item.source_signal_id),
++                            "outcome": str(item.outcome),
++                        }
++                        for item in non_applying
++                    ],
++                },
++            )
++            self.db.commit()
++            return CandidateRebaseResult(record, None, llm_called=False)
++
++        # If new current-head evidence has appeared in the same semantic group,
++        # the stale proposal is no longer the whole story. Do not silently reuse
++        # its old semantic analysis; let the normal current-head Analyzer judge
++        # the complete group instead.
++        current_group_signals = [
++            item
++            for item in self.signal_service.list_all(
++                hypothesis_id=int(hypothesis.id),
++                base_revision=target_revision_number,
++                valid_only=True,
++            )
++            if str(item.dimension) == str(old_proposal.dimension)
++            and str(item.operation) == str(old_proposal.operation)
++            and str(item.target_field) == str(old_proposal.target_field)
++            and str(item.resolution_status or "open").lower() == "open"
++        ]
++        current_group_ids = sorted(int(item.id) for item in current_group_signals)
++        extra_group_ids = sorted(set(current_group_ids) - set(target_signal_ids))
++        if extra_group_ids:
++            record = self._upsert_record(
++                candidate=candidate,
++                proposal=old_proposal,
++                target_revision=target_revision_number,
++                status="needs_fresh_analysis",
++                source_signal_ids=source_ids,
++                target_signal_ids=target_signal_ids,
++                reason="new_same_target_signals_require_fresh_analysis",
++                rebase_data={
++                    "current_group_signal_ids": current_group_ids,
++                    "extra_current_signal_ids": extra_group_ids,
++                },
++            )
++            self.db.commit()
++            return CandidateRebaseResult(record, None, llm_called=False)
++
++        old_base = self.db.scalar(
++            select(HypothesisRevision).where(
++                HypothesisRevision.hypothesis_id == int(hypothesis.id),
++                HypothesisRevision.revision_number == int(candidate.base_revision),
++            )
++        )
++        current = self.db.scalar(
++            select(HypothesisRevision).where(
++                HypothesisRevision.hypothesis_id == int(hypothesis.id),
++                HypothesisRevision.revision_number == target_revision_number,
++            )
++        )
++        if old_base is None or current is None:
++            raise ValueError("缺少 Candidate rebase 所需的 revision snapshot")
++
++        if str(old_proposal.dimension).upper() == "ABSTRACTION":
++            record = self._upsert_record(
++                candidate=candidate,
++                proposal=old_proposal,
++                target_revision=target_revision_number,
++                status="conflict",
++                source_signal_ids=source_ids,
++                target_signal_ids=target_signal_ids,
++                reason="abstraction_rebase_requires_fresh_semantic_analysis",
++            )
++            self.db.commit()
++            return CandidateRebaseResult(record, None, llm_called=False)
++
++        old_present, old_value = self._field_value(old_base, old_proposal)
++        current_present, current_value = self._field_value(current, old_proposal)
++        if old_present != current_present or old_value != current_value:
++            record = self._upsert_record(
++                candidate=candidate,
++                proposal=old_proposal,
++                target_revision=target_revision_number,
++                status="conflict",
++                source_signal_ids=source_ids,
++                target_signal_ids=target_signal_ids,
++                reason="target_field_changed_since_stale_base",
++                rebase_data={
++                    "target_field": str(old_proposal.target_field),
++                    "old_base_value": old_value,
++                    "current_value": current_value,
++                },
++            )
++            self.db.commit()
++            return CandidateRebaseResult(record, None, llm_called=False)
++
++        target_signals = list(
++            self.db.scalars(select(RevisionSignal).where(RevisionSignal.id.in_(target_signal_ids))).all()
++        )
++        independent_count = len(
++            {int(item.interaction_id) for item in target_signals if item.interaction_id is not None}
++        )
++        revalidation_confidences = [float(item.confidence) for item in revalidations]
++        direction_confidence = min(
++            float(old_proposal.direction_confidence),
++            mean(revalidation_confidences) if revalidation_confidences else 0.5,
++        )
++
++        fingerprint = self._fingerprint(
++            {
++                "kind": "candidate_rebase",
++                "source_candidate_id": int(candidate.id),
++                "source_proposal_id": int(old_proposal.id),
++                "from_revision": int(candidate.base_revision),
++                "target_revision": target_revision_number,
++                "target_signal_ids": sorted(target_signal_ids),
++                "dimension": str(old_proposal.dimension),
++                "operation": str(old_proposal.operation),
++                "target_field": str(old_proposal.target_field),
++            }
++        )
++        analysis = self.db.scalar(
++            select(RevisionAnalysisRecord).where(
++                RevisionAnalysisRecord.candidate_fingerprint == fingerprint
++            )
++        )
++        if analysis is None:
++            analysis = RevisionAnalysisRecord(
++                hypothesis_id=int(hypothesis.id),
++                base_revision=target_revision_number,
++                dimension=str(old_proposal.dimension),
++                operation=str(old_proposal.operation),
++                target_field=str(old_proposal.target_field),
++                signal_ids=sorted(target_signal_ids),
++                candidate_fingerprint=fingerprint,
++                consistent=True,
++                direction_confidence=float(direction_confidence),
++                reason=(
++                    f"clean_rebase_from_CR#{candidate.id}/RP#{old_proposal.id}: all source signals "
++                    f"revalidated STILL_APPLIES on r{target_revision_number}; target field unchanged"
++                ),
++            )
++            self.db.add(analysis)
++            self.db.flush()
++
++        new_proposal = self.db.scalar(
++            select(RevisionProposal).where(RevisionProposal.analysis_id == int(analysis.id))
++        )
++        if new_proposal is None:
++            new_proposal = RevisionProposal(
++                analysis_id=int(analysis.id),
++                hypothesis_id=int(hypothesis.id),
++                base_revision=target_revision_number,
++                dimension=str(old_proposal.dimension),
++                operation=str(old_proposal.operation),
++                target_field=str(old_proposal.target_field),
++                before_data=(copy.deepcopy(current_value) if current_present else None),
++                proposed_after_data=copy.deepcopy(old_proposal.proposed_after_data),
++                reason=(
++                    f"rebased_from_RP#{old_proposal.id} after ancestor signal revalidation; "
++                    "semantic direction inherited, candidate must be re-evaluated"
++                ),
++                source_signal_ids=sorted(target_signal_ids),
++                independent_signal_count=independent_count,
++                direction_confidence=float(direction_confidence),
++                status="proposed",
++            )
++            self.db.add(new_proposal)
++            self.db.flush()
++
++        record = self._upsert_record(
++            candidate=candidate,
++            proposal=old_proposal,
++            target_revision=target_revision_number,
++            status="rebasing",
++            source_signal_ids=source_ids,
++            target_signal_ids=target_signal_ids,
++            reason="clean_three_way_rebase_ready_for_candidate_validation",
++            rebase_data={
++                "target_field": str(old_proposal.target_field),
++                "source_analysis_id": int(old_proposal.analysis_id),
++                "revalidation_record_ids": [int(item.id) for item in revalidations],
++            },
++        )
++        record.rebased_analysis_id = int(analysis.id)
++        record.rebased_proposal_id = int(new_proposal.id)
++        self.db.flush()
++
++        candidate_service = CandidateRevisionService(
++            self.db,
++            self.llm,
++            max_evidence=self.max_evidence,
++        )
++        evaluated = candidate_service.evaluate_proposal(new_proposal)
++        rebased_candidate = evaluated.candidate
++        data = dict(rebased_candidate.evaluation_data or {})
++        data["rebase"] = {
++            "source_candidate_id": int(candidate.id),
++            "source_proposal_id": int(old_proposal.id),
++            "candidate_rebase_record_id": int(record.id),
++            "from_revision": int(candidate.base_revision),
++            "target_revision": target_revision_number,
++            "source_signal_ids": source_ids,
++            "target_signal_ids": target_signal_ids,
++        }
++        rebased_candidate.evaluation_data = data
++
++        record.status = "rebased"
++        record.rebased_candidate_id = int(rebased_candidate.id)
++        record.reason = "clean_rebase_completed_and_candidate_re_evaluated"
++        old_proposal.status = "stale"
++        self.db.commit()
++        self.db.refresh(record)
++        self.db.refresh(rebased_candidate)
++        return CandidateRebaseResult(record, rebased_candidate, llm_called=evaluated.llm_called)
++
++    def list_records(self, *, limit: int = 100) -> list[CandidateRebaseRecord]:
++        stmt = (
++            select(CandidateRebaseRecord)
++            .order_by(CandidateRebaseRecord.created_at.desc(), CandidateRebaseRecord.id.desc())
++            .limit(max(1, int(limit)))
++        )
++        return list(self.db.scalars(stmt).all())
+diff --git a/app/hypothesis/revision_reconciliation.py b/app/hypothesis/revision_reconciliation.py
+index e412a52..d7e33ba 100644
+--- a/app/hypothesis/revision_reconciliation.py
++++ b/app/hypothesis/revision_reconciliation.py
+@@ -88,8 +88,14 @@ class RevisionReconciliationService:
+         if int(signal.id) not in valid_signal_ids:
+             return "invalid"
+         stored = str(signal.resolution_status or "open").lower()
++
++        # Resolution/supersession are branch-local facts. If the revision that
++        # retired the signal is not in the current lineage (for example after a
++        # rollback to the ancestor), the original signal becomes open again.
+         if stored == "superseded":
+-            return "superseded"
++            superseded_by = signal.superseded_by_revision
++            if superseded_by is not None and int(superseded_by) in lineage:
++                return "superseded"
+ 
+         resolved_by = signal.resolved_by_revision
+         if stored == "resolved" and resolved_by is not None and int(resolved_by) in lineage:
+diff --git a/app/hypothesis/service.py b/app/hypothesis/service.py
+index 2a40226..505c8ba 100644
+--- a/app/hypothesis/service.py
++++ b/app/hypothesis/service.py
+@@ -365,6 +365,7 @@ class HypothesisService:
+             elif (
+                 hypothesis.refinement_count > 0
+                 and pressure.resolved == 0
++                and pressure.superseded == 0
+                 and pressure.inactive_branch_open == 0
+             ):
+                 # Compatibility/failsafe: a REFINE relation may exist without an
+diff --git a/app/migrations.py b/app/migrations.py
+index 0fd257b..ce69f88 100644
+--- a/app/migrations.py
++++ b/app/migrations.py
+@@ -44,6 +44,9 @@ V0_2_1_SQLITE_COLUMNS = {
+         "resolved_by_candidate_id": "INTEGER",
+         "resolved_by_revision": "INTEGER",
+         "resolved_at": "DATETIME",
++        "superseded_by_signal_id": "INTEGER",
++        "superseded_by_revision": "INTEGER",
++        "superseded_at": "DATETIME",
+         "resolution_note": "TEXT DEFAULT ''",
+     },
+ }
+diff --git a/app/models.py b/app/models.py
+index 021629d..cf573a1 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -235,11 +235,58 @@ class RevisionSignal(Base):
+     )
+     resolved_by_revision: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
++
++    # Ancestor revalidation may either carry the same semantic signal forward to
++    # a descendant revision or retire it for that branch. Supersession is also
++    # lineage-aware: rolling back before superseded_by_revision re-opens the
++    # original signal instead of erasing history.
++    superseded_by_signal_id: Mapped[int | None] = mapped_column(
++        ForeignKey("revision_signals.id"), nullable=True, index=True
++    )
++    superseded_by_revision: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
++    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+     resolution_note: Mapped[str] = mapped_column(Text, default="")
+ 
+     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+ 
+ 
++class RevisionSignalRevalidation(Base):
++    """Audit record for re-checking one ancestor RevisionSignal against a newer head.
++
++    Revalidation is immutable per evaluator version. A STILL_APPLIES result may
++    materialize a new RevisionSignal on target_revision; the source signal stays
++    historically intact and is only branch-superseded.
++    """
++    __tablename__ = "revision_signal_revalidations"
++    __table_args__ = (
++        UniqueConstraint(
++            "source_signal_id",
++            "target_revision",
++            "evaluation_version",
++            name="uq_revision_signal_revalidation_version",
++        ),
++    )
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    hypothesis_id: Mapped[int] = mapped_column(
++        ForeignKey("strategy_hypotheses.id"), index=True
++    )
++    source_signal_id: Mapped[int] = mapped_column(
++        ForeignKey("revision_signals.id"), index=True
++    )
++    source_revision: Mapped[int] = mapped_column(Integer, index=True)
++    target_revision: Mapped[int] = mapped_column(Integer, index=True)
++    evaluation_version: Mapped[int] = mapped_column(Integer, default=1, index=True)
++    outcome: Mapped[str] = mapped_column(String(32), index=True)
++    confidence: Mapped[float] = mapped_column(Float, default=0.5)
++    reason: Mapped[str] = mapped_column(Text, default="")
++    rebased_signal_id: Mapped[int | None] = mapped_column(
++        ForeignKey("revision_signals.id"), nullable=True, index=True
++    )
++    evaluation_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++
++
+ class RevisionAnalysisRecord(Base):
+     """对一个 RevisionSignalGroup 的语义一致性分析记录。
+ 
+@@ -355,6 +402,55 @@ class CandidateRevision(Base):
+     )
+ 
+ 
++class CandidateRebaseRecord(Base):
++    """Audit record for carrying a stale Candidate onto the current revision.
++
++    A clean rebase is only allowed when every source signal was revalidated as
++    STILL_APPLIES and the proposal target field did not change between the old
++    base and the current head. The rebased Candidate is always re-evaluated.
++    """
++    __tablename__ = "candidate_rebase_records"
++    __table_args__ = (
++        UniqueConstraint(
++            "source_candidate_id",
++            "target_revision",
++            name="uq_candidate_rebase_target",
++        ),
++    )
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    hypothesis_id: Mapped[int] = mapped_column(
++        ForeignKey("strategy_hypotheses.id"), index=True
++    )
++    source_candidate_id: Mapped[int] = mapped_column(
++        ForeignKey("candidate_revisions.id"), index=True
++    )
++    source_proposal_id: Mapped[int] = mapped_column(
++        ForeignKey("revision_proposals.id"), index=True
++    )
++    from_revision: Mapped[int] = mapped_column(Integer, index=True)
++    target_revision: Mapped[int] = mapped_column(Integer, index=True)
++    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
++
++    source_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
++    target_signal_ids: Mapped[list] = mapped_column(JSON, default=list)
++    rebased_analysis_id: Mapped[int | None] = mapped_column(
++        ForeignKey("revision_analysis_records.id"), nullable=True, index=True
++    )
++    rebased_proposal_id: Mapped[int | None] = mapped_column(
++        ForeignKey("revision_proposals.id"), nullable=True, index=True
++    )
++    rebased_candidate_id: Mapped[int | None] = mapped_column(
++        ForeignKey("candidate_revisions.id"), nullable=True, index=True
++    )
++    reason: Mapped[str] = mapped_column(Text, default="")
++    rebase_data: Mapped[dict] = mapped_column(JSON, default=dict)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime, default=datetime.now, onupdate=datetime.now
++    )
++
++
+ class RevisionApplicationEvent(Base):
+     """Hypothesis Revision 的应用/回滚/人工拒绝审计事件。
+ 
+diff --git a/app/runtime.py b/app/runtime.py
+index 32ec78a..33598ce 100644
+--- a/app/runtime.py
++++ b/app/runtime.py
+@@ -22,6 +22,8 @@ from app.config import (
+     REVISION_AUTO_APPLY_BUDGET_HOURS,
+     REVISION_AUTO_APPLY_PER_HYPOTHESIS,
+     REVISION_AUTO_APPLY_MAX_PER_RUN,
++    REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH,
++    REVISION_REVALIDATION_MAX_HYPOTHESES_PER_RUN,
+ )
+ from app.context.builder import ContextBuilder
+ from app.evaluation.service import EvaluationService
+@@ -30,6 +32,8 @@ from app.gates.experience_gate import ExperienceGate
+ from app.gates.learning_eligibility_gate import LearningEligibilityGate
+ from app.gates.personal_memory_gate import PersonalMemoryGate
+ from app.hypothesis.aggregator import HypothesisAggregator
++from app.hypothesis.ancestor_revalidation import AncestorSignalRevalidationService
++from app.hypothesis.candidate_rebase import CandidateRebaseService
+ from app.hypothesis.candidate_revision import CandidateRevisionService
+ from app.hypothesis.relation_judge import HypothesisRelationJudge
+ from app.hypothesis.revision_aggregation import RevisionAggregationService
+@@ -94,6 +98,16 @@ class EvoMeRuntime:
+             self.llm,
+             max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
+         )
++        self.ancestor_revalidation_service = AncestorSignalRevalidationService(
++            db,
++            self.llm,
++            max_signals_per_batch=REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH,
++        )
++        self.candidate_rebase_service = CandidateRebaseService(
++            db,
++            self.llm,
++            max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
++        )
+         self.revision_commit_service = RevisionCommitService(
+             db,
+             auto_min_utility=REVISION_AUTO_APPLY_MIN_UTILITY,
+@@ -391,6 +405,56 @@ class EvoMeRuntime:
+                 ],
+             }
+ 
++    def _process_ancestor_revalidation_job(self) -> dict[str, Any]:
++        """Revalidate ancestor-open signals against current heads in the background."""
++        with self._background_session_factory() as db:
++            llm = self._new_background_llm()
++            service = AncestorSignalRevalidationService(
++                db,
++                llm,
++                max_signals_per_batch=REVISION_REVALIDATION_MAX_SIGNALS_PER_BATCH,
++            )
++            results = service.revalidate_pending(
++                max_hypotheses=REVISION_REVALIDATION_MAX_HYPOTHESES_PER_RUN
++            )
++            hypothesis_service = HypothesisService(db)
++            for item in results:
++                hypothesis_service.recalculate(item.hypothesis_id, commit=False)
++            if results:
++                db.commit()
++            return {
++                "revalidation_batches": len(results),
++                "hypothesis_ids": [item.hypothesis_id for item in results],
++                "target_revisions": [item.target_revision for item in results],
++                "record_ids": [rid for item in results for rid in item.record_ids],
++                "rebased_signal_ids": [sid for item in results for sid in item.rebased_signal_ids],
++                "resolved_signal_ids": [sid for item in results for sid in item.resolved_signal_ids],
++                "superseded_signal_ids": [sid for item in results for sid in item.superseded_signal_ids],
++                "uncertain_signal_ids": [sid for item in results for sid in item.uncertain_signal_ids],
++            }
++
++    def _process_candidate_rebase_job(self, candidate_id: int) -> dict[str, Any]:
++        """Three-way rebase one stale Candidate onto the current revision."""
++        with self._background_session_factory() as db:
++            llm = self._new_background_llm()
++            service = CandidateRebaseService(
++                db,
++                llm,
++                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
++            )
++            result = service.rebase_candidate(int(candidate_id))
++            return {
++                "source_candidate_id": int(candidate_id),
++                "candidate_rebase_record_id": int(result.record.id),
++                "rebase_status": str(result.record.status),
++                "target_revision": int(result.record.target_revision),
++                "rebased_proposal_id": result.record.rebased_proposal_id,
++                "rebased_candidate_id": result.record.rebased_candidate_id,
++                "candidate_status": (result.candidate.status if result.candidate is not None else None),
++                "llm_called": bool(result.llm_called),
++                "reason": str(result.record.reason),
++            }
++
+     def _process_revision_auto_apply_job(self) -> dict[str, Any]:
+         """Apply already-validated LOW-risk Candidates without another LLM call."""
+         with self._background_session_factory() as db:
+@@ -594,6 +658,30 @@ class EvoMeRuntime:
+         self._last_background_job_id = job_id
+         return job_id
+ 
++    def enqueue_ancestor_revalidation(self) -> str | None:
++        """Queue Phase 5.5 ancestor signal revalidation."""
++        if self.background_queue is None:
++            self._process_ancestor_revalidation_job()
++            return None
++        job_id = self.background_queue.submit(
++            kind="ancestor_revalidation",
++            fn=self._process_ancestor_revalidation_job,
++        )
++        self._last_background_job_id = job_id
++        return job_id
++
++    def enqueue_candidate_rebase(self, candidate_id: int) -> str | None:
++        """Queue Phase 5.5 stale Candidate rebase and re-evaluation."""
++        if self.background_queue is None:
++            self._process_candidate_rebase_job(int(candidate_id))
++            return None
++        job_id = self.background_queue.submit(
++            kind="candidate_rebase",
++            fn=lambda: self._process_candidate_rebase_job(int(candidate_id)),
++        )
++        self._last_background_job_id = job_id
++        return job_id
++
+     def list_background_jobs(self, limit: int = 10):
+         if self.background_queue is None:
+             return []
+@@ -673,6 +761,14 @@ class EvoMeRuntime:
+         self.db.expire_all()
+         return self.candidate_revision_service.list_candidates()
+ 
++    def list_signal_revalidations(self, limit: int = 100):
++        self.db.expire_all()
++        return self.ancestor_revalidation_service.list_records(limit=limit)
++
++    def list_candidate_rebases(self, limit: int = 100):
++        self.db.expire_all()
++        return self.candidate_rebase_service.list_records(limit=limit)
++
+     def approve_candidate(self, candidate_id: int, *, reason: str = "human_approved"):
+         self.db.expire_all()
+         result = self.revision_commit_service.approve_candidate(candidate_id, reason=reason)
+diff --git a/main.py b/main.py
+index c4db2a6..4effbb2 100644
+--- a/main.py
++++ b/main.py
+@@ -74,6 +74,7 @@ def show_hypotheses(runtime: EvoMeRuntime) -> None:
+             f"diversity={h.context_diversity}\n"
+             f"Revision Pressure: active_open={pressure.active_open} "
+             f"ancestor_open={pressure.ancestor_open} resolved={pressure.resolved} "
++            f"superseded={pressure.superseded} "
+             f"inactive_branch={pressure.inactive_branch_open} invalid={pressure.invalid}\n"
+         )
+ 
+@@ -123,6 +124,22 @@ def show_revision_signals(runtime: EvoMeRuntime) -> None:
+ 
+ 
+ 
++def show_signal_revalidations(runtime: EvoMeRuntime) -> None:
++    print("\n===== Ancestor Signal Revalidations =====")
++    items = runtime.list_signal_revalidations()
++    if not items:
++        print("暂无 Ancestor Signal Revalidation")
++        return
++    for item in items:
++        rebased = f"RS#{item.rebased_signal_id}" if item.rebased_signal_id is not None else "-"
++        print(
++            f"SRV#{item.id} H#{item.hypothesis_id}: r{item.source_revision} -> r{item.target_revision} "
++            f"source=RS#{item.source_signal_id} outcome={item.outcome} "
++            f"confidence={item.confidence:.2f} rebased={rebased}\n"
++            f"reason: {item.reason}\n"
++        )
++
++
+ def show_revision_groups(runtime: EvoMeRuntime) -> None:
+     print("\n===== Revision Signal Groups =====")
+     groups = runtime.list_revision_signal_groups()
+@@ -156,7 +173,8 @@ def show_evidence_summary(runtime: EvoMeRuntime) -> None:
+             f"Context Coverage: {summary['context_coverage']}\n"
+             f"Revision Pressure: active_open={summary['revision_pressure']['active_open']} "
+             f"ancestor_open={summary['revision_pressure']['ancestor_open']} "
+-            f"resolved={summary['revision_pressure']['resolved']}\n"
++            f"resolved={summary['revision_pressure']['resolved']} "
++            f"superseded={summary['revision_pressure']['superseded']}\n"
+             f"Revision Groups: {len(summary['revision_groups'])} "
+             f"analysis_candidates={len(summary['analysis_candidates'])}\n"
+         )
+@@ -176,6 +194,7 @@ def show_revision_pressure(runtime: EvoMeRuntime) -> None:
+             f"active_open={p.active_open} ids={p.active_open_ids}\n"
+             f"ancestor_open={p.ancestor_open} ids={p.ancestor_open_ids}\n"
+             f"resolved={p.resolved} ids={p.resolved_ids}\n"
++            f"superseded={p.superseded}\n"
+             f"inactive_branch_open={p.inactive_branch_open} "
+             f"ids={p.inactive_branch_open_ids} invalid={p.invalid}\n"
+         )
+@@ -249,6 +268,24 @@ def show_candidates(runtime: EvoMeRuntime) -> None:
+ 
+ 
+ 
++def show_candidate_rebases(runtime: EvoMeRuntime) -> None:
++    print("\n===== Candidate Rebase Records =====")
++    items = runtime.list_candidate_rebases()
++    if not items:
++        print("暂无 Candidate Rebase Record")
++        return
++    for item in items:
++        new_candidate = f"CR#{item.rebased_candidate_id}" if item.rebased_candidate_id is not None else "-"
++        new_proposal = f"RP#{item.rebased_proposal_id}" if item.rebased_proposal_id is not None else "-"
++        print(
++            f"RB#{item.id} [{item.status}] H#{item.hypothesis_id}: "
++            f"CR#{item.source_candidate_id} r{item.from_revision} -> r{item.target_revision} "
++            f"proposal={new_proposal} candidate={new_candidate}\n"
++            f"signals: {item.source_signal_ids} -> {item.target_signal_ids}\n"
++            f"reason: {item.reason}\n"
++        )
++
++
+ def show_revision_events(runtime: EvoMeRuntime) -> None:
+     print("\n===== Revision Application Events =====")
+     items = runtime.list_revision_events()
+@@ -351,6 +388,28 @@ def show_background_status(runtime: EvoMeRuntime) -> None:
+                     f"event_ids={result.get('revision_event_ids', [])} "
+                     f"new_revisions={result.get('new_revisions', [])}"
+                 )
++            elif job.kind == "ancestor_revalidation":
++                print(
++                    "  "
++                    f"batches={result.get('revalidation_batches', 0)} "
++                    f"hypotheses={result.get('hypothesis_ids', [])} "
++                    f"records={result.get('record_ids', [])} "
++                    f"rebased_signals={result.get('rebased_signal_ids', [])} "
++                    f"resolved={result.get('resolved_signal_ids', [])} "
++                    f"superseded={result.get('superseded_signal_ids', [])} "
++                    f"uncertain={result.get('uncertain_signal_ids', [])}"
++                )
++            elif job.kind == "candidate_rebase":
++                print(
++                    "  "
++                    f"source=CR#{result.get('source_candidate_id')} "
++                    f"status={result.get('rebase_status')} "
++                    f"target=r{result.get('target_revision')} "
++                    f"proposal={result.get('rebased_proposal_id')} "
++                    f"candidate={result.get('rebased_candidate_id')} "
++                    f"candidate_status={result.get('candidate_status')} "
++                    f"llm_called={result.get('llm_called', False)}"
++                )
+             else:
+                 print(
+                     "  "
+@@ -377,8 +436,10 @@ def main() -> None:
+     print("🌱 EvoMe V0.2.1-dev Core")
+     print(
+         "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
+-        "/revision-signals  /revision-pressure  /revision-groups  /evidence-summary  /revision-analyze  "
++        "/revision-signals  /revision-pressure  /revision-groups  /ancestor-revalidate  "
++        "/signal-revalidations  /evidence-summary  /revision-analyze  "
+         "/revision-analyses  /revision-proposals  /candidate-evaluate  /candidates  "
++        "/candidate-rebase <id>  /candidate-rebases  "
+         "/revision-apply-auto  /candidate-approve <id>  /candidate-reject <id>  "
+         "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
+         "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
+@@ -421,6 +482,15 @@ def main() -> None:
+                 show_revision_pressure(runtime); continue
+             if user_input == "/revision-groups":
+                 show_revision_groups(runtime); continue
++            if user_input == "/ancestor-revalidate":
++                job_id = runtime.enqueue_ancestor_revalidation()
++                if job_id is None:
++                    print("Ancestor Signal Revalidation 已同步执行完成。")
++                else:
++                    print(f"Ancestor Signal Revalidation 已进入后台队列：{job_id}")
++                continue
++            if user_input == "/signal-revalidations":
++                show_signal_revalidations(runtime); continue
+             if user_input == "/evidence-summary":
+                 show_evidence_summary(runtime); continue
+             if user_input == "/revision-analyze":
+@@ -443,6 +513,19 @@ def main() -> None:
+                 continue
+             if user_input == "/candidates":
+                 show_candidates(runtime); continue
++            if user_input.startswith("/candidate-rebase "):
++                try:
++                    candidate_id = int(user_input.split(maxsplit=1)[1])
++                    job_id = runtime.enqueue_candidate_rebase(candidate_id)
++                    if job_id is None:
++                        print(f"Candidate CR#{candidate_id} Rebase 已同步执行完成。")
++                    else:
++                        print(f"Candidate CR#{candidate_id} Rebase 已进入后台队列：{job_id}")
++                except Exception as exc:
++                    print(f"❌ Candidate rebase failed: {exc}")
++                continue
++            if user_input == "/candidate-rebases":
++                show_candidate_rebases(runtime); continue
+             if user_input == "/revision-apply-auto":
+                 job_id = runtime.enqueue_revision_auto_apply()
+                 if job_id is None:
+diff --git a/tests/test_ancestor_revalidation.py b/tests/test_ancestor_revalidation.py
+new file mode 100644
+index 0000000..8d4d6c8
+--- /dev/null
++++ b/tests/test_ancestor_revalidation.py
+@@ -0,0 +1,117 @@
++import json
++
++from sqlalchemy import select
++
++from app.hypothesis.ancestor_revalidation import AncestorSignalRevalidationService
++from app.hypothesis.revision_commit import RevisionCommitService
++from app.hypothesis.revision_reconciliation import RevisionReconciliationService
++from app.models import RevisionSignal, RevisionSignalRevalidation
++from tests.test_revision_aggregation import _add_refine_signal
++from tests.test_revision_commit import _evaluated_low_candidate
++from tests.test_revision_reconciliation import _normalize_outcome_source_signals
++
++
++class FakeRevalidationLLM:
++    def __init__(self, outcome="STILL_APPLIES"):
++        self.outcome = outcome
++        self.calls = 0
++
++    def json_chat(self, messages, temperature=0.1):
++        self.calls += 1
++        payload = json.loads(messages[-1]["content"])
++        return {
++            "assessments": [
++                {
++                    "signal_id": item["signal_id"],
++                    "outcome": self.outcome,
++                    "confidence": 0.92,
++                    "reason": "test revalidation",
++                }
++                for item in payload["ancestor_signals"]
++            ]
++        }
++
++
++def _r2_with_one_ancestor_signal(db):
++    hypothesis, _proposal, low_candidate = _evaluated_low_candidate(db)
++    _normalize_outcome_source_signals(db, low_candidate)
++    ancestor = _add_refine_signal(
++        db,
++        hypothesis,
++        interaction_id=9001,
++        reflection_seed="response structure still needed",
++        target_field="response_structure",
++    )
++    RevisionCommitService(db).auto_apply_ready(max_candidates=1)
++    db.refresh(hypothesis)
++    assert hypothesis.current_revision == 2
++    assert ancestor.id in RevisionReconciliationService(db).pressure_summary(hypothesis.id).ancestor_open_ids
++    return hypothesis, ancestor
++
++
++def test_phase5_5_still_applies_materializes_current_signal_and_supersedes_ancestor_on_branch(db):
++    hypothesis, ancestor = _r2_with_one_ancestor_signal(db)
++    llm = FakeRevalidationLLM("STILL_APPLIES")
++    service = AncestorSignalRevalidationService(db, llm)
++
++    result = service.revalidate_hypothesis(hypothesis.id)
++
++    assert result.llm_called is True
++    assert llm.calls == 1
++    assert len(result.record_ids) == 1
++    assert len(result.rebased_signal_ids) == 1
++
++    db.refresh(ancestor)
++    rebased = db.get(RevisionSignal, result.rebased_signal_ids[0])
++    assert rebased.base_revision == 2
++    assert rebased.target_field == ancestor.target_field
++    assert rebased.provenance_data["rebased_from_signal_id"] == ancestor.id
++    assert ancestor.resolution_status == "superseded"
++    assert ancestor.superseded_by_signal_id == rebased.id
++    assert ancestor.superseded_by_revision == 2
++
++    record = db.get(RevisionSignalRevalidation, result.record_ids[0])
++    assert record.outcome == "STILL_APPLIES"
++    assert record.rebased_signal_id == rebased.id
++
++    pressure = RevisionReconciliationService(db).pressure_summary(hypothesis.id)
++    assert pressure.ancestor_open == 0
++    assert pressure.active_open == 1
++    assert pressure.superseded == 1
++    assert rebased.id in pressure.active_open_ids
++
++    # Same source/target is idempotent and spends no second LLM call.
++    second = service.revalidate_hypothesis(hypothesis.id)
++    assert second.llm_called is False
++    assert llm.calls == 1
++
++
++def test_phase5_5_branch_supersession_reopens_original_after_rollback(db):
++    hypothesis, ancestor = _r2_with_one_ancestor_signal(db)
++    service = AncestorSignalRevalidationService(db, FakeRevalidationLLM("STILL_APPLIES"))
++    result = service.revalidate_hypothesis(hypothesis.id)
++    rebased_id = result.rebased_signal_ids[0]
++
++    RevisionCommitService(db).rollback(hypothesis.id, 1, reason="test rollback")
++    db.refresh(hypothesis)
++    pressure = RevisionReconciliationService(db).pressure_summary(hypothesis.id)
++
++    assert ancestor.id in pressure.active_open_ids
++    assert rebased_id in pressure.inactive_branch_open_ids
++    assert ancestor.id not in pressure.resolved_ids
++
++
++def test_phase5_5_resolved_by_current_retires_ancestor_without_copy(db):
++    hypothesis, ancestor = _r2_with_one_ancestor_signal(db)
++    service = AncestorSignalRevalidationService(db, FakeRevalidationLLM("RESOLVED_BY_CURRENT"))
++
++    result = service.revalidate_hypothesis(hypothesis.id)
++
++    assert result.rebased_signal_ids == []
++    assert result.resolved_signal_ids == [ancestor.id]
++    db.refresh(ancestor)
++    assert ancestor.resolution_status == "resolved"
++    assert ancestor.resolved_by_revision == 2
++    pressure = RevisionReconciliationService(db).pressure_summary(hypothesis.id)
++    assert ancestor.id in pressure.resolved_ids
++    assert pressure.ancestor_open == 0
+diff --git a/tests/test_candidate_rebase.py b/tests/test_candidate_rebase.py
+new file mode 100644
+index 0000000..7da6da3
+--- /dev/null
++++ b/tests/test_candidate_rebase.py
+@@ -0,0 +1,243 @@
++import json
++
++from app.hypothesis.ancestor_revalidation import AncestorSignalRevalidationService
++from app.hypothesis.candidate_rebase import CandidateRebaseService
++from app.hypothesis.candidate_revision import CandidateRevisionService
++from app.hypothesis.revision_commit import RevisionCommitService
++from app.models import (
++    Experience,
++    HypothesisEvidence,
++    ReflectionRecord,
++    RevisionAnalysisRecord,
++    RevisionProposal,
++    RevisionSignal,
++)
++from tests.test_candidate_revision import FakeCandidateLLM
++from tests.test_revision_aggregation import _add_refine_signal
++from tests.test_revision_commit import _evaluated_low_candidate
++from tests.test_revision_reconciliation import _normalize_outcome_source_signals
++
++
++class CombinedRebaseLLM:
++    """Understands both ancestor revalidation and candidate-local evaluation prompts."""
++
++    def __init__(self):
++        self.revalidation_calls = 0
++        self.candidate_calls = 0
++
++    def json_chat(self, messages, temperature=0.1):
++        payload = json.loads(messages[-1]["content"])
++        if "ancestor_signals" in payload:
++            self.revalidation_calls += 1
++            return {
++                "assessments": [
++                    {
++                        "signal_id": item["signal_id"],
++                        "outcome": "STILL_APPLIES",
++                        "confidence": 0.93,
++                        "reason": "still needed on r2",
++                    }
++                    for item in payload["ancestor_signals"]
++                ]
++            }
++        self.candidate_calls += 1
++        return {
++            "signal_assessments": [
++                {
++                    "signal_id": item["signal_id"],
++                    "resolution": "RESOLVED",
++                    "confidence": 0.95,
++                    "reason": "rebased candidate resolves the local signal",
++                }
++                for item in payload.get("source_signals", [])
++            ],
++            "guard_assessments": [
++                {
++                    "evidence_id": item["evidence_id"],
++                    "verdict": "PASS",
++                    "confidence": 0.9,
++                    "reason": "preserved",
++                }
++                for item in payload.get("guard_evidence", [])
++            ],
++        }
++
++
++def _stale_action_candidate_after_r2(db):
++    hypothesis, _low_proposal, low_candidate = _evaluated_low_candidate(db)
++    _normalize_outcome_source_signals(db, low_candidate)
++
++    signals = [
++        _add_refine_signal(
++            db,
++            hypothesis,
++            interaction_id=9100 + index,
++            reflection_seed=f"response structure {index}",
++            target_field="response_structure",
++        )
++        for index in range(3)
++    ]
++    analysis = RevisionAnalysisRecord(
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        signal_ids=[item.id for item in signals],
++        candidate_fingerprint=f"stale-action-{hypothesis.id}",
++        consistent=True,
++        direction_confidence=0.9,
++        reason="same response structure direction",
++    )
++    db.add(analysis)
++    db.flush()
++    proposal = RevisionProposal(
++        analysis_id=analysis.id,
++        hypothesis_id=hypothesis.id,
++        base_revision=1,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        before_data=None,
++        proposed_after_data={
++            "response_structure": {
++                "ordered_sections": ["data flow", "interfaces"],
++                "checks": ["boundaries", "anti-patterns"],
++            }
++        },
++        reason="stale action proposal",
++        source_signal_ids=[item.id for item in signals],
++        independent_signal_count=3,
++        direction_confidence=0.9,
++        status="proposed",
++    )
++    db.add(proposal)
++    db.commit()
++
++    stale_candidate = CandidateRevisionService(db, FakeCandidateLLM()).evaluate_proposal(proposal).candidate
++    assert stale_candidate.status == "needs_review"
++
++    RevisionCommitService(db).auto_apply_ready(max_candidates=1)
++    db.refresh(hypothesis)
++    db.refresh(stale_candidate)
++    assert hypothesis.current_revision == 2
++    assert stale_candidate.status == "stale"
++    return hypothesis, proposal, stale_candidate, signals
++
++
++def test_phase5_5_clean_candidate_rebase_creates_new_proposal_and_reevaluated_candidate(db):
++    hypothesis, old_proposal, stale_candidate, source_signals = _stale_action_candidate_after_r2(db)
++    llm = CombinedRebaseLLM()
++
++    revalidation = AncestorSignalRevalidationService(db, llm, max_signals_per_batch=16)
++    revalidated = revalidation.revalidate_hypothesis(hypothesis.id)
++    assert set(revalidated.rebased_signal_ids)
++    assert llm.revalidation_calls == 1
++
++    service = CandidateRebaseService(db, llm)
++    result = service.rebase_candidate(stale_candidate.id)
++
++    assert result.record.status == "rebased"
++    assert result.candidate is not None
++    assert result.candidate.id != stale_candidate.id
++    assert result.candidate.base_revision == 2
++    assert result.candidate.source_proposal_id == result.record.rebased_proposal_id
++    assert result.candidate.evaluation_data["rebase"]["source_candidate_id"] == stale_candidate.id
++    assert result.record.source_signal_ids == [item.id for item in source_signals]
++    assert len(result.record.target_signal_ids) == len(source_signals)
++    assert llm.candidate_calls == 1
++
++    db.refresh(old_proposal)
++    assert old_proposal.status == "stale"
++    # Rebase never changes the current revision by itself.
++    db.refresh(hypothesis)
++    assert hypothesis.current_revision == 2
++
++    # Idempotent repeat returns the already rebased Candidate without another LLM call.
++    second = service.rebase_candidate(stale_candidate.id)
++    assert second.candidate.id == result.candidate.id
++    assert second.llm_called is False
++    assert llm.candidate_calls == 1
++
++
++def test_phase5_5_candidate_rebase_waits_until_all_source_signals_are_revalidated(db):
++    _hypothesis, _old_proposal, stale_candidate, _signals = _stale_action_candidate_after_r2(db)
++    llm = CombinedRebaseLLM()
++    service = CandidateRebaseService(db, llm)
++
++    result = service.rebase_candidate(stale_candidate.id)
++
++    assert result.record.status == "not_ready"
++    assert result.candidate is None
++    assert "not_fully_revalidated" in result.record.reason
++    assert llm.candidate_calls == 0
++
++
++def test_phase5_5_candidate_rebase_defers_when_new_same_target_signal_exists(db):
++    hypothesis, _old_proposal, stale_candidate, _signals = _stale_action_candidate_after_r2(db)
++    llm = CombinedRebaseLLM()
++    revalidated = AncestorSignalRevalidationService(db, llm).revalidate_hypothesis(hypothesis.id)
++    assert revalidated.rebased_signal_ids
++
++    # New r2 evidence arrived after the stale r1 proposal was formed. It belongs
++    # to the same semantic group, so the old proposal must not be silently reused.
++    exp = Experience(
++        interaction_id=9999,
++        task_type="architecture_design",
++        strategy_name="default",
++        strategy_version=2,
++        skills_used=[],
++        result_summary="new current-head response preference",
++        success=True,
++        score=1.0,
++        context_data={"task_type": "architecture_design", "complexity": "high", "interaction_mode": "collaborative"},
++    )
++    db.add(exp); db.flush()
++    reflection = ReflectionRecord(
++        experience_id=exp.id,
++        reflection_type="success",
++        observation="new current-head response preference",
++        lesson="new current-head response preference",
++        insight="new current-head response preference",
++        applicable_context={"task_type": "architecture_design", "complexity": "high", "interaction_mode": "collaborative"},
++        strategy_signal="new current-head response preference",
++        expected_effect="clarity",
++        canonical_signal="new current-head response preference",
++        confidence=0.9,
++        status="active",
++    )
++    db.add(reflection); db.flush()
++    evidence = HypothesisEvidence(
++        hypothesis_id=hypothesis.id,
++        hypothesis_revision=2,
++        reflection_id=reflection.id,
++        relation_type="REFINES",
++        relation_confidence=0.9,
++        relation_reason="new r2 refine",
++        is_independent=True,
++    )
++    db.add(evidence); db.flush()
++    extra = RevisionSignal(
++        hypothesis_id=hypothesis.id,
++        base_revision=2,
++        reflection_id=reflection.id,
++        evidence_id=evidence.id,
++        interaction_id=9999,
++        dimension="ACTION",
++        operation="EXPAND",
++        target_field="response_structure",
++        before_data=None,
++        observed_data="new explicit response ordering",
++        canonical_change="response_structure: expand",
++        confidence=0.9,
++        provenance_data={},
++        resolution_status="open",
++    )
++    db.add(extra); db.commit()
++
++    result = CandidateRebaseService(db, llm).rebase_candidate(stale_candidate.id)
++
++    assert result.record.status == "needs_fresh_analysis"
++    assert result.candidate is None
++    assert extra.id in result.record.rebase_data["extra_current_signal_ids"]
++    assert llm.candidate_calls == 0
+diff --git a/tests/test_cli_commands.py b/tests/test_cli_commands.py
+index 35a8abf..97c02b5 100644
+--- a/tests/test_cli_commands.py
++++ b/tests/test_cli_commands.py
+@@ -4,6 +4,8 @@ from app.cli_commands import normalize_cli_input
+ def test_known_command_without_slash_is_normalized():
+     assert normalize_cli_input("revision-signals") == "/revision-signals"
+     assert normalize_cli_input("candidate-approve 3") == "/candidate-approve 3"
++    assert normalize_cli_input("candidate-rebase 3") == "/candidate-rebase 3"
++    assert normalize_cli_input("ancestor-revalidate") == "/ancestor-revalidate"
+ 
+ 
+ def test_natural_language_is_not_rewritten():

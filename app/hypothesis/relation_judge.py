@@ -33,6 +33,7 @@ operation 必须同时符合 dimension 的兼容矩阵：
 - ABSTRACTION: GENERALIZE / SPECIALIZE
 例如“给执行流程增加一步”属于 ACTION/EXPAND，不要写 ACTION/ADD_CONDITION。
 before_data 写当前 Hypothesis 里的现有值；observed_data 只写这条 Reflection 真正观察到的新信息；不得提前生成最终 after。
+CONTEXT 特别保守：不要因为某次成功交互“恰好”是 low/high complexity、direct/collaborative 或 low/high risk，就扩展 Hypothesis 的适用边界。只有用户明确把这些条件说成适用范围/偏好条件时，才输出对应 CONTEXT signal。
 user_satisfaction 只有存在明确用户反馈时才允许输出；不得从 evaluator score 推断。
 最多输出 5 条原子 Signal。relation 不是 REFINES 时 revision_signals 必须为空数组。
 

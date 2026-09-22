@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.hypothesis.canonical import build_hypothesis_title
+from app.hypothesis.revision_reconciliation import RevisionReconciliationService
 from app.models import (
     Experience,
     HypothesisEvidence,
@@ -16,7 +17,7 @@ from app.models import (
 )
 
 
-ACTIVE_HYPOTHESIS_STATUSES = {"observing", "ready_for_review", "needs_revision"}
+ACTIVE_HYPOTHESIS_STATUSES = {"observing", "ready_for_review", "needs_revision", "needs_revalidation"}
 
 
 class HypothesisService:
@@ -66,6 +67,7 @@ class HypothesisService:
         do_data: dict[str, Any],
         expect_data: dict[str, Any],
         created_reason: str,
+        parent_revision: int | None = None,
         commit: bool = True,
     ) -> HypothesisRevision:
         """创建不可变 Revision 快照。
@@ -85,6 +87,7 @@ class HypothesisService:
         revision = HypothesisRevision(
             hypothesis_id=hypothesis_id,
             revision_number=revision_number,
+            parent_revision=parent_revision,
             title=title,
             canonical_signal=canonical_signal,
             insight=insight,
@@ -118,6 +121,7 @@ class HypothesisService:
             do_data={"text": hypothesis.proposed_change},
             expect_data={"text": hypothesis.expected_effect},
             created_reason=created_reason,
+            parent_revision=None,
             commit=commit,
         )
 
@@ -183,6 +187,7 @@ class HypothesisService:
             .where(
                 HypothesisEvidence.hypothesis_id == hypothesis_id,
                 HypothesisEvidence.hypothesis_revision == revision_number,
+                ReflectionRecord.status == "active",
             )
         )
         return {int(item) for item in self.db.scalars(stmt).all() if item is not None}
@@ -265,6 +270,7 @@ class HypothesisService:
             .where(
                 HypothesisEvidence.hypothesis_id == hypothesis_id,
                 HypothesisEvidence.hypothesis_revision == revision_number,
+                ReflectionRecord.status == "active",
             )
         )
         return list(self.db.execute(stmt).all())
@@ -323,7 +329,12 @@ class HypothesisService:
             "confidence": round(confidence, 4),
         }
 
-    def recalculate(self, hypothesis_id: int) -> StrategyHypothesis:
+    def recalculate(
+        self,
+        hypothesis_id: int,
+        *,
+        commit: bool = True,
+    ) -> StrategyHypothesis:
         hypothesis = self.db.get(StrategyHypothesis, hypothesis_id)
         if hypothesis is None:
             raise ValueError(f"Hypothesis #{hypothesis_id} 不存在")
@@ -341,7 +352,25 @@ class HypothesisService:
         hypothesis.last_evidence_at = datetime.now()
 
         if hypothesis.status in ACTIVE_HYPOTHESIS_STATUSES:
-            if hypothesis.refinement_count > 0:
+            pressure = RevisionReconciliationService(self.db).pressure_summary(
+                hypothesis_id, current_revision
+            )
+            # Current-state semantics: historical REFINES evidence is audit history.
+            # Only open signals on the active head mean "needs_revision". Signals
+            # inherited from an ancestor must first be revalidated/rebased.
+            if pressure.active_open > 0:
+                hypothesis.status = "needs_revision"
+            elif pressure.ancestor_open > 0:
+                hypothesis.status = "needs_revalidation"
+            elif (
+                hypothesis.refinement_count > 0
+                and pressure.resolved == 0
+                and pressure.superseded == 0
+                and pressure.inactive_branch_open == 0
+            ):
+                # Compatibility/failsafe: a REFINE relation may exist without an
+                # atomic signal (legacy data or a judge that emitted no valid
+                # signal). Do not silently downgrade that unresolved evidence.
                 hypothesis.status = "needs_revision"
             elif (
                 hypothesis.confidence >= 0.8
@@ -353,14 +382,19 @@ class HypothesisService:
             else:
                 hypothesis.status = "observing"
 
-        self.db.commit()
-        self.db.refresh(hypothesis)
+        if commit:
+            self.db.commit()
+            self.db.refresh(hypothesis)
+        else:
+            self.db.flush()
         return hypothesis
 
     def activate_revision(
         self,
         hypothesis_id: int,
         revision_number: int,
+        *,
+        commit: bool = True,
     ) -> StrategyHypothesis:
         """切换 current revision 的受控入口。
 
@@ -387,9 +421,12 @@ class HypothesisService:
         hypothesis.proposed_change = str((revision.do_data or {}).get("text", ""))
         hypothesis.expected_effect = str((revision.expect_data or {}).get("text", ""))
 
-        self.db.commit()
-        self.db.refresh(hypothesis)
-        return self.recalculate(hypothesis_id)
+        if commit:
+            self.db.commit()
+            self.db.refresh(hypothesis)
+        else:
+            self.db.flush()
+        return self.recalculate(hypothesis_id, commit=commit)
 
     def recalculate_all(self) -> list[StrategyHypothesis]:
         """按各 Hypothesis 的 current revision 重新计算活动 Hypothesis。"""

@@ -6,7 +6,11 @@ from datetime import datetime
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
-from app.models import HypothesisEvidence, HypothesisRevision
+from app.models import (
+    HypothesisEvidence,
+    HypothesisRevision,
+    ProposalNormalizationRecord,
+)
 
 
 V0_2_SQLITE_COLUMNS = {
@@ -29,6 +33,31 @@ V0_2_SQLITE_COLUMNS = {
 V0_2_1_SQLITE_COLUMNS = {
     "strategy_hypotheses": {
         "current_revision": "INTEGER DEFAULT 1",
+    },
+    # Phase 5.1: existing Phase 5 candidates used reflection-level fit.
+    # Mark them as evaluator v1 so they can be safely re-evaluated in place.
+    "candidate_revisions": {
+        "evaluation_version": "INTEGER DEFAULT 1",
+        "complexity_version": "INTEGER DEFAULT 1",
+    },
+    "revision_proposals": {
+        "parent_proposal_id": "INTEGER",
+        "proposal_kind": "TEXT DEFAULT 'raw'",
+        "normalization_version": "INTEGER DEFAULT 0",
+    },
+    "hypothesis_revisions": {
+        "parent_revision": "INTEGER",
+    },
+    "revision_signals": {
+        "provenance_data": "JSON DEFAULT '{}'",
+        "resolution_status": "TEXT DEFAULT 'open'",
+        "resolved_by_candidate_id": "INTEGER",
+        "resolved_by_revision": "INTEGER",
+        "resolved_at": "DATETIME",
+        "superseded_by_signal_id": "INTEGER",
+        "superseded_by_revision": "INTEGER",
+        "superseded_at": "DATETIME",
+        "resolution_note": "TEXT DEFAULT ''",
     },
 }
 
@@ -248,6 +277,167 @@ def _backfill_hypothesis_revisions(engine: Engine) -> None:
             )
 
 
+
+def _backfill_revision_lineage_and_signal_resolution(engine: Engine) -> None:
+    """Phase 5.4: recover lineage/resolution from immutable application events.
+
+    This is deliberately idempotent so an existing Phase 5.3 database (where r2
+    already exists) can be upgraded without replaying any LLM work.
+    """
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    required = {"hypothesis_revisions", "revision_application_events", "revision_signals"}
+    if not required.issubset(tables):
+        return
+
+    with engine.begin() as conn:
+        events = conn.execute(
+            text(
+                """
+                SELECT id, hypothesis_id, from_revision, to_revision, candidate_id, action, event_data, created_at
+                FROM revision_application_events
+                WHERE action IN ('AUTO_APPLY', 'HUMAN_APPLY')
+                  AND to_revision IS NOT NULL
+                ORDER BY id ASC
+                """
+            )
+        ).mappings().all()
+
+        for event in events:
+            conn.execute(
+                text(
+                    """
+                    UPDATE hypothesis_revisions
+                    SET parent_revision = COALESCE(parent_revision, :parent_revision)
+                    WHERE hypothesis_id = :hypothesis_id
+                      AND revision_number = :revision_number
+                    """
+                ),
+                {
+                    "parent_revision": int(event["from_revision"]),
+                    "hypothesis_id": int(event["hypothesis_id"]),
+                    "revision_number": int(event["to_revision"]),
+                },
+            )
+
+            raw_data = event["event_data"]
+            if isinstance(raw_data, str):
+                try:
+                    event_data = json.loads(raw_data) if raw_data else {}
+                except json.JSONDecodeError:
+                    event_data = {}
+            elif isinstance(raw_data, dict):
+                event_data = raw_data
+            else:
+                event_data = {}
+
+            for signal_id in event_data.get("resolved_signal_ids", []) or []:
+                try:
+                    signal_id = int(signal_id)
+                except (TypeError, ValueError):
+                    continue
+                conn.execute(
+                    text(
+                        """
+                        UPDATE revision_signals
+                        SET resolution_status = 'resolved',
+                            resolved_by_candidate_id = COALESCE(resolved_by_candidate_id, :candidate_id),
+                            resolved_by_revision = COALESCE(resolved_by_revision, :revision_number),
+                            resolved_at = COALESCE(resolved_at, :resolved_at),
+                            resolution_note = CASE
+                                WHEN COALESCE(resolution_note, '') = '' THEN :note
+                                ELSE resolution_note
+                            END
+                        WHERE id = :signal_id
+                          AND hypothesis_id = :hypothesis_id
+                        """
+                    ),
+                    {
+                        "candidate_id": event["candidate_id"],
+                        "revision_number": int(event["to_revision"]),
+                        "resolved_at": event["created_at"] or datetime.now(),
+                        "note": f"backfilled_from_revision_event_RE#{int(event['id'])}",
+                        "signal_id": signal_id,
+                        "hypothesis_id": int(event["hypothesis_id"]),
+                    },
+                )
+
+
+def _sqlite_upgrade_proposal_normalization_versioning(engine: Engine) -> None:
+    """Replace the Phase 5.6 v1 source-only UNIQUE with source+version.
+
+    Existing PN rows, including failed v1 attempts, retain their ids and audit
+    payloads. The rebuild changes only the idempotency key so v2 can create a
+    new record for the same source proposal.
+    """
+    inspector = inspect(engine)
+    table_name = "proposal_normalization_records"
+    if table_name not in inspector.get_table_names():
+        return
+
+    unique_constraints = inspector.get_unique_constraints(table_name)
+    has_versioned_unique = any(
+        set(item.get("column_names") or [])
+        == {"source_proposal_id", "normalization_version"}
+        for item in unique_constraints
+    )
+    has_source_only_unique = any(
+        set(item.get("column_names") or []) == {"source_proposal_id"}
+        for item in unique_constraints
+    )
+    if has_versioned_unique and not has_source_only_unique:
+        return
+
+    backup = "proposal_normalization_records_v1_backup"
+    with engine.begin() as conn:
+        conn.execute(text("PRAGMA foreign_keys=OFF"))
+        conn.execute(text(f'DROP TABLE IF EXISTS "{backup}"'))
+        conn.execute(text(f'ALTER TABLE "{table_name}" RENAME TO "{backup}"'))
+
+        backup_inspector = inspect(conn)
+        for index in backup_inspector.get_indexes(backup):
+            name = index.get("name")
+            if name:
+                safe_name = str(name).replace('"', '""')
+                conn.execute(text(f'DROP INDEX IF EXISTS "{safe_name}"'))
+
+        ProposalNormalizationRecord.__table__.create(bind=conn, checkfirst=False)
+        conn.execute(
+            text(
+                f'''
+                INSERT INTO {table_name} (
+                    id,
+                    source_proposal_id,
+                    normalized_proposal_id,
+                    normalization_version,
+                    status,
+                    rule_count,
+                    source_signal_ids,
+                    reason,
+                    normalization_data,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    id,
+                    source_proposal_id,
+                    normalized_proposal_id,
+                    COALESCE(normalization_version, 1),
+                    status,
+                    rule_count,
+                    source_signal_ids,
+                    reason,
+                    normalization_data,
+                    created_at,
+                    updated_at
+                FROM "{backup}"
+                '''
+            )
+        )
+        conn.execute(text(f'DROP TABLE "{backup}"'))
+        conn.execute(text("PRAGMA foreign_keys=ON"))
+
+
 def migrate_v0_2_1(engine: Engine) -> None:
     """V0.2 -> V0.2.1 第一阶段迁移：Hypothesis revision-aware schema。
 
@@ -294,3 +484,5 @@ def migrate_v0_2_1(engine: Engine) -> None:
 
     _sqlite_rebuild_hypothesis_evidence(engine)
     _backfill_hypothesis_revisions(engine)
+    _backfill_revision_lineage_and_signal_resolution(engine)
+    _sqlite_upgrade_proposal_normalization_versioning(engine)

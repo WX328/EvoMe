@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.context.schema import sanitize_applicable_context
 from app.hypothesis.revision_signal import RevisionSignalService
+from app.hypothesis.revision_reconciliation import RevisionReconciliationService
 from app.hypothesis.service import HypothesisService
 from app.models import Experience, HypothesisEvidence, ReflectionRecord, RevisionSignal
 
@@ -50,6 +51,7 @@ class RevisionAggregationService:
         self.min_independent_signals = max(1, int(min_independent_signals))
         self.signal_service = RevisionSignalService(db)
         self.hypothesis_service = HypothesisService(db)
+        self.reconciliation_service = RevisionReconciliationService(db)
 
     @staticmethod
     def _stable_key(value: Any) -> str:
@@ -87,6 +89,16 @@ class RevisionAggregationService:
 
         buckets: dict[tuple[int, int, str, str, str], list[RevisionSignal]] = {}
         for signal in signals:
+            hypothesis = self.hypothesis_service.get(int(signal.hypothesis_id))
+            if hypothesis is None:
+                continue
+            current_revision = int(hypothesis.current_revision or hypothesis.revision or 1)
+            # Phase 5.4: only unresolved signals on the current head are eligible
+            # for fresh aggregation/analysis. Ancestor signals require revalidation.
+            if int(signal.base_revision) != current_revision:
+                continue
+            if str(signal.resolution_status or "open").lower() != "open":
+                continue
             key = (
                 int(signal.hypothesis_id),
                 int(signal.base_revision),
@@ -210,6 +222,9 @@ class RevisionAggregationService:
             },
             "confidence": stats["confidence"],
             "context_coverage": self._context_coverage(hypothesis_id, target_revision),
+            "revision_pressure": self.reconciliation_service.pressure_summary(
+                hypothesis_id, target_revision
+            ).to_dict(),
             "revision_groups": [group.to_dict() for group in groups],
             "analysis_candidates": [
                 {
