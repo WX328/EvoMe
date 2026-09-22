@@ -6,3 +6,5 @@ __pycache__/
 evome.db
 # Local Qdrant vector index
 evome_qdrant/
+patches/
+*.patch

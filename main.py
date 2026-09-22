@@ -376,6 +376,30 @@ def show_skills(runtime: EvoMeRuntime) -> None:
 
 
 
+def show_token_usage(runtime: EvoMeRuntime) -> None:
+    print("\n===== Token Usage (current process) =====")
+    summary = runtime.token_usage_summary()
+    totals = summary["totals"]
+    print(
+        f"calls={totals['calls']} prompt={totals['prompt_tokens']} "
+        f"completion={totals['completion_tokens']} total={totals['total_tokens']} "
+        f"reasoning={totals['reasoning_tokens']} visible={totals['visible_completion_tokens']} "
+        f"cached={totals['cached_tokens']} truncated={totals['truncated_calls']}"
+    )
+    rows = summary.get("by_purpose", [])
+    if not rows:
+        print("暂无 Token Usage")
+        return
+    for row in rows:
+        print(
+            f"- {row['purpose']}: calls={row['calls']} "
+            f"prompt={row['prompt_tokens']} completion={row['completion_tokens']} "
+            f"total={row['total_tokens']} reasoning={row['reasoning_tokens']} "
+            f"visible={row['visible_completion_tokens']} cached={row['cached_tokens']} "
+            f"truncated={row['truncated_calls']}"
+        )
+
+
 def show_background_status(runtime: EvoMeRuntime) -> None:
     print("\n===== Background Jobs =====")
     jobs = runtime.list_background_jobs(limit=10)
@@ -473,7 +497,7 @@ def main() -> None:
         "/revision-apply-auto  /candidate-approve <id>  /candidate-reject <id>  "
         "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
         "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
-        "/status  /audit  /skills  /exit\n"
+        "/status  /token-usage  /audit  /skills  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -655,6 +679,8 @@ def main() -> None:
                 show_learning_invalidations(runtime); continue
             if user_input == "/status":
                 show_background_status(runtime); continue
+            if user_input == "/token-usage":
+                show_token_usage(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
             if user_input == "/skills":

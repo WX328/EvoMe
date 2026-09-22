@@ -8,6 +8,18 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 EVOME_DB_URL = os.getenv("EVOME_DB_URL", "sqlite:///./evome.db")
 
+# Phase 5.7A: hard output caps for each LLM workload. These protect JSON
+# helpers from accidentally generating long responses while leaving the
+# user-facing stream comparatively generous.
+EVOME_MAX_TOKENS_CHAT = int(os.getenv("EVOME_MAX_TOKENS_CHAT", "4096"))
+EVOME_MAX_TOKENS_JSON_DEFAULT = int(os.getenv("EVOME_MAX_TOKENS_JSON_DEFAULT", "768"))
+EVOME_MAX_TOKENS_EVALUATION = int(os.getenv("EVOME_MAX_TOKENS_EVALUATION", "512"))
+EVOME_MAX_TOKENS_GATE = int(os.getenv("EVOME_MAX_TOKENS_GATE", "384"))
+EVOME_MAX_TOKENS_CONTEXT = int(os.getenv("EVOME_MAX_TOKENS_CONTEXT", "768"))
+EVOME_MAX_TOKENS_REFLECTION = int(os.getenv("EVOME_MAX_TOKENS_REFLECTION", "1024"))
+EVOME_MAX_TOKENS_RELATION = int(os.getenv("EVOME_MAX_TOKENS_RELATION", "1024"))
+EVOME_MAX_TOKENS_REVISION = int(os.getenv("EVOME_MAX_TOKENS_REVISION", "1200"))
+
 EVOME_QDRANT_PATH = os.getenv("EVOME_QDRANT_PATH", "./evome_qdrant")
 HYPOTHESIS_TOP_K = int(os.getenv("HYPOTHESIS_TOP_K", "5"))
 HYPOTHESIS_SCORE_THRESHOLD = float(os.getenv("HYPOTHESIS_SCORE_THRESHOLD", "0.60"))

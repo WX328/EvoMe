@@ -46,6 +46,7 @@ from app.hypothesis.revision_signal import RevisionSignalService
 from app.hypothesis.service import HypothesisService
 from app.learning.invalidation import LearningInvalidationService
 from app.llm import DeepSeekClient
+from app.telemetry import GLOBAL_TOKEN_USAGE
 from app.memory.service import PersonalMemoryService
 from app.models import CandidateRevision, RevisionProposal, StrategyHypothesis, StrategyRecord
 from app.reflection.service import ReflectionService
@@ -298,47 +299,24 @@ class EvoMeRuntime:
         }
 
     def run(self, user_input: str) -> dict:
-        """Legacy synchronous path retained for tests and batch callers."""
+        """Legacy synchronous path retained for tests and batch callers.
+
+        Phase 5.7A stops at RevisionSignal creation. Revision analysis, policy
+        normalization, candidate validation and auto-apply are explicit/batch jobs.
+        """
         state = self.strategy.invoke(user_input=user_input, session_id=self.session_id)
         eligibility = state.get("learning_eligibility", {})
-
+        state["revision_analysis_count"] = 0
+        state["revision_proposal_count"] = 0
+        state["proposal_normalization_count"] = 0
+        state["candidate_revision_count"] = 0
+        state["revision_auto_apply_count"] = 0
         if eligibility.get("allow_evolution"):
-            analysis_results = self.revision_analysis_service.analyze_pending(
-                max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
-            )
-            state["revision_analysis_count"] = len(analysis_results)
-            state["revision_proposal_count"] = sum(
-                1 for item in analysis_results if item.proposal is not None
-            )
-            normalization_results = self.policy_normalizer_service.normalize_pending(
-                max_normalizations=REVISION_CANDIDATE_MAX_PER_RUN
-            )
-            state["proposal_normalization_count"] = len(normalization_results)
-            candidate_results = self.candidate_revision_service.evaluate_pending(
-                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
-            )
-            state["candidate_revision_count"] = len(candidate_results)
-            commit_results = self.revision_commit_service.auto_apply_ready(
-                max_candidates=REVISION_AUTO_APPLY_MAX_PER_RUN
-            )
-            state["revision_auto_apply_count"] = len(commit_results)
-            for item in commit_results:
-                if item.event is not None:
-                    hypothesis = self.hypothesis_service.get(item.event.hypothesis_id)
-                    if hypothesis is not None:
-                        self.hypothesis_retriever.index(hypothesis)
-
             evaluation = state.get("evaluation", {})
-            score = float(evaluation.get("score", 0.0))
-            success = bool(evaluation.get("success", False))
-            self._record_strategy_result(score, success)
-        else:
-            state["revision_analysis_count"] = 0
-            state["revision_proposal_count"] = 0
-            state["proposal_normalization_count"] = 0
-            state["candidate_revision_count"] = 0
-            state["revision_auto_apply_count"] = 0
-
+            self._record_strategy_result(
+                float(evaluation.get("score", 0.0)),
+                bool(evaluation.get("success", False)),
+            )
         return self._result_from_state(state, strategy_name=self.strategy_full_name)
 
     def _process_revision_analysis_job(self) -> dict[str, Any]:
@@ -523,76 +501,24 @@ class EvoMeRuntime:
             state = strategy.process_slow_state(dict(payload))
             eligibility = state.get("learning_eligibility", {})
 
-            if not eligibility.get("allow_evolution"):
-                state["revision_analysis_count"] = 0
-                state["revision_proposal_count"] = 0
-                state["proposal_normalization_count"] = 0
-                state["candidate_revision_count"] = 0
-                state["revision_auto_apply_count"] = 0
-                return self._result_from_state(
-                    state,
-                    strategy_name=f"{strategy.name}_v{strategy.version}",
+            # Phase 5.7A: a user turn may create Experience/Reflection/Hypothesis/
+            # RevisionSignal, but it never drains the global revision backlog.
+            # Heavy work remains available through explicit queue commands.
+            state["revision_analysis_count"] = 0
+            state["revision_proposal_count"] = 0
+            state["proposal_normalization_count"] = 0
+            state["candidate_revision_count"] = 0
+            state["revision_auto_apply_count"] = 0
+
+            if eligibility.get("allow_evolution"):
+                evaluation = state.get("evaluation", {})
+                self._record_strategy_result_for_session(
+                    db,
+                    strategy_name=strategy.name,
+                    strategy_version=strategy.version,
+                    score=float(evaluation.get("score", 0.0)),
+                    success=bool(evaluation.get("success", False)),
                 )
-
-            # Phase 4 stays entirely on the Slow Path. Only deterministic
-            # analysis candidates are considered, and unchanged candidate
-            # fingerprints are never sent to the LLM twice.
-            revision_analysis_service = RevisionAnalysisService(
-                db,
-                llm,
-                min_independent_signals=REVISION_ANALYSIS_MIN_INDEPENDENT_SIGNALS,
-            )
-            analysis_results = revision_analysis_service.analyze_pending(
-                max_analyses=REVISION_ANALYSIS_MAX_PER_RUN
-            )
-            state["revision_analysis_count"] = len(analysis_results)
-            state["revision_proposal_count"] = sum(
-                1 for item in analysis_results if item.proposal is not None
-            )
-
-            normalizer = ProposalPolicyNormalizer(db, llm)
-            normalization_results = normalizer.normalize_pending(
-                max_normalizations=REVISION_CANDIDATE_MAX_PER_RUN
-            )
-            state["proposal_normalization_count"] = len(normalization_results)
-
-            candidate_service = CandidateRevisionService(
-                db,
-                llm,
-                max_evidence=REVISION_CANDIDATE_MAX_EVIDENCE,
-            )
-            candidate_results = candidate_service.evaluate_pending(
-                max_candidates=REVISION_CANDIDATE_MAX_PER_RUN
-            )
-            state["candidate_revision_count"] = len(candidate_results)
-
-            commit_service = RevisionCommitService(
-                db,
-                auto_min_utility=REVISION_AUTO_APPLY_MIN_UTILITY,
-                auto_budget_hours=REVISION_AUTO_APPLY_BUDGET_HOURS,
-                auto_per_hypothesis=REVISION_AUTO_APPLY_PER_HYPOTHESIS,
-            )
-            commit_results = commit_service.auto_apply_ready(
-                max_candidates=REVISION_AUTO_APPLY_MAX_PER_RUN
-            )
-            state["revision_auto_apply_count"] = len(commit_results)
-            for item in commit_results:
-                if item.event is None:
-                    continue
-                hypothesis = db.get(StrategyHypothesis, item.event.hypothesis_id)
-                if hypothesis is not None:
-                    retriever.index(hypothesis)
-
-            evaluation = state.get("evaluation", {})
-            score = float(evaluation.get("score", 0.0))
-            success = bool(evaluation.get("success", False))
-            self._record_strategy_result_for_session(
-                db,
-                strategy_name=strategy.name,
-                strategy_version=strategy.version,
-                score=score,
-                success=success,
-            )
             return self._result_from_state(
                 state,
                 strategy_name=f"{strategy.name}_v{strategy.version}",
@@ -646,6 +572,9 @@ class EvoMeRuntime:
             "background_status": "queued",
             "relevant_memory_count": len(state.get("relevant_memories", [])),
         }
+
+    def token_usage_summary(self) -> dict[str, Any]:
+        return GLOBAL_TOKEN_USAGE.summary()
 
     def enqueue_revision_analysis(self) -> str | None:
         """Queue Phase 4 analysis explicitly; useful for operator/testing workflows."""

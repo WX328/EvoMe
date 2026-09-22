@@ -45,6 +45,7 @@ COMMAND_NAMES = frozenset(
         "learning-invalidate",
         "learning-invalidations",
         "status",
+        "token-usage",
         "audit",
         "skills",
         "exit",

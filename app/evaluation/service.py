@@ -2,22 +2,16 @@ from typing import Any
 
 
 EVALUATION_PROMPT = '''
-你是 EvoMe 的 Evaluator。
+你是 EvoMe 的 Evaluator。只做紧凑评分，不复述用户问题或回答，不展开推理。
 
-评估这次响应是否真正帮助了用户。
-只输出 JSON：
-{
-  "score": 0.0,
-  "success": false,
-  "reason": ""
-}
+只输出一个 JSON 对象，只允许三个键：
+{"score":0.0,"success":false,"reason":""}
 
-score 范围 0~1。
-当前 V0.1 没有外部自动测试时，使用以下标准：
-- 是否直接回应用户意图
-- 是否利用了真正相关的历史 Memory
-- 是否没有把历史推测成当前事实
-- 是否具体、可执行
+规则：
+- score 范围 0~1。
+- reason 最多 60 个汉字，只写一条最关键依据。
+- 禁止额外字段、Markdown、前后说明。
+- 评估：是否直接回应意图；是否正确使用相关 Memory；是否把推测当事实；是否具体可执行。
 '''
 
 

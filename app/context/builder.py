@@ -15,45 +15,22 @@ from app.context.schema import (
 
 CONTEXT_BUILDER_PROMPT = """
 MODULE: CONTEXT_BUILDER
-你是 EvoMe 的 Context Builder。
-你的任务不是回答用户，而是把当前任务环境结构化。
+把当前任务环境压缩成结构化 Context。只输出 JSON，不解释、不复述输入、不输出 Markdown。
 
-必须遵守：
-1. 只从当前输入和给出的历史上下文中提取，不臆测用户心理状态。
-2. 当前用户明确输入优先于历史信息。
-3. 不确定时使用 unknown。
-4. task_type 必须从固定枚举中选一个：
-   qa / debugging / coding / architecture_design / project_planning /
-   learning / research / decision_support / execution / other
-5. interaction_mode 必须从：direct / collaborative / teaching / exploratory 中选一个。
-6. complexity/risk 只返回用于规则计算的布尔指标，不直接决定最终等级。
+固定枚举：
+- task_type: qa / debugging / coding / architecture_design / project_planning / learning / research / decision_support / execution / other
+- interaction_mode: direct / collaborative / teaching / exploratory
 
-严格 JSON：
-{
-  "task_type": "other",
-  "task_type_confidence": 0.8,
-  "interaction_mode": "direct",
-  "interaction_mode_confidence": 0.8,
-  "explicit_instruction": "",
-  "project_name": "unknown",
-  "project_name_confidence": 0.5,
-  "project_stage": "unknown",
-  "project_stage_confidence": 0.5,
-  "complexity_indicators": {
-    "multi_step": false,
-    "ambiguity": false,
-    "cross_module": false,
-    "external_tool": false,
-    "long_term_state": false,
-    "tradeoff": false
-  },
-  "risk_indicators": {
-    "destructive_change": false,
-    "external_side_effect": false,
-    "security_sensitive": false,
-    "irreversible": false
-  }
-}
+规则：
+- 当前明确输入优先于历史；不确定用 unknown。
+- explicit_instruction 最多 80 个汉字；没有则空字符串。
+- project_name / project_stage 最多 30 个汉字；不确定用 unknown。
+- confidence 仅 0~1 数字。
+- complexity_indicators / risk_indicators 只填布尔值。
+- 禁止新增 reason / rationale / analysis 等字段。
+
+严格输出：
+{"task_type":"other","task_type_confidence":0.8,"interaction_mode":"direct","interaction_mode_confidence":0.8,"explicit_instruction":"","project_name":"unknown","project_name_confidence":0.5,"project_stage":"unknown","project_stage_confidence":0.5,"complexity_indicators":{"multi_step":false,"ambiguity":false,"cross_module":false,"external_tool":false,"long_term_state":false,"tradeoff":false},"risk_indicators":{"destructive_change":false,"external_side_effect":false,"security_sensitive":false,"irreversible":false}}
 """
 
 
