@@ -128,29 +128,52 @@ class HypothesisAggregator:
                 StrategyHypothesis,
             ]
         ] = []
+
+        # Phase 5.7B.1: retrieve first, then judge all viable candidates in one
+        # compact LLM call. This replaces the old O(N) per-hypothesis loop.
+        candidates: list[tuple[StrategyHypothesis, dict[str, Any]]] = []
         for match in matches:
             hypothesis = self.service.get(match.hypothesis_id)
             if hypothesis is None or hypothesis.status not in {
                 "observing", "ready_for_review", "needs_revision", "needs_revalidation"
             }:
                 continue
-            decision = self.relation_judge.judge(
-                reflection_payload=self._reflection_payload(reflection),
-                hypothesis_payload=self._hypothesis_payload(hypothesis),
+            candidates.append((hypothesis, self._hypothesis_payload(hypothesis)))
+
+        invalid_related_decisions: list[tuple[StrategyHypothesis, dict[str, Any]]] = []
+        if candidates:
+            reflection_payload = self._reflection_payload(reflection)
+            decisions = self.relation_judge.judge_batch(
+                reflection_payload=reflection_payload,
+                hypothesis_payloads=[payload for _, payload in candidates],
             )
-            relation = decision["relation"]
-            confidence = float(decision["confidence"])
-            if relation == "UNRELATED" or confidence < self.min_relation_confidence:
-                continue
-            judged.append(
-                (
-                    confidence,
-                    relation,
-                    decision["reason"],
-                    list(decision.get("revision_signals") or []),
-                    hypothesis,
+            decision_by_id = {
+                int(item["hypothesis_id"]): item
+                for item in decisions
+                if item.get("hypothesis_id") is not None
+            }
+
+            for hypothesis, _ in candidates:
+                decision = decision_by_id.get(hypothesis.id)
+                if decision is None:
+                    continue
+                relation = decision["relation"]
+                confidence = float(decision["confidence"])
+                if not bool(decision.get("decision_valid", True)):
+                    if relation != "UNRELATED":
+                        invalid_related_decisions.append((hypothesis, decision))
+                    continue
+                if relation == "UNRELATED" or confidence < self.min_relation_confidence:
+                    continue
+                judged.append(
+                    (
+                        confidence,
+                        relation,
+                        decision["reason"],
+                        list(decision.get("revision_signals") or []),
+                        hypothesis,
+                    )
                 )
-            )
 
         if judged:
             confidence, relation, reason, raw_revision_signals, hypothesis = max(
@@ -182,6 +205,28 @@ class HypothesisAggregator:
                 "relation": relation,
                 "relation_confidence": confidence,
                 "revision_signal_count": len(created_signals),
+            }
+
+        # Fail closed when the judge says an existing hypothesis needs
+        # refinement but cannot produce a valid atomic RevisionSignal. Creating
+        # a duplicate hypothesis or recording REFINES-without-signal would both
+        # corrupt evidence semantics. The Reflection remains persisted and can
+        # be re-evaluated later.
+        if invalid_related_decisions:
+            hypothesis, decision = max(
+                invalid_related_decisions,
+                key=lambda item: float(item[1].get("confidence", 0.0)),
+            )
+            return {
+                "action": "skipped_invalid_relation",
+                "hypothesis_id": hypothesis.id,
+                "relation": decision.get("relation", "REFINES"),
+                "relation_confidence": float(decision.get("confidence", 0.0)),
+                "revision_signal_count": 0,
+                "reason": str(
+                    decision.get("invalid_reason")
+                    or "related relation decision failed semantic validation"
+                ),
             }
 
         hypothesis = self.service.create_from_reflection(

@@ -1,67 +1,269 @@
 from __future__ import annotations
+
+import json
 from typing import Any
+
 from app.hypothesis.signal_quality import normalize_revision_signal
 
 RELATIONS = {"SUPPORTS", "REFINES", "CONFLICTS", "UNRELATED"}
 
-RELATION_JUDGE_PROMPT = """
+BATCH_RELATION_JUDGE_PROMPT = """
 MODULE: HYPOTHESIS_RELATION_JUDGE
-你是 EvoMe 的 Strategy Hypothesis Relation Judge。
-判断“新的 Reflection”与“已有 Strategy Hypothesis 当前 Revision”的语义关系。
+Compare one new Reflection with the current revisions of several Strategy Hypotheses.
+Return one compact decision per hypothesis. Do not explain outside JSON.
 
-只能选择：SUPPORTS / REFINES / CONFLICTS / UNRELATED。
-- SUPPORTS：当前 WHEN/DO/EXPECT 已覆盖新证据，不需要修改。
-- REFINES：核心规律相关，但新证据要求扩展、收窄或修正当前 WHEN/DO/EXPECT。
-- CONFLICTS：相近 Context 下出现反证。
-- UNRELATED：不是同一行为规律。
+Relations:
+- SUPPORTS: current WHEN/DO/EXPECT already covers the evidence.
+- REFINES: same core rule, but evidence requires a local WHEN/DO/EXPECT change.
+- CONFLICTS: counter-evidence in a comparable context.
+- UNRELATED: different behavioral rule.
 
-当且仅当 relation=REFINES 时输出 revision_signals。每个 Signal 只表达一个局部变化，禁止把多个动作或多个 Outcome 塞进同一 Signal。
+If relation=REFINES, revision_signals MUST contain 1-5 atomic, evidence-grounded local changes.
+If you cannot formulate at least one valid local change, choose SUPPORTS or UNRELATED instead; never emit REFINES with an empty revision_signals array.
+Otherwise revision_signals must be []. Maximum 5 signals per hypothesis.
 
-固定 target_field taxonomy：
-CONTEXT: task_type / complexity / risk_level / interaction_mode / project_stage / cross_module / multi_step / tradeoff / ambiguity / long_term_state / explicit_instruction_present / scope_bounded
-ACTION: workflow_structure / response_structure / scope_alignment / verification_step / tool_usage / memory_usage / boundary_handling / data_flow_handling / error_handling
-OUTCOME: clarity / executability / correctness / efficiency / boundary_consistency / scope_drift / responsibility_confusion / evaluation_performance / user_satisfaction
-ABSTRACTION: context_scope / action_scope / outcome_scope / hypothesis_scope
+Stable target_field taxonomy:
+CONTEXT: task_type, complexity, risk_level, interaction_mode, project_stage, cross_module, multi_step, tradeoff, ambiguity, long_term_state, explicit_instruction_present, scope_bounded
+ACTION: workflow_structure, response_structure, scope_alignment, verification_step, tool_usage, memory_usage, boundary_handling, data_flow_handling, error_handling
+OUTCOME: clarity, executability, correctness, efficiency, boundary_consistency, scope_drift, responsibility_confusion, evaluation_performance, user_satisfaction
+ABSTRACTION: context_scope, action_scope, outcome_scope, hypothesis_scope
 
-禁止使用 applicable_context、do_data.text、expect_data.text 等宽泛字段。
-禁止把 available_skills / available_tools / model / memory_quality / relevant_memory_count 当作 CONTEXT Revision，它们属于 Execution Context。
+Operation compatibility:
+CONTEXT=EXPAND/NARROW/ADD_CONDITION/REMOVE_CONDITION/CHANGE;
+ACTION=EXPAND/CHANGE/GENERALIZE/SPECIALIZE;
+OUTCOME=EXPAND/NARROW/CHANGE;
+ABSTRACTION=GENERALIZE/SPECIALIZE.
 
-operation 必须同时符合 dimension 的兼容矩阵：
-- CONTEXT: EXPAND / NARROW / ADD_CONDITION / REMOVE_CONDITION / CHANGE
-- ACTION: EXPAND / CHANGE / GENERALIZE / SPECIALIZE
-- OUTCOME: EXPAND / NARROW / CHANGE
-- ABSTRACTION: GENERALIZE / SPECIALIZE
-例如“给执行流程增加一步”属于 ACTION/EXPAND，不要写 ACTION/ADD_CONDITION。
-before_data 写当前 Hypothesis 里的现有值；observed_data 只写这条 Reflection 真正观察到的新信息；不得提前生成最终 after。
-CONTEXT 特别保守：不要因为某次成功交互“恰好”是 low/high complexity、direct/collaborative 或 low/high risk，就扩展 Hypothesis 的适用边界。只有用户明确把这些条件说成适用范围/偏好条件时，才输出对应 CONTEXT signal。
-user_satisfaction 只有存在明确用户反馈时才允许输出；不得从 evaluator score 推断。
-最多输出 5 条原子 Signal。relation 不是 REFINES 时 revision_signals 必须为空数组。
+Do not turn execution facts (skills/tools/model/memory quality) into applicability context.
+Do not expand complexity/risk/interaction_mode merely because one turn happened under that condition.
+An explicit user preference about answer/order/format is normally an ACTION change; use response_structure when the evidence is specifically about presentation order or answer structure.
+user_satisfaction requires explicit user feedback. before_data must reflect the current hypothesis;
+observed_data must contain only newly observed evidence; never invent final after-data.
+Keep reason under 60 Chinese characters or equivalent.
 
-严格 JSON：
-{"relation":"REFINES","confidence":0.9,"reason":"","revision_signals":[{"dimension":"CONTEXT","operation":"EXPAND","target_field":"complexity","before_data":["high"],"observed_data":["medium"],"canonical_change":"complexity: high -> include observed medium","confidence":0.88}]}
+Strict JSON:
+{"decisions":[{"hypothesis_id":1,"relation":"SUPPORTS","confidence":0.9,"reason":"","revision_signals":[]}]}
 """
 
+
 def _clamp_confidence(value: Any, default: float = 0.5) -> float:
-    try: parsed=float(value)
-    except (TypeError,ValueError): parsed=default
-    return max(0.0,min(1.0,parsed))
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, min(1.0, parsed))
+
+
+def _compact_value(value: Any, *, depth: int = 0) -> Any:
+    """Remove provenance/telemetry noise before sending hypothesis semantics to the LLM."""
+    if depth >= 4:
+        return "..."
+    if isinstance(value, str):
+        return value if len(value) <= 400 else value[:397] + "..."
+    if isinstance(value, list):
+        return [_compact_value(item, depth=depth + 1) for item in value[:8]]
+    if isinstance(value, dict):
+        ignored = {
+            "source_signal_ids",
+            "provenance",
+            "provenance_data",
+            "field_meta",
+            "metadata",
+            "raw_evaluator_output",
+        }
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key) in ignored:
+                continue
+            result[str(key)] = _compact_value(item, depth=depth + 1)
+            if len(result) >= 12:
+                break
+        return result
+    return value
+
+
+def _compact_reflection(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "insight": _compact_value(payload.get("insight", "")),
+        "context": _compact_value(payload.get("applicable_context") or {}),
+        "change": _compact_value(payload.get("proposed_change", "")),
+        "effect": _compact_value(payload.get("expected_effect", "")),
+        "user_feedback": _compact_value(payload.get("user_feedback", "")),
+    }
+
+
+def _compact_hypothesis(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": payload.get("id"),
+        "revision": payload.get("revision"),
+        "when": _compact_value(
+            payload.get("when_data") or payload.get("applicable_context") or {}
+        ),
+        "do": _compact_value(
+            payload.get("do_data")
+            if payload.get("do_data") is not None
+            else payload.get("proposed_change", "")
+        ),
+        "expect": _compact_value(
+            payload.get("expect_data")
+            if payload.get("expect_data") is not None
+            else payload.get("expected_effect", "")
+        ),
+    }
+
 
 class HypothesisRelationJudge:
-    def __init__(self,llm)->None: self.llm=llm
-    def judge(self,*,reflection_payload:dict[str,Any],hypothesis_payload:dict[str,Any])->dict[str,Any]:
-        result=self.llm.json_chat([
-            {"role":"system","content":RELATION_JUDGE_PROMPT},
-            {"role":"user","content":f"New Reflection：\n{reflection_payload}\n\nExisting Hypothesis：\n{hypothesis_payload}"},
-        ],temperature=0.0)
-        relation=str(result.get("relation","UNRELATED")).strip().upper()
-        if relation not in RELATIONS: relation="UNRELATED"
-        raw_signals=result.get("revision_signals")
-        if raw_signals is None and result.get("revision_signal") is not None: raw_signals=[result.get("revision_signal")]
-        if not isinstance(raw_signals,list): raw_signals=[]
-        revision_signals=[]; rejected=[]
-        if relation=="REFINES":
+    def __init__(self, llm) -> None:
+        self.llm = llm
+
+    @staticmethod
+    def _normalize_decision(
+        raw: dict[str, Any],
+        *,
+        reflection_payload: dict[str, Any],
+        hypothesis_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        relation = str(raw.get("relation", "UNRELATED")).strip().upper()
+        if relation not in RELATIONS:
+            relation = "UNRELATED"
+
+        raw_signals = raw.get("revision_signals")
+        if raw_signals is None and raw.get("revision_signal") is not None:
+            raw_signals = [raw.get("revision_signal")]
+        if not isinstance(raw_signals, list):
+            raw_signals = []
+
+        revision_signals: list[dict[str, Any]] = []
+        rejected: list[str] = []
+        if relation == "REFINES":
             for item in raw_signals[:5]:
-                normalized,reason=normalize_revision_signal(item,reflection_payload=reflection_payload,hypothesis_payload=hypothesis_payload)
-                if normalized is not None: revision_signals.append(normalized)
-                else: rejected.append(reason)
-        return {"relation":relation,"confidence":_clamp_confidence(result.get("confidence",0.5)),"reason":str(result.get("reason","")).strip(),"revision_signals":revision_signals,"rejected_revision_signal_reasons":rejected}
+                normalized, reason = normalize_revision_signal(
+                    item,
+                    reflection_payload=reflection_payload,
+                    hypothesis_payload=hypothesis_payload,
+                )
+                if normalized is not None:
+                    revision_signals.append(normalized)
+                else:
+                    rejected.append(reason)
+
+        decision_valid = not (relation == "REFINES" and not revision_signals)
+        invalid_reason = ""
+        if not decision_valid:
+            invalid_reason = (
+                "REFINES requires at least one valid atomic revision_signal"
+            )
+            if rejected:
+                invalid_reason += ": " + "; ".join(rejected[:3])
+
+        return {
+            "hypothesis_id": hypothesis_payload.get("id"),
+            "relation": relation,
+            "confidence": _clamp_confidence(raw.get("confidence", 0.5)),
+            "reason": str(raw.get("reason", "")).strip(),
+            "revision_signals": revision_signals,
+            "rejected_revision_signal_reasons": rejected,
+            "decision_valid": decision_valid,
+            "invalid_reason": invalid_reason,
+        }
+
+    def judge_batch(
+        self,
+        *,
+        reflection_payload: dict[str, Any],
+        hypothesis_payloads: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not hypothesis_payloads:
+            return []
+
+        payload_by_id = {
+            int(item["id"]): item
+            for item in hypothesis_payloads
+            if item.get("id") is not None
+        }
+        prompt_payload = {
+            "reflection": _compact_reflection(reflection_payload),
+            "hypotheses": [
+                _compact_hypothesis(item)
+                for item in hypothesis_payloads
+                if item.get("id") is not None
+            ],
+        }
+        result = self.llm.json_chat(
+            [
+                {"role": "system", "content": BATCH_RELATION_JUDGE_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        prompt_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                },
+            ],
+            temperature=0.0,
+        )
+        if not isinstance(result, dict):
+            result = {}
+
+        raw_decisions = result.get("decisions")
+        # Backward-compatible adapter for tests/custom LLMs that still return
+        # the old single-candidate shape.
+        if not isinstance(raw_decisions, list):
+            if len(payload_by_id) == 1 and "relation" in result:
+                only_id = next(iter(payload_by_id))
+                raw_decisions = [{**result, "hypothesis_id": only_id}]
+            else:
+                raw_decisions = []
+
+        decisions: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for raw in raw_decisions:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                hypothesis_id = int(raw.get("hypothesis_id"))
+            except (TypeError, ValueError):
+                continue
+            if hypothesis_id not in payload_by_id or hypothesis_id in seen:
+                continue
+            seen.add(hypothesis_id)
+            decisions.append(
+                self._normalize_decision(
+                    raw,
+                    reflection_payload=reflection_payload,
+                    hypothesis_payload=payload_by_id[hypothesis_id],
+                )
+            )
+        return decisions
+
+    def judge(
+        self,
+        *,
+        reflection_payload: dict[str, Any],
+        hypothesis_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        # The legacy single-candidate API historically accepted semantic
+        # payloads without a persisted hypothesis id. Give only that adapter a
+        # private sentinel so the strict batch API can still correlate results.
+        batch_payload = hypothesis_payload
+        if hypothesis_payload.get("id") is None:
+            batch_payload = {**hypothesis_payload, "id": 0}
+        decisions = self.judge_batch(
+            reflection_payload=reflection_payload,
+            hypothesis_payloads=[batch_payload],
+        )
+        if decisions:
+            result = dict(decisions[0])
+            result.pop("hypothesis_id", None)
+            return result
+        return {
+            "relation": "UNRELATED",
+            "confidence": 0.0,
+            "reason": "relation judge returned no valid decision",
+            "revision_signals": [],
+            "rejected_revision_signal_reasons": [],
+            "decision_valid": False,
+            "invalid_reason": "relation judge returned no valid decision",
+        }

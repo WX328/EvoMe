@@ -107,7 +107,28 @@ class ContextBuilder:
             ],
             temperature=0.0,
         )
+        return self.normalize_result(
+            user_input=user_input,
+            result=result,
+            relevant_memories=relevant_memories,
+            available_skills=available_skills,
+            available_tools=available_tools,
+            memory_quality=memory_quality,
+            task_type_hint=task_type_hint,
+        )
 
+    def normalize_result(
+        self,
+        *,
+        user_input: str,
+        result: dict[str, Any] | None,
+        relevant_memories: list[str],
+        available_skills: list[str],
+        available_tools: list[str] | None = None,
+        memory_quality: float = 0.0,
+        task_type_hint: str | None = None,
+    ) -> dict[str, Any]:
+        result = result if isinstance(result, dict) else {}
         explicit_mode = self._explicit_mode(user_input)
         inferred_mode = normalize_enum(
             result.get("interaction_mode"), INTERACTION_MODES, "direct"

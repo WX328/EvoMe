@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.prompt_utils import compact_for_prompt
+
 
 EXPERIENCE_GATE_PROMPT = """
 你是 EvoMe 的 Experience Gate。
@@ -305,7 +307,7 @@ class ExperienceGate:
                     "role": "user",
                     "content": (
                         f"用户输入：\n{user_input}\n\n"
-                        f"EvoMe 回复：\n{assistant_response}\n\n"
+                        f"EvoMe 回复：\n{compact_for_prompt(assistant_response)}\n\n"
                         f"Strategy：{strategy_name}\n"
                         f"Skills：{skills_used}\n"
                         f"Evaluation：{evaluation}"

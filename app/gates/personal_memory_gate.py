@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import re
 from typing import Any
 
 
@@ -32,10 +35,118 @@ PERSONAL_MEMORY_GATE_PROMPT = """
 
 
 class PersonalMemoryGate:
+    """Hybrid gate: deterministic for explicit durable preferences, LLM otherwise."""
+
+    _DURABLE_PREFERENCE_MARKERS = (
+        "以后给我",
+        "你以后给我",
+        "今后给我",
+        "以后帮我",
+        "今后帮我",
+        "以后默认",
+        "今后默认",
+        "默认按",
+        "默认先",
+        "我更喜欢",
+        "这样我更容易",
+        "我更容易理解",
+        "这样更适合我",
+        "对我更有帮助",
+        "以后都",
+        "今后都",
+    )
+    _TESTING_MARKERS = (
+        "这只是测试",
+        "只是测试",
+        "不是真的",
+        "假设我",
+        "模拟用户",
+        "测试记忆",
+        "mock data",
+        "synthetic data",
+        "test only",
+    )
+    _NO_STORE_MARKERS = (
+        "不要记住",
+        "别记住",
+        "不要保存",
+        "别保存",
+        "不用记住",
+        "不用保存",
+    )
+    _AMBIGUOUS_NEGATION_MARKERS = (
+        "不是说",
+        "并不是",
+        "不代表",
+    )
+
     def __init__(self, llm):
         self.llm = llm
 
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    @classmethod
+    def _contains_any(cls, text: str, markers: tuple[str, ...]) -> bool:
+        lowered = text.lower()
+        return any(marker.lower() in lowered for marker in markers)
+
+    @classmethod
+    def _deterministic_extract(cls, user_input: str) -> dict[str, Any] | None:
+        text = cls._normalize(user_input)
+        if not text:
+            return {"should_save": False, "memories": [], "decision_source": "deterministic_hard_skip"}
+
+        if cls._contains_any(text, cls._TESTING_MARKERS) or cls._contains_any(
+            text, cls._NO_STORE_MARKERS
+        ):
+            return {
+                "should_save": False,
+                "memories": [],
+                "decision_source": "deterministic_hard_skip",
+            }
+
+        # Negated/contrastive wording can reverse the apparent preference.
+        # Leave those cases to the semantic gate instead of guessing.
+        if cls._contains_any(text, cls._AMBIGUOUS_NEGATION_MARKERS):
+            return None
+
+        durable_preference = cls._contains_any(text, cls._DURABLE_PREFERENCE_MARKERS)
+        if not durable_preference:
+            lowered = text.lower()
+            has_future = ("以后" in lowered) or ("今后" in lowered)
+            has_user_reference = any(
+                marker in lowered for marker in ("给我", "帮我", "我更", "对我", "我希望")
+            )
+            has_preference_shape = any(
+                marker in lowered for marker in ("先", "默认", "更容易", "更喜欢", "都")
+            )
+            durable_preference = has_future and has_user_reference and has_preference_shape
+
+        if not durable_preference:
+            return None
+
+        # Preserve the user's own wording instead of asking an LLM to paraphrase
+        # it. This avoids hallucinated detail and makes provenance obvious.
+        return {
+            "should_save": True,
+            "memories": [
+                {
+                    "memory_type": "preference",
+                    "content": text[:500],
+                    "importance": 0.9,
+                    "confidence": 1.0,
+                }
+            ],
+            "decision_source": "deterministic_explicit_preference",
+        }
+
     def extract(self, user_input: str) -> dict[str, Any]:
+        deterministic = self._deterministic_extract(user_input)
+        if deterministic is not None:
+            return deterministic
+
         result = self.llm.json_chat(
             [
                 {"role": "system", "content": PERSONAL_MEMORY_GATE_PROMPT},
@@ -63,4 +174,5 @@ class PersonalMemoryGate:
         return {
             "should_save": bool(result.get("should_save", False)) and bool(memories),
             "memories": memories,
+            "decision_source": "llm",
         }

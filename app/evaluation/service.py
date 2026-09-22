@@ -19,6 +19,19 @@ class EvaluationService:
     def __init__(self, llm):
         self.llm = llm
 
+    @staticmethod
+    def normalize_result(result: dict[str, Any] | None) -> dict[str, Any]:
+        result = result if isinstance(result, dict) else {}
+        try:
+            score = max(0.0, min(1.0, float(result.get("score", 0.5))))
+        except (TypeError, ValueError):
+            score = 0.5
+        return {
+            "score": score,
+            "success": bool(result.get("success", score >= 0.7)),
+            "reason": str(result.get("reason", "")).strip()[:240],
+        }
+
     def evaluate(
         self,
         *,
@@ -39,10 +52,4 @@ class EvaluationService:
         ]
 
         result = self.llm.json_chat(messages)
-
-        score = max(0.0, min(1.0, float(result.get("score", 0.5))))
-        return {
-            "score": score,
-            "success": bool(result.get("success", score >= 0.7)),
-            "reason": str(result.get("reason", "")).strip(),
-        }
+        return self.normalize_result(result)

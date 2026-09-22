@@ -17,8 +17,21 @@ EVOME_MAX_TOKENS_EVALUATION = int(os.getenv("EVOME_MAX_TOKENS_EVALUATION", "512"
 EVOME_MAX_TOKENS_GATE = int(os.getenv("EVOME_MAX_TOKENS_GATE", "384"))
 EVOME_MAX_TOKENS_CONTEXT = int(os.getenv("EVOME_MAX_TOKENS_CONTEXT", "768"))
 EVOME_MAX_TOKENS_REFLECTION = int(os.getenv("EVOME_MAX_TOKENS_REFLECTION", "1024"))
+EVOME_MAX_TOKENS_POST_TURN = int(os.getenv("EVOME_MAX_TOKENS_POST_TURN", "1200"))
 EVOME_MAX_TOKENS_RELATION = int(os.getenv("EVOME_MAX_TOKENS_RELATION", "1024"))
 EVOME_MAX_TOKENS_REVISION = int(os.getenv("EVOME_MAX_TOKENS_REVISION", "1200"))
+
+# Phase 5.7C: bound how much of an assistant response is embedded into internal
+# JSON-helper prompts. The post-turn assessor and the experience gate only need
+# enough of the response to judge intent and outcome.
+EVOME_PROMPT_RESPONSE_CHAR_LIMIT = int(
+    os.getenv("EVOME_PROMPT_RESPONSE_CHAR_LIMIT", "1200")
+)
+
+# Phase 5.7C: slow-loop cadence. The slow evolution path is submitted on every
+# user turn by default. Setting this above 1 runs it only every Nth turn,
+# trading learning frequency for token cost. 1 = current behavior.
+EVOME_SLOW_LOOP_EVERY_N_TURNS = int(os.getenv("EVOME_SLOW_LOOP_EVERY_N_TURNS", "1"))
 
 EVOME_QDRANT_PATH = os.getenv("EVOME_QDRANT_PATH", "./evome_qdrant")
 HYPOTHESIS_TOP_K = int(os.getenv("HYPOTHESIS_TOP_K", "5"))

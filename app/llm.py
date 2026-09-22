@@ -14,6 +14,7 @@ from app.config import (
     EVOME_MAX_TOKENS_GATE,
     EVOME_MAX_TOKENS_JSON_DEFAULT,
     EVOME_MAX_TOKENS_REFLECTION,
+    EVOME_MAX_TOKENS_POST_TURN,
     EVOME_MAX_TOKENS_RELATION,
     EVOME_MAX_TOKENS_REVISION,
 )
@@ -40,9 +41,11 @@ class DeepSeekClient:
         markers = (
             ("learning_eligibility_gate", "learning_eligibility"),
             ("personal memory gate", "personal_memory_gate"),
+            ("evome 的 experience gate", "experience_gate"),
             ("evoMe 的 evaluator".lower(), "evaluation"),
             ("context_builder", "context_builder"),
             ("module: reflection", "reflection"),
+            ("module: post_turn_assessor", "post_turn_assessor"),
             ("hypothesis_relation_judge", "relation_judge"),
             ("proposed hypothesis revision", "revision_analysis"),
             ("candidate revision", "candidate_validation"),
@@ -76,6 +79,8 @@ class DeepSeekClient:
             return EVOME_MAX_TOKENS_CONTEXT
         if purpose == "reflection":
             return EVOME_MAX_TOKENS_REFLECTION
+        if purpose == "post_turn_assessor":
+            return EVOME_MAX_TOKENS_POST_TURN
         if purpose == "relation_judge":
             return EVOME_MAX_TOKENS_RELATION
         if purpose in {

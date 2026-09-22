@@ -11,6 +11,7 @@ from app.background import BackgroundEvolutionQueue
 from app.config import (
     DEEPSEEK_MODEL,
     EVOME_QDRANT_PATH,
+    EVOME_SLOW_LOOP_EVERY_N_TURNS,
     HYPOTHESIS_RELATION_CONFIDENCE,
     HYPOTHESIS_SCORE_THRESHOLD,
     HYPOTHESIS_TOP_K,
@@ -45,6 +46,7 @@ from app.hypothesis.retriever import HybridHypothesisRetriever
 from app.hypothesis.revision_signal import RevisionSignalService
 from app.hypothesis.service import HypothesisService
 from app.learning.invalidation import LearningInvalidationService
+from app.learning.post_turn_assessor import PostTurnAssessor
 from app.llm import DeepSeekClient
 from app.telemetry import GLOBAL_TOKEN_USAGE
 from app.memory.service import PersonalMemoryService
@@ -79,6 +81,9 @@ class EvoMeRuntime:
             BackgroundEvolutionQueue(max_workers=1) if enable_background else None
         )
         self._last_background_job_id: str | None = None
+        # Phase 5.7C: counts user turns so the slow evolution job can run on a
+        # reduced cadence (see EVOME_SLOW_LOOP_EVERY_N_TURNS).
+        self._slow_loop_turn_counter = 0
 
         self.audit_service = AuditService(db)
         self.personal_memory_service = PersonalMemoryService(db)
@@ -129,6 +134,7 @@ class EvoMeRuntime:
         self.context_builder = ContextBuilder(self.llm, model_name=DEEPSEEK_MODEL)
         self.reflection_service = ReflectionService(self.llm)
         self.evaluation_service = EvaluationService(self.llm)
+        self.post_turn_assessor = PostTurnAssessor(self.llm)
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
 
         self.hypothesis_retriever = HybridHypothesisRetriever(
@@ -171,6 +177,7 @@ class EvoMeRuntime:
         context_builder = ContextBuilder(llm, model_name=DEEPSEEK_MODEL)
         reflection_service = ReflectionService(llm)
         evaluation_service = EvaluationService(llm)
+        post_turn_assessor = PostTurnAssessor(llm)
         skill_registry = build_default_skill_registry(personal_memory_service)
         hypothesis_relation_judge = HypothesisRelationJudge(llm)
         hypothesis_aggregator = HypothesisAggregator(
@@ -193,6 +200,7 @@ class EvoMeRuntime:
             reflection_service=reflection_service,
             hypothesis_aggregator=hypothesis_aggregator,
             evaluation_service=evaluation_service,
+            post_turn_assessor=post_turn_assessor,
             skill_registry=skill_registry,
         )
 
@@ -217,7 +225,7 @@ class EvoMeRuntime:
                 status="active",
                 description=(
                     "Fast Path: retrieve Personal Memory -> stream response; "
-                    "Slow Path: evaluate -> audit -> memory/experience/reflection -> "
+                    "Slow Path: post-turn assess -> audit -> memory/experience/reflection -> "
                     "hypothesis/revision-signal processing"
                 ),
             )
@@ -559,6 +567,21 @@ class EvoMeRuntime:
         # Copy only serializable/plain state into the queued closure. ORM objects
         # are never sent across threads.
         payload = dict(state)
+
+        # Phase 5.7C: optionally run the slow evolution path only every Nth turn.
+        self._slow_loop_turn_counter += 1
+        cadence = EVOME_SLOW_LOOP_EVERY_N_TURNS
+        run_slow = cadence <= 1 or (self._slow_loop_turn_counter % cadence) == 0
+
+        if not run_slow:
+            return {
+                "response": response,
+                "strategy_name": self.strategy_full_name,
+                "background_job_id": None,
+                "background_status": "skipped_by_cadence",
+                "relevant_memory_count": len(state.get("relevant_memories", [])),
+            }
+
         job_id = self.background_queue.submit(
             kind="slow_evolution",
             fn=lambda: self._process_slow_payload(payload),

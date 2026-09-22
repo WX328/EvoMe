@@ -9,6 +9,59 @@ class FakeLLM:
         system = messages[0]["content"]
         user_text = messages[-1]["content"]
 
+        if "MODULE: POST_TURN_ASSESSOR" in system:
+            stage = "memory_design"
+            if "样例B" in user_text:
+                stage = "skill_design"
+            elif "样例C" in user_text:
+                stage = "strategy_design"
+            return {
+                "evaluation": {
+                    "score": 0.9,
+                    "success": True,
+                    "reason": "测试通过",
+                },
+                "context": {
+                    "task_type": "architecture_design",
+                    "task_type_confidence": 0.95,
+                    "interaction_mode": "collaborative",
+                    "interaction_mode_confidence": 0.95,
+                    "explicit_instruction": "先讨论设计",
+                    "project_name": "EvoMe",
+                    "project_name_confidence": 0.95,
+                    "project_stage": stage,
+                    "project_stage_confidence": 0.9,
+                    "complexity_indicators": {
+                        "multi_step": True,
+                        "ambiguity": True,
+                        "cross_module": True,
+                        "external_tool": False,
+                        "long_term_state": True,
+                        "tradeoff": True,
+                    },
+                    "risk_indicators": {
+                        "destructive_change": False,
+                        "external_side_effect": False,
+                        "security_sensitive": False,
+                        "irreversible": False,
+                    },
+                },
+                "reflection": {
+                    "reflection_type": "pattern",
+                    "observation": "复杂设计任务中，先完成设计对齐后结果较好。",
+                    "insight": "复杂开放式工程任务在执行前进行设计对齐可能减少返工。",
+                    "applicable_context": {
+                        "task_type": "architecture_design",
+                        "complexity": "high",
+                        "interaction_mode": "collaborative",
+                    },
+                    "strategy_signal": "在 execute 前增加 design_alignment",
+                    "skill_signal": "",
+                    "expected_effect": "减少用户纠正和返工",
+                    "confidence": 0.9,
+                },
+            }
+
         if "Evaluator" in system:
             return {"score": 0.9, "success": True, "reason": "测试通过"}
 

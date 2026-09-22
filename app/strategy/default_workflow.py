@@ -1,6 +1,7 @@
 from langgraph.graph import END, START, StateGraph
 
 from app.hypothesis.canonical import build_canonical_signal
+from app.learning.post_turn_assessor import PostTurnAssessor
 from app.models import ReflectionRecord
 from app.strategy.state import EvoMeState
 
@@ -36,6 +37,7 @@ class DefaultConversationStrategy:
         reflection_service,
         hypothesis_aggregator,
         evaluation_service,
+        post_turn_assessor: PostTurnAssessor,
         skill_registry,
     ) -> None:
         self.llm = llm
@@ -49,6 +51,7 @@ class DefaultConversationStrategy:
         self.reflection_service = reflection_service
         self.hypothesis_aggregator = hypothesis_aggregator
         self.evaluation_service = evaluation_service
+        self.post_turn_assessor = post_turn_assessor
         self.skill_registry = skill_registry
         self.graph = self._build_graph()
 
@@ -104,7 +107,7 @@ class DefaultConversationStrategy:
     @staticmethod
     def _route_after_eligibility(state: EvoMeState) -> str:
         eligibility = state.get("learning_eligibility", {})
-        return "evaluate" if eligibility.get("allow_evolution") else "record_interaction"
+        return "post_turn_assess" if eligibility.get("allow_evolution") else "record_interaction"
 
     @staticmethod
     def _route_after_interaction(state: EvoMeState) -> str:
@@ -120,13 +123,20 @@ class DefaultConversationStrategy:
         eligibility = state.get("learning_eligibility", {})
         return "experience_gate" if eligibility.get("allow_evolution") else "end"
 
-    def _evaluate(self, state: EvoMeState) -> dict:
+    def _assess_post_turn(self, state: EvoMeState) -> dict:
+        assessment = self.post_turn_assessor.assess(
+            user_input=state["user_input"],
+            assistant_response=state["response"],
+            relevant_memories=state.get("relevant_memories", []),
+            strategy_name=f"{self.name}_v{self.version}",
+            skills_used=state.get("skills_used", []),
+        )
+        evaluation = self.evaluation_service.normalize_result(
+            assessment.get("evaluation")
+        )
         return {
-            "evaluation": self.evaluation_service.evaluate(
-                user_input=state["user_input"],
-                response=state["response"],
-                relevant_memories=state.get("relevant_memories", []),
-            )
+            "post_turn_assessment": assessment,
+            "evaluation": evaluation,
         }
 
     def _record_interaction(self, state: EvoMeState) -> dict:
@@ -186,11 +196,11 @@ class DefaultConversationStrategy:
         if not gate.get("should_save"):
             return {"context_data": {}}
 
-        available_skills = [
-            skill.name for skill in self.skill_registry.list_skills()
-        ]
-        context_data = self.context_builder.build(
+        available_skills = [skill.name for skill in self.skill_registry.list_skills()]
+        assessment = state.get("post_turn_assessment", {})
+        context_data = self.context_builder.normalize_result(
             user_input=state["user_input"],
+            result=assessment.get("context") if isinstance(assessment, dict) else {},
             relevant_memories=state.get("relevant_memories", []),
             available_skills=available_skills,
             available_tools=[],
@@ -229,13 +239,14 @@ class DefaultConversationStrategy:
         return "reflect_experience" if state.get("experience_saved") else "end"
 
     def _reflect_experience(self, state: EvoMeState) -> dict:
-        gate = state["experience_gate"]
-        reflection = self.reflection_service.reflect(
-            task_type=str(state.get("context_data", {}).get("task_type") or gate["task_type"]),
-            result_summary=gate["result_summary"],
-            evaluation=state["evaluation"],
-            strategy_name=f"{self.name}_v{self.version}",
-            skills_used=state.get("skills_used", []),
+        assessment = state.get("post_turn_assessment", {})
+        raw_reflection = (
+            assessment.get("reflection", {})
+            if isinstance(assessment, dict)
+            else {}
+        )
+        reflection = self.reflection_service.normalize_result(
+            raw_reflection,
             context_data=state.get("context_data", {}),
         )
         return {"reflection": reflection}
@@ -308,6 +319,7 @@ class DefaultConversationStrategy:
             "skills_used": [],
             "learning_eligibility": {},
             "evaluation": {},
+            "post_turn_assessment": {},
             "personal_memory_candidates": [],
             "personal_memories_saved": 0,
             "context_data": {},
@@ -338,7 +350,7 @@ class DefaultConversationStrategy:
         eligibility = state["learning_eligibility"]
 
         if eligibility.get("allow_evolution"):
-            state.update(self._evaluate(state))
+            state.update(self._assess_post_turn(state))
 
         # InteractionRecord is append-only audit and is intentionally written
         # even when both learning lanes are closed.
@@ -370,7 +382,7 @@ class DefaultConversationStrategy:
         builder.add_node("retrieve_personal_memory", self._retrieve_memory)
         builder.add_node("respond", self._respond)
         builder.add_node("learning_eligibility_gate", self._classify_learning_eligibility)
-        builder.add_node("evaluate", self._evaluate)
+        builder.add_node("post_turn_assess", self._assess_post_turn)
         builder.add_node("record_interaction", self._record_interaction)
         builder.add_node("personal_memory_gate", self._extract_personal_memory)
         builder.add_node("write_personal_memory", self._write_personal_memory)
@@ -387,9 +399,12 @@ class DefaultConversationStrategy:
         builder.add_conditional_edges(
             "learning_eligibility_gate",
             self._route_after_eligibility,
-            {"evaluate": "evaluate", "record_interaction": "record_interaction"},
+            {
+                "post_turn_assess": "post_turn_assess",
+                "record_interaction": "record_interaction",
+            },
         )
-        builder.add_edge("evaluate", "record_interaction")
+        builder.add_edge("post_turn_assess", "record_interaction")
         builder.add_conditional_edges(
             "record_interaction",
             self._route_after_interaction,

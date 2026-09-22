@@ -13,6 +13,7 @@ class EvoMeState(TypedDict, total=False):
     response: str
     learning_eligibility: dict[str, Any]
     evaluation: dict[str, Any]
+    post_turn_assessment: dict[str, Any]
     interaction_id: int
 
     personal_memory_candidates: list[dict[str, Any]]

@@ -21,22 +21,69 @@ MODULE: REFLECTION
 """
 
 class ReflectionService:
-    def __init__(self, llm): self.llm = llm
-    def reflect(self, *, task_type: str, result_summary: str, evaluation: dict[str, Any], strategy_name: str, skills_used: list[str], context_data: dict[str, Any] | None = None) -> dict[str, Any]:
-        applicability_context, execution_context = split_context(context_data or {})
-        result = self.llm.json_chat([
-            {"role":"system","content":REFLECTION_PROMPT},
-            {"role":"user","content":f"Task Type：{task_type}\nStrategy：{strategy_name}\nSkills：{skills_used}\nApplicability Context：{applicability_context}\nExecution Context：{execution_context}\nResult：{result_summary}\nEvaluation：{evaluation}"},
-        ], temperature=0.1)
+    def __init__(self, llm):
+        self.llm = llm
+
+    @staticmethod
+    def normalize_result(
+        result: dict[str, Any] | None,
+        *,
+        context_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = result if isinstance(result, dict) else {}
         reflection_type = str(result.get("reflection_type", "success")).strip()
-        if reflection_type not in {"failure","success","pattern","conflict"}: reflection_type="success"
-        applicable_context = sanitize_applicable_context(result.get("applicable_context") or {})
-        insight = str(result.get("insight", result.get("lesson", ""))).strip()
-        try: confidence=float(result.get("confidence",0.8))
-        except (TypeError,ValueError): confidence=0.8
-        return {
-            "reflection_type":reflection_type,"observation":str(result.get("observation","")).strip(),
-            "insight":insight,"lesson":insight,"applicable_context":applicable_context,
-            "strategy_signal":str(result.get("strategy_signal","")).strip(),"skill_signal":str(result.get("skill_signal","")).strip(),
-            "expected_effect":str(result.get("expected_effect","")).strip(),"confidence":max(0.0,min(1.0,confidence)),
+        if reflection_type not in {"failure", "success", "pattern", "conflict"}:
+            reflection_type = "success"
+
+        candidate_context = sanitize_applicable_context(
+            result.get("applicable_context") or {}
+        )
+        allowed_context, _ = split_context(context_data or {})
+        applicable_context = {
+            key: value
+            for key, value in candidate_context.items()
+            if key in allowed_context and allowed_context.get(key) == value
         }
+        insight = str(result.get("insight", result.get("lesson", ""))).strip()[:320]
+        try:
+            confidence = float(result.get("confidence", 0.8))
+        except (TypeError, ValueError):
+            confidence = 0.8
+        return {
+            "reflection_type": reflection_type,
+            "observation": str(result.get("observation", "")).strip()[:240],
+            "insight": insight,
+            "lesson": insight,
+            "applicable_context": applicable_context,
+            "strategy_signal": str(result.get("strategy_signal", "")).strip()[:320],
+            "skill_signal": str(result.get("skill_signal", "")).strip()[:240],
+            "expected_effect": str(result.get("expected_effect", "")).strip()[:240],
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+
+    def reflect(
+        self,
+        *,
+        task_type: str,
+        result_summary: str,
+        evaluation: dict[str, Any],
+        strategy_name: str,
+        skills_used: list[str],
+        context_data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        applicability_context, execution_context = split_context(context_data or {})
+        result = self.llm.json_chat(
+            [
+                {"role": "system", "content": REFLECTION_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Task Type：{task_type}\nStrategy：{strategy_name}\nSkills：{skills_used}\n"
+                        f"Applicability Context：{applicability_context}\nExecution Context：{execution_context}\n"
+                        f"Result：{result_summary}\nEvaluation：{evaluation}"
+                    ),
+                },
+            ],
+            temperature=0.1,
+        )
+        return self.normalize_result(result, context_data=context_data)
