@@ -28,6 +28,12 @@ EVOME_PROMPT_RESPONSE_CHAR_LIMIT = int(
     os.getenv("EVOME_PROMPT_RESPONSE_CHAR_LIMIT", "1200")
 )
 
+# Phase 5.7D: per-memory character cap for memories embedded into internal
+# prompts. Without this, recalled memories are embedded unbounded.
+EVOME_PROMPT_MEMORY_CHAR_LIMIT = int(
+    os.getenv("EVOME_PROMPT_MEMORY_CHAR_LIMIT", "200")
+)
+
 # Phase 5.7C: slow-loop cadence. The slow evolution path is submitted on every
 # user turn by default. Setting this above 1 runs it only every Nth turn,
 # trading learning frequency for token cost. 1 = current behavior.

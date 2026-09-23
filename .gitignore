@@ -10,3 +10,4 @@ patches/
 *.patch
 # Local pre-edit backups (not source of truth)
 _backup_before_tokenfix/
+scripts/__pycache__/
