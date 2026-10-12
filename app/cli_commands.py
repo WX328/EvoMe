@@ -50,6 +50,7 @@ COMMAND_NAMES = frozenset(
         "token-usage",
         "audit",
         "skills",
+        "hooks",
         "tool-approvals",
         "tool-approve",
         "tool-deny",

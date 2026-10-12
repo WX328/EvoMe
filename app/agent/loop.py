@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 from typing import Any
 
 from app.agent.schema import AgentRunResult, AgentStep, ToolCall
+from app.hooks.manager import HookContext, HookManager
 from app.tools.executor import ToolExecutor
 from app.tools.permissions import ApprovalStore, PermissionPolicy
 from app.tools.registry import ToolRegistry
@@ -47,15 +48,18 @@ class AgentLoop:
         max_steps: int = 6,
         permission_policy: PermissionPolicy | None = None,
         approval_store: ApprovalStore | None = None,
+        hook_manager: HookManager | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
         self.llm = llm
         self.tool_registry = tool_registry
+        self.hook_manager = hook_manager
         self.executor = ToolExecutor(
             tool_registry,
             permission_policy=permission_policy,
             approval_store=approval_store,
+            hook_manager=hook_manager,
         )
         self.max_steps = max_steps
 
@@ -70,6 +74,24 @@ class AgentLoop:
                 }
             )
         return json.dumps(rows, ensure_ascii=False)
+
+
+    def _decision_chat(self, messages: list[dict[str, str]]) -> dict:
+        """Call json_chat with purpose when supported, while preserving older adapters."""
+        try:
+            return self.llm.json_chat(
+                messages,
+                temperature=0.1,
+                purpose="agent_loop",
+            )
+        except TypeError as exc:
+            message = str(exc)
+            if "purpose" not in message or "unexpected keyword argument" not in message:
+                raise
+            return self.llm.json_chat(
+                messages,
+                temperature=0.1,
+            )
 
     @classmethod
     def _json_safe_tool_value(cls, value: Any) -> Any:
@@ -114,6 +136,45 @@ class AgentLoop:
         user_input: str,
         context_messages: list[dict[str, str]] | None = None,
     ) -> AgentRunResult:
+        if self.hook_manager is not None:
+            report = self.hook_manager.dispatch(HookContext(
+                event="before_agent", input_length=len(user_input),
+            ))
+            if not report.allowed:
+                result = AgentRunResult(
+                    answer=f"Agent 执行被 Hook 阻止：{report.reason}",
+                    steps=(),
+                    termination_reason="blocked_by_hook",
+                )
+                self.hook_manager.dispatch(HookContext(
+                    event="after_agent", status=result.termination_reason,
+                ))
+                return result
+
+        try:
+            result = self._run_steps(
+                user_input=user_input, context_messages=context_messages,
+            )
+        except Exception:
+            if self.hook_manager is not None:
+                self.hook_manager.dispatch(HookContext(
+                    event="after_agent", status="error",
+                ))
+            raise
+        if self.hook_manager is not None:
+            self.hook_manager.dispatch(HookContext(
+                event="after_agent",
+                status=result.termination_reason,
+                step_count=len(result.steps),
+            ))
+        return result
+
+    def _run_steps(
+        self,
+        *,
+        user_input: str,
+        context_messages: list[dict[str, str]] | None = None,
+    ) -> AgentRunResult:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": _AGENT_SYSTEM_PROMPT},
             {
@@ -129,11 +190,7 @@ class AgentLoop:
         seen_calls: set[str] = set()
 
         for index in range(1, self.max_steps + 1):
-            decision = self.llm.json_chat(
-                messages,
-                temperature=0.1,
-                purpose="agent_loop",
-            )
+            decision = self._decision_chat(messages)
             action = str(decision.get("action", "")).strip().lower()
 
             if action == "final":
@@ -214,10 +271,8 @@ class AgentLoop:
                 return AgentRunResult(
                     answer=(
                         f"该操作需要你的确认（风险等级：{result.risk}）。"
-                        f"
-批准：/tool-approve {result.approval_id}"
-                        f"
-拒绝：/tool-deny {result.approval_id}"
+                        f"\n批准：/tool-approve {result.approval_id}"
+                        f"\n拒绝：/tool-deny {result.approval_id}"
                     ),
                     steps=tuple(steps),
                     termination_reason="approval_required",

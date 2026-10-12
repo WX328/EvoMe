@@ -1,6 +1,7 @@
 from langgraph.graph import END, START, StateGraph
 
 from app.agent import AgentLoop
+from app.hooks.manager import HookManager
 from app.hypothesis.canonical import build_canonical_signal
 from app.tools import ApprovalStore, PermissionPolicy, build_default_tool_registry
 from app.learning.post_turn_assessor import PostTurnAssessor
@@ -49,6 +50,7 @@ class DefaultConversationStrategy:
         tool_max_output_chars: int = 12000,
         bash_permission: str = "ask",
         approval_store: ApprovalStore | None = None,
+        hook_manager: HookManager | None = None,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -78,6 +80,7 @@ class DefaultConversationStrategy:
                 max_steps=agent_max_steps,
                 permission_policy=PermissionPolicy(bash_mode=bash_permission),
                 approval_store=self.approval_store,
+                hook_manager=hook_manager,
             )
             if enable_agent_loop
             else None

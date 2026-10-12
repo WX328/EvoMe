@@ -4,7 +4,7 @@
 
 EvoMe 是一个实验性的 Personal AI 核心系统。它探索 AI 如何从长期交互中形成关于用户的记忆与关于自身行为的经验，同时避免因为一次模型判断就随意改变策略。
 
-当前开发版本：`v0.2.1-dev`。项目仍处于研究原型阶段，不建议直接用于生产环境。
+当前开发版本：`v0.3.0-dev`（S1–S4 Agent Runtime）。项目仍处于研究原型阶段，不建议直接用于生产环境。
 
 ## 核心设计
 
@@ -79,6 +79,7 @@ flowchart TD
 - 按 LLM 工作负载限制输出 token
 - 进程内 Token Usage 统计
 - Fake LLM 离线测试，不需要 API Key
+- S1–S4 Agent Runtime：有界 Agent Loop、自主工具调用、工作区文件工具、人工审批与生命周期 Hooks
 
 ## 尚在实验
 
@@ -188,6 +189,7 @@ app/
 - `v0.1.1`：拆分 Personal Memory、Interaction、Experience 与 Reflection。
 - `v0.2`：加入结构化 Context 与 Strategy Hypothesis 聚合。
 - `v0.2.1-dev`：加入完整的 Revision 演化管线、后台学习边界与 LLM 成本控制。
+- `v0.3.0-dev`：加入 S1 Agent Loop、S2 Tool Use、S3 Permission/Approval 与 S04 Hooks 生命周期钩子（开发版）。
 
 ## 设计理念
 
@@ -208,3 +210,23 @@ EvoMe 的目标不是让模型频繁改写自身，而是建立一条可观察�
 ## License
 
 当前尚未选择开源许可证。正式公开前请根据用途添加合适的 `LICENSE` 文件。
+
+## S04 Hooks
+
+With `EVOME_AGENT_LOOP_ENABLED=1`, the S04 hook manager supports
+`before_agent`, `after_agent`, `before_tool`, and `after_tool` lifecycle
+events. Register trusted Python handlers via
+`runtime.hook_manager.register(event, handler, name="...", priority=10)`.
+A pre-hook may return `HookDecision(False, "reason")` to block execution.
+Exceptions in pre-hooks fail closed; exceptions in post-hooks do not change the
+Tool result. S03 PermissionPolicy remains authoritative: a hook cannot approve
+a pending write or shell command.
+
+The default `before_tool` guard blocks direct file-tool access to `.env`,
+private keys, `.git`, `.venv`, the local database and the Qdrant storage
+directory (including paths inside the configured workspace).
+For operator visibility, enter `/hooks` in EvoMe CLI. Only event names,
+outcomes and minimal metadata are retained in a bounded in-memory history;
+no arguments, command text, file contents or prompts are logged there.
+Hooks are local trusted Python callbacks, not executable user prompts. The
+file guard does *not* sandbox arbitrary shell commands.

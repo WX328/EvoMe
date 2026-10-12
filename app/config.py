@@ -25,6 +25,15 @@ EVOME_BASH_TIMEOUT_SECONDS = max(1, int(os.getenv("EVOME_BASH_TIMEOUT_SECONDS", 
 EVOME_TOOL_MAX_OUTPUT_CHARS = max(1000, int(os.getenv("EVOME_TOOL_MAX_OUTPUT_CHARS", "12000")))
 EVOME_BASH_PERMISSION = os.getenv("EVOME_BASH_PERMISSION", "ask").strip().lower()
 
+# S04 Hooks. These intercept lifecycle events without bypassing S03 approvals.
+EVOME_HOOKS_ENABLED = os.getenv(
+    "EVOME_HOOKS_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_HOOK_HISTORY_LIMIT = max(1, int(os.getenv("EVOME_HOOK_HISTORY_LIMIT", "100")))
+EVOME_HOOK_PROTECT_SECRETS = os.getenv(
+    "EVOME_HOOK_PROTECT_SECRETS", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

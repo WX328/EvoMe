@@ -12,6 +12,9 @@ from app.config import (
     DEEPSEEK_MODEL,
     EVOME_AGENT_LOOP_ENABLED,
     EVOME_AGENT_MAX_STEPS,
+    EVOME_HOOKS_ENABLED,
+    EVOME_HOOK_HISTORY_LIMIT,
+    EVOME_HOOK_PROTECT_SECRETS,
     EVOME_BASH_TOOL_ENABLED,
     EVOME_BASH_TIMEOUT_SECONDS,
     EVOME_BASH_PERMISSION,
@@ -39,6 +42,7 @@ from app.evolution.service import EvolutionMemoryService
 from app.gates.experience_gate import ExperienceGate
 from app.gates.learning_eligibility_gate import LearningEligibilityGate
 from app.gates.personal_memory_gate import PersonalMemoryGate
+from app.hooks import HookManager, build_sensitive_path_guard
 from app.hypothesis.aggregator import HypothesisAggregator
 from app.hypothesis.ancestor_revalidation import AncestorSignalRevalidationService
 from app.hypothesis.candidate_rebase import CandidateRebaseService
@@ -72,11 +76,18 @@ class EvoMeRuntime:
         session_id: str | None = None,
         *,
         enable_background: bool = True,
+        enable_agent_loop: bool | None = None,
     ) -> None:
         self.db = db
+        injected_llm = llm is not None
         self.llm = llm or DeepSeekClient()
         self.session_id = session_id or uuid4().hex
         self.enable_background = enable_background
+        self.enable_agent_loop = (
+            bool(enable_agent_loop)
+            if enable_agent_loop is not None
+            else (EVOME_AGENT_LOOP_ENABLED if not injected_llm else False)
+        )
 
         # Background jobs must use a fresh SQLAlchemy Session. Reusing the
         # foreground Session across threads is unsafe.
@@ -145,6 +156,18 @@ class EvoMeRuntime:
         self.post_turn_assessor = PostTurnAssessor(self.llm)
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
         self.tool_approval_store = ApprovalStore()
+        self.hook_manager = (
+            HookManager(history_limit=EVOME_HOOK_HISTORY_LIMIT)
+            if EVOME_HOOKS_ENABLED
+            else None
+        )
+        if self.hook_manager is not None and EVOME_HOOK_PROTECT_SECRETS:
+            self.hook_manager.register(
+                "before_tool",
+                build_sensitive_path_guard(EVOME_TOOL_WORKSPACE),
+                name="protect_sensitive_paths",
+                priority=100,
+            )
 
         self.hypothesis_retriever = HybridHypothesisRetriever(
             db, qdrant_path=EVOME_QDRANT_PATH
@@ -211,7 +234,7 @@ class EvoMeRuntime:
             evaluation_service=evaluation_service,
             post_turn_assessor=post_turn_assessor,
             skill_registry=skill_registry,
-            enable_agent_loop=EVOME_AGENT_LOOP_ENABLED,
+            enable_agent_loop=self.enable_agent_loop,
             agent_max_steps=EVOME_AGENT_MAX_STEPS,
             tool_workspace=EVOME_TOOL_WORKSPACE,
             enable_bash_tool=EVOME_BASH_TOOL_ENABLED,
@@ -219,6 +242,7 @@ class EvoMeRuntime:
             tool_max_output_chars=EVOME_TOOL_MAX_OUTPUT_CHARS,
             bash_permission=EVOME_BASH_PERMISSION,
             approval_store=self.tool_approval_store,
+            hook_manager=self.hook_manager,
         )
 
     @property
@@ -615,6 +639,9 @@ class EvoMeRuntime:
             "agent_termination_reason": state.get("agent_termination_reason", ""),
             "tool_error_count": int(state.get("tool_error_count", 0)),
         }
+
+    def list_hook_events(self, limit: int = 20):
+        return self.hook_manager.recent(limit=limit) if self.hook_manager else []
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()

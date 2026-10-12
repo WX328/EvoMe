@@ -4,6 +4,7 @@ from app.database import Base, engine, SessionLocal
 from app.migrations import migrate_v0_2, migrate_v0_2_1
 from app.runtime import EvoMeRuntime
 from app.cli_commands import COMMAND_NAMES, normalize_cli_input
+from app.version import APP_VERSION
 
 
 def init_db() -> None:
@@ -486,7 +487,7 @@ def show_background_status(runtime: EvoMeRuntime) -> None:
 
 def main() -> None:
     init_db()
-    print("🌱 EvoMe V0.2.1-dev Core")
+    print(f"🌱 EvoMe {APP_VERSION} Core")
     print(
         "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
         "/revision-signals  /revision-pressure  /revision-groups  /ancestor-revalidate  "
@@ -497,7 +498,7 @@ def main() -> None:
         "/revision-apply-auto  /candidate-approve <id>  /candidate-reject <id>  "
         "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
         "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
-        "/status  /token-usage  /audit  /skills  /tool-approvals  "
+        "/status  /token-usage  /audit  /skills  /hooks  /tool-approvals  "
         "/tool-approve <id>  /tool-deny <id>  /exit\n"
     )
 
@@ -684,6 +685,18 @@ def main() -> None:
                 show_token_usage(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
+            if user_input == "/hooks":
+                events = runtime.list_hook_events(limit=20)
+                if not events:
+                    print("暂无 Hook 事件（或 S04 Hooks 已关闭）")
+                for entry in events:
+                    print(
+                        f"{entry.timestamp} {entry.event} "
+                        f"[{entry.outcome}] tool={entry.tool_name or '-'} "
+                        f"risk={entry.risk or '-'} status={entry.status or '-'}"
+                        + (f" reason={entry.reason}" if entry.reason else "")
+                    )
+                continue
             if user_input == "/tool-approvals":
                 items = runtime.list_pending_tool_approvals()
                 if not items:

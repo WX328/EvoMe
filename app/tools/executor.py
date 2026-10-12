@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.hooks.manager import HookContext, HookManager
 from app.tools.base import ToolResult
 from app.tools.permissions import ApprovalStore, PermissionPolicy
 from app.tools.registry import ToolRegistry
@@ -14,22 +15,57 @@ class ToolExecutor:
         *,
         permission_policy: PermissionPolicy | None = None,
         approval_store: ApprovalStore | None = None,
+        hook_manager: HookManager | None = None,
     ) -> None:
         self.registry = registry
-        self.permission_policy = permission_policy or PermissionPolicy()
+        self.permission_policy = permission_policy
         self.approval_store = approval_store or ApprovalStore()
+        self.hook_manager = hook_manager
 
-    def _run(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
+    def _run(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        risk: str = "low",
+    ) -> ToolResult:
+        if self.hook_manager is not None:
+            report = self.hook_manager.dispatch(HookContext(
+                event="before_tool",
+                tool_name=tool_name,
+                risk=risk,
+                arguments=dict(arguments),
+            ))
+            if not report.allowed:
+                return ToolResult(
+                    tool_name=tool_name,
+                    success=False,
+                    status="denied",
+                    risk=risk,
+                    error=f"hook denied: {report.reason}",
+                )
         try:
             implementation = self.registry.resolve(tool_name)
             output = implementation.execute(**arguments)
+            result = ToolResult(
+                tool_name=tool_name, success=True, output=output,
+                status="executed", risk=risk,
+            )
         except Exception as exc:
-            return ToolResult(
+            result = ToolResult(
                 tool_name=tool_name,
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
+                status="failed", risk=risk,
             )
-        return ToolResult(tool_name=tool_name, success=True, output=output)
+        if self.hook_manager is not None:
+            self.hook_manager.dispatch(HookContext(
+                event="after_tool",
+                tool_name=tool_name,
+                risk=risk,
+                status=result.status,
+            ))
+        return result
 
     def execute(
         self,
@@ -39,6 +75,9 @@ class ToolExecutor:
         approved: bool = False,
     ) -> ToolResult:
         args = dict(arguments or {})
+        if self.permission_policy is None:
+            return self._run(tool_name, args)
+
         decision = self.permission_policy.evaluate(tool_name, args)
 
         if decision.action == "deny":
@@ -66,15 +105,7 @@ class ToolExecutor:
                 approval_id=pending.id,
             )
 
-        result = self._run(tool_name, args)
-        return ToolResult(
-            tool_name=result.tool_name,
-            success=result.success,
-            output=result.output,
-            error=result.error,
-            status="executed" if result.success else "failed",
-            risk=decision.risk,
-        )
+        return self._run(tool_name, args, risk=decision.risk)
 
     def approve(self, approval_id: str) -> ToolResult:
         pending = self.approval_store.pop(approval_id)

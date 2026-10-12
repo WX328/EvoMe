@@ -19,7 +19,7 @@ def registry():
 
 
 def test_read_only_tool_is_allowed():
-    ex = ToolExecutor(registry())
+    ex = ToolExecutor(registry(), permission_policy=PermissionPolicy())
     result = ex.execute("read_file", {"path": "x.txt"})
     assert result.success
     assert result.status == "executed"
@@ -28,7 +28,11 @@ def test_read_only_tool_is_allowed():
 
 def test_write_requires_approval_then_executes():
     store = ApprovalStore()
-    ex = ToolExecutor(registry(), approval_store=store)
+    ex = ToolExecutor(
+        registry(),
+        permission_policy=PermissionPolicy(),
+        approval_store=store,
+    )
     pending = ex.execute("write_file", {"path": "x.txt", "content": "hi"})
     assert pending.status == "approval_required"
     assert pending.approval_id
@@ -49,7 +53,7 @@ def test_denied_bash_never_executes():
 
 
 def test_unknown_tool_is_denied_by_policy():
-    ex = ToolExecutor(registry())
+    ex = ToolExecutor(registry(), permission_policy=PermissionPolicy())
     result = ex.execute("mystery", {})
     assert not result.success
     assert result.status == "denied"
