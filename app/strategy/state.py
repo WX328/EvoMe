@@ -11,9 +11,13 @@ class EvoMeState(TypedDict, total=False):
     memory_quality: float
     skills_used: list[str]
     response: str
+    agent_steps: list[dict[str, Any]]
+    agent_termination_reason: str
+    tool_error_count: int
     learning_eligibility: dict[str, Any]
     evaluation: dict[str, Any]
     post_turn_assessment: dict[str, Any]
+    evolution_deferred_by_cadence: bool
     interaction_id: int
 
     personal_memory_candidates: list[dict[str, Any]]

@@ -75,3 +75,19 @@ def test_domain_normalizers_do_not_call_llm():
     assert evaluation["score"] == 0.9
     assert context["task_type"] == "architecture_design"
     assert reflection["applicable_context"] == {"task_type": "architecture_design"}
+
+
+def test_deterministic_experience_task_type_overrides_assessor_guess():
+    llm = CountingLLM({})
+    context = ContextBuilder(llm, model_name="test").normalize_result(
+        user_input="检查架构边界",
+        result={"task_type": "qa", "task_type_confidence": 0.9},
+        relevant_memories=[],
+        available_skills=[],
+        task_type_hint="architecture_design",
+        prefer_task_type_hint=True,
+    )
+
+    assert context["task_type"] == "architecture_design"
+    assert context["field_meta"]["task_type"]["source"] == "deterministic"
+    assert llm.calls == 0

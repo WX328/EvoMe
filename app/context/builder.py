@@ -91,6 +91,7 @@ class ContextBuilder:
         available_tools: list[str] | None = None,
         memory_quality: float = 0.0,
         task_type_hint: str | None = None,
+        prefer_task_type_hint: bool = False,
     ) -> dict[str, Any]:
         memory_text = "\n".join(f"- {item}" for item in relevant_memories[:5]) or "无"
         result = self.llm.json_chat(
@@ -115,6 +116,7 @@ class ContextBuilder:
             available_tools=available_tools,
             memory_quality=memory_quality,
             task_type_hint=task_type_hint,
+            prefer_task_type_hint=prefer_task_type_hint,
         )
 
     def normalize_result(
@@ -127,6 +129,7 @@ class ContextBuilder:
         available_tools: list[str] | None = None,
         memory_quality: float = 0.0,
         task_type_hint: str | None = None,
+        prefer_task_type_hint: bool = False,
     ) -> dict[str, Any]:
         result = result if isinstance(result, dict) else {}
         explicit_mode = self._explicit_mode(user_input)
@@ -140,7 +143,11 @@ class ContextBuilder:
         )
 
         task_type = normalize_enum(result.get("task_type"), TASK_TYPES, "other")
-        if task_type == "other" and task_type_hint in TASK_TYPES:
+        if prefer_task_type_hint and task_type_hint in TASK_TYPES:
+            task_type = str(task_type_hint)
+            task_source = "deterministic"
+            task_confidence = 0.9
+        elif task_type == "other" and task_type_hint in TASK_TYPES:
             task_type = str(task_type_hint)
             task_source = "deterministic"
             task_confidence = 0.8

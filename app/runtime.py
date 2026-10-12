@@ -10,6 +10,13 @@ from app.audit.service import AuditService
 from app.background import BackgroundEvolutionQueue
 from app.config import (
     DEEPSEEK_MODEL,
+    EVOME_AGENT_LOOP_ENABLED,
+    EVOME_AGENT_MAX_STEPS,
+    EVOME_BASH_TOOL_ENABLED,
+    EVOME_BASH_TIMEOUT_SECONDS,
+    EVOME_BASH_PERMISSION,
+    EVOME_TOOL_MAX_OUTPUT_CHARS,
+    EVOME_TOOL_WORKSPACE,
     EVOME_QDRANT_PATH,
     EVOME_SLOW_LOOP_EVERY_N_TURNS,
     HYPOTHESIS_RELATION_CONFIDENCE,
@@ -53,6 +60,7 @@ from app.memory.service import PersonalMemoryService
 from app.models import CandidateRevision, RevisionProposal, StrategyHypothesis, StrategyRecord
 from app.reflection.service import ReflectionService
 from app.skills.builtin import build_default_skill_registry
+from app.tools import ApprovalStore
 from app.strategy.default_workflow import DefaultConversationStrategy
 
 
@@ -136,6 +144,7 @@ class EvoMeRuntime:
         self.evaluation_service = EvaluationService(self.llm)
         self.post_turn_assessor = PostTurnAssessor(self.llm)
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
+        self.tool_approval_store = ApprovalStore()
 
         self.hypothesis_retriever = HybridHypothesisRetriever(
             db, qdrant_path=EVOME_QDRANT_PATH
@@ -202,6 +211,14 @@ class EvoMeRuntime:
             evaluation_service=evaluation_service,
             post_turn_assessor=post_turn_assessor,
             skill_registry=skill_registry,
+            enable_agent_loop=EVOME_AGENT_LOOP_ENABLED,
+            agent_max_steps=EVOME_AGENT_MAX_STEPS,
+            tool_workspace=EVOME_TOOL_WORKSPACE,
+            enable_bash_tool=EVOME_BASH_TOOL_ENABLED,
+            bash_timeout_seconds=EVOME_BASH_TIMEOUT_SECONDS,
+            tool_max_output_chars=EVOME_TOOL_MAX_OUTPUT_CHARS,
+            bash_permission=EVOME_BASH_PERMISSION,
+            approval_store=self.tool_approval_store,
         )
 
     @property
@@ -304,6 +321,9 @@ class EvoMeRuntime:
             "proposal_normalization_count": int(state.get("proposal_normalization_count", 0)),
             "candidate_revision_count": int(state.get("candidate_revision_count", 0)),
             "revision_auto_apply_count": int(state.get("revision_auto_apply_count", 0)),
+            "agent_steps": state.get("agent_steps", []),
+            "agent_termination_reason": state.get("agent_termination_reason", ""),
+            "tool_error_count": int(state.get("tool_error_count", 0)),
         }
 
     def run(self, user_input: str) -> dict:
@@ -492,6 +512,7 @@ class EvoMeRuntime:
             }
 
     def _process_slow_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        run_evolution = bool(payload.pop("_run_evolution", True))
         with self._background_session_factory() as db:
             llm = self._new_background_llm()
             personal_memory_service = PersonalMemoryService(db)
@@ -506,7 +527,10 @@ class EvoMeRuntime:
                 evolution_memory_service=evolution_memory_service,
                 hypothesis_retriever=retriever,
             )
-            state = strategy.process_slow_state(dict(payload))
+            state = strategy.process_slow_state(
+                dict(payload),
+                run_evolution=run_evolution,
+            )
             eligibility = state.get("learning_eligibility", {})
 
             # Phase 5.7A: a user turn may create Experience/Reflection/Hypothesis/
@@ -518,7 +542,7 @@ class EvoMeRuntime:
             state["candidate_revision_count"] = 0
             state["revision_auto_apply_count"] = 0
 
-            if eligibility.get("allow_evolution"):
+            if run_evolution and eligibility.get("allow_evolution"):
                 evaluation = state.get("evaluation", {})
                 self._record_strategy_result_for_session(
                     db,
@@ -573,17 +597,10 @@ class EvoMeRuntime:
         cadence = EVOME_SLOW_LOOP_EVERY_N_TURNS
         run_slow = cadence <= 1 or (self._slow_loop_turn_counter % cadence) == 0
 
-        if not run_slow:
-            return {
-                "response": response,
-                "strategy_name": self.strategy_full_name,
-                "background_job_id": None,
-                "background_status": "skipped_by_cadence",
-                "relevant_memory_count": len(state.get("relevant_memories", [])),
-            }
+        payload["_run_evolution"] = run_slow
 
         job_id = self.background_queue.submit(
-            kind="slow_evolution",
+            kind="slow_evolution" if run_slow else "post_turn_audit",
             fn=lambda: self._process_slow_payload(payload),
         )
         self._last_background_job_id = job_id
@@ -592,9 +609,23 @@ class EvoMeRuntime:
             "response": response,
             "strategy_name": self.strategy_full_name,
             "background_job_id": job_id,
-            "background_status": "queued",
+            "background_status": "queued" if run_slow else "queued_audit_only",
             "relevant_memory_count": len(state.get("relevant_memories", [])),
+            "agent_step_count": len(state.get("agent_steps", [])),
+            "agent_termination_reason": state.get("agent_termination_reason", ""),
+            "tool_error_count": int(state.get("tool_error_count", 0)),
         }
+
+    def list_pending_tool_approvals(self):
+        return self.tool_approval_store.list_pending()
+
+    def approve_tool_call(self, approval_id: str):
+        return self.strategy.agent_loop.executor.approve(approval_id) if self.strategy.agent_loop else None
+
+    def deny_tool_call(self, approval_id: str) -> bool:
+        if self.strategy.agent_loop is None:
+            return False
+        return self.strategy.agent_loop.executor.deny(approval_id)
 
     def token_usage_summary(self) -> dict[str, Any]:
         return GLOBAL_TOKEN_USAGE.summary()

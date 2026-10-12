@@ -206,7 +206,7 @@ def _print_summary(llm: RecordingLLM, *, skipped: int, turns: int) -> None:
     print(f"BENCH|turns|{turns}")
     print(f"BENCH|total_calls|{total_calls}")
     print(f"BENCH|total_prompt_chars|{total_chars}")
-    print(f"BENCH|skipped_by_cadence|{skipped}")
+    print(f"BENCH|evolution_deferred_by_cadence|{skipped}")
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +248,7 @@ def main() -> int:
             result = runtime.stream_run(prompt, on_token=lambda _t: None)
             status = result.get("background_status")
             job_id = result.get("background_job_id")
-            if status == "skipped_by_cadence":
+            if status in {"skipped_by_cadence", "queued_audit_only"}:
                 skipped += 1
             if job_id is not None:
                 # Block until the slow job's LLM calls are recorded before the

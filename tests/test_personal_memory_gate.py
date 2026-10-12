@@ -35,7 +35,7 @@ def test_explicit_future_preference_skips_llm():
             "memory_type": "preference",
             "content": text,
             "importance": 0.9,
-            "confidence": 1.0,
+            "confidence": 0.95,
         }
     ]
     assert llm.calls == 0
@@ -80,6 +80,17 @@ def test_negated_preference_still_uses_llm():
     gate = PersonalMemoryGate(llm)
 
     result = gate.extract("不是说以后给我都先讲数据流，我只是举个例子。")
+
+    assert result["should_save"] is False
+    assert result["decision_source"] == "llm"
+    assert llm.calls == 1
+
+
+def test_quoted_preference_discussion_uses_semantic_gate():
+    llm = CountingLLM({"should_save": False, "memories": []})
+    gate = PersonalMemoryGate(llm)
+
+    result = gate.extract("请判断「以后给我设计架构时先讲数据流」是不是合理偏好。")
 
     assert result["should_save"] is False
     assert result["decision_source"] == "llm"

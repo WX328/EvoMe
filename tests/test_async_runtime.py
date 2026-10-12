@@ -56,12 +56,14 @@ def test_stream_run_respects_slow_loop_cadence(db, monkeypatch):
 
     runtime = EvoMeRuntime(db, llm=StreamingFakeLLM(), session_id="cadence-session")
 
-    first = runtime.stream_run("第一个问题")
+    first = runtime.stream_run(
+        "你以后给我设计架构时，先讲数据流，再讲模块接口。"
+    )
     second = runtime.stream_run("第二个问题")
-    assert first["background_status"] == "skipped_by_cadence"
-    assert first["background_job_id"] is None
-    assert second["background_status"] == "skipped_by_cadence"
-    assert second["background_job_id"] is None
+    assert first["background_status"] == "queued_audit_only"
+    assert first["background_job_id"]
+    assert second["background_status"] == "queued_audit_only"
+    assert second["background_job_id"]
 
     third = runtime.stream_run("第三个问题")
     assert third["background_status"] == "queued"
@@ -70,5 +72,12 @@ def test_stream_run_respects_slow_loop_cadence(db, monkeypatch):
     # The user-facing answer must not depend on which slow-loop branch ran.
     assert third["response"] == first["response"] == second["response"]
 
-    runtime.wait_for_background(third["background_job_id"], timeout=5)
+    for result in (first, second, third):
+        runtime.wait_for_background(result["background_job_id"], timeout=5)
+
+    # Cadence may defer evolution, but must never discard audit or an explicit
+    # Personal Memory preference from the skipped turns.
+    assert len(runtime.list_interactions()) == 3
+    memories = runtime.personal_memory_service.list_all()
+    assert any("先讲数据流" in item.content for item in memories)
     runtime.shutdown(wait=True)

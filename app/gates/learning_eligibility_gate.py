@@ -4,6 +4,11 @@ import re
 from typing import Any
 
 from app.cli_commands import looks_like_operational_input
+from app.gates.preference_guard import (
+    explicitly_disallows_storage,
+    has_ambiguous_preference_negation,
+    is_quoted_preference_discussion,
+)
 
 
 LEARNING_ELIGIBILITY_PROMPT = """
@@ -309,6 +314,33 @@ class LearningEligibilityGate:
                     "deterministic_hard_pass" if opt_in else "deterministic_hard_skip"
                 ),
             )
+
+        # An explicit no-store instruction must close both learning lanes;
+        # otherwise the same text can still leak into Reflection/Hypothesis.
+        if explicitly_disallows_storage(text):
+            return self._result(
+                category="natural",
+                allow_personal_memory=False,
+                allow_evolution=False,
+                reason="deterministic: user explicitly disabled storage",
+                decision_source="deterministic_hard_skip",
+            )
+
+        # Quoted examples and questions about a possible preference are content
+        # to analyze, not evidence that the preference belongs to the user.
+        if is_quoted_preference_discussion(text):
+            return self._result(
+                category="natural",
+                allow_personal_memory=False,
+                allow_evolution=False,
+                reason="deterministic: quoted preference discussion is non-learning",
+                decision_source="deterministic_hard_skip",
+            )
+
+        # Contrastive wording can reverse the apparent preference. Defer it to
+        # the semantic gate before structural keywords can hard-pass evolution.
+        if has_ambiguous_preference_negation(text):
+            return None
 
         has_personal = self._contains_any(text, self._PERSONAL_WORLD_MARKERS)
         has_feedback = self._contains_any(text, self._CORRECTION_OR_FEEDBACK_MARKERS)

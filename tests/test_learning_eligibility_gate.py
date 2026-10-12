@@ -170,3 +170,27 @@ def test_explicit_future_explanation_preference_routes_to_both_lanes():
     assert result["allow_evolution"] is True
     assert result["decision_source"] == "deterministic_hard_pass"
     assert llm.calls == 0
+
+
+def test_explicit_no_store_closes_both_learning_lanes():
+    llm = CountingLLM()
+    gate = LearningEligibilityGate(llm)
+
+    result = gate.classify("不要记住这句话：以后给我设计架构时先讲数据流。")
+
+    assert result["allow_personal_memory"] is False
+    assert result["allow_evolution"] is False
+    assert result["decision_source"] == "deterministic_hard_skip"
+    assert llm.calls == 0
+
+
+def test_quoted_preference_discussion_is_non_learning():
+    llm = CountingLLM()
+    gate = LearningEligibilityGate(llm)
+
+    result = gate.classify("请判断「以后给我设计架构时先讲数据流」是不是合理偏好。")
+
+    assert result["allow_personal_memory"] is False
+    assert result["allow_evolution"] is False
+    assert result["decision_source"] == "deterministic_hard_skip"
+    assert llm.calls == 0

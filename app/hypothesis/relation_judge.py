@@ -18,6 +18,13 @@ Relations:
 - CONFLICTS: counter-evidence in a comparable context.
 - UNRELATED: different behavioral rule.
 
+A hypothesis may include pending_signals. They are validated active-open evidence
+attached to the current revision, but they are NOT applied WHEN/DO/EXPECT truth.
+Use them only as semantic-continuity evidence. If the Reflection repeats or
+strengthens a pending change, prefer the same hypothesis over UNRELATED and
+normally emit a new evidence-grounded REFINES signal. Never return SUPPORTS only
+because a pending signal already describes the behavior.
+
 If relation=REFINES, revision_signals MUST contain 1-5 atomic, evidence-grounded local changes.
 If you cannot formulate at least one valid local change, choose SUPPORTS or UNRELATED instead; never emit REFINES with an empty revision_signals array.
 Otherwise revision_signals must be []. Maximum 5 signals per hypothesis.
@@ -93,6 +100,9 @@ def _compact_reflection(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_hypothesis(payload: dict[str, Any]) -> dict[str, Any]:
+    pending = payload.get("pending_signals") or []
+    if not isinstance(pending, list):
+        pending = []
     return {
         "id": payload.get("id"),
         "revision": payload.get("revision"),
@@ -109,6 +119,11 @@ def _compact_hypothesis(payload: dict[str, Any]) -> dict[str, Any]:
             if payload.get("expect_data") is not None
             else payload.get("expected_effect", "")
         ),
+        "pending_signals": [
+            _compact_value(item)
+            for item in pending[:3]
+            if isinstance(item, dict)
+        ],
     }
 
 
@@ -123,8 +138,10 @@ class HypothesisRelationJudge:
         reflection_payload: dict[str, Any],
         hypothesis_payload: dict[str, Any],
     ) -> dict[str, Any]:
-        relation = str(raw.get("relation", "UNRELATED")).strip().upper()
-        if relation not in RELATIONS:
+        raw_relation = str(raw.get("relation", "")).strip().upper()
+        relation_label_valid = raw_relation in RELATIONS
+        relation = raw_relation
+        if not relation_label_valid:
             relation = "UNRELATED"
 
         raw_signals = raw.get("revision_signals")
@@ -147,14 +164,19 @@ class HypothesisRelationJudge:
                 else:
                     rejected.append(reason)
 
-        decision_valid = not (relation == "REFINES" and not revision_signals)
+        decision_valid = relation_label_valid and not (
+            relation == "REFINES" and not revision_signals
+        )
         invalid_reason = ""
         if not decision_valid:
-            invalid_reason = (
-                "REFINES requires at least one valid atomic revision_signal"
-            )
-            if rejected:
-                invalid_reason += ": " + "; ".join(rejected[:3])
+            if not relation_label_valid:
+                invalid_reason = f"invalid relation label: {raw_relation or '<empty>'}"
+            else:
+                invalid_reason = (
+                    "REFINES requires at least one valid atomic revision_signal"
+                )
+                if rejected:
+                    invalid_reason += ": " + "; ".join(rejected[:3])
 
         return {
             "hypothesis_id": hypothesis_payload.get("id"),

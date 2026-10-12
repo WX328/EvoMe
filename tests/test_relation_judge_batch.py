@@ -7,6 +7,7 @@ from app.hypothesis.aggregator import HypothesisAggregator
 from app.hypothesis.relation_judge import HypothesisRelationJudge
 from app.hypothesis.retriever import HypothesisMatch
 from app.hypothesis.service import HypothesisService
+from app.models import RevisionSignal
 
 
 class CountingLLM:
@@ -158,3 +159,108 @@ def test_aggregator_batches_multiple_retrieved_hypotheses(db):
     assert judge.batch_sizes == [2]
     assert result["action"] == "supports"
     assert result["hypothesis_id"] == h1.id
+
+
+def test_missing_batch_decision_fails_closed_without_duplicate(db):
+    service = HypothesisService(db)
+    base = _reflection(db, 811, "base")
+    hypothesis = service.create_from_reflection(
+        reflection=base,
+        canonical_signal="h1-base",
+    )
+    incoming = _reflection(db, 812, "incoming")
+    judge = HypothesisRelationJudge(CountingLLM({"decisions": []}))
+    aggregator = HypothesisAggregator(
+        db,
+        relation_judge=judge,
+        retriever=MultiRetriever([hypothesis.id]),
+        score_threshold=0.0,
+    )
+
+    result = aggregator.process(incoming)
+
+    assert result["action"] == "skipped_ambiguous_relation"
+    assert len(service.list_all(include_inactive=False)) == 1
+
+
+def test_low_confidence_unrelated_fails_closed_without_duplicate(db):
+    service = HypothesisService(db)
+    base = _reflection(db, 821, "base")
+    hypothesis = service.create_from_reflection(
+        reflection=base,
+        canonical_signal="h1-base",
+    )
+    incoming = _reflection(db, 822, "incoming")
+    judge = HypothesisRelationJudge(
+        CountingLLM({
+            "decisions": [{
+                "hypothesis_id": hypothesis.id,
+                "relation": "UNRELATED",
+                "confidence": 0.2,
+                "reason": "uncertain",
+                "revision_signals": [],
+            }]
+        })
+    )
+    aggregator = HypothesisAggregator(
+        db,
+        relation_judge=judge,
+        retriever=MultiRetriever([hypothesis.id]),
+        score_threshold=0.0,
+    )
+
+    result = aggregator.process(incoming)
+
+    assert result["action"] == "skipped_ambiguous_relation"
+    assert len(service.list_all(include_inactive=False)) == 1
+
+
+def test_relation_judge_receives_active_pending_signal_context(db):
+    service = HypothesisService(db)
+    base = _reflection(db, 831, "base")
+    hypothesis = service.create_from_reflection(
+        reflection=base,
+        canonical_signal="h1-base",
+    )
+    db.add(
+        RevisionSignal(
+            hypothesis_id=hypothesis.id,
+            base_revision=1,
+            reflection_id=base.id,
+            dimension="ACTION",
+            operation="EXPAND",
+            target_field="response_structure",
+            before_data="先说明职责边界",
+            observed_data="数据流 -> 模块接口",
+            canonical_change="默认按数据流 -> 模块接口组织回答",
+            confidence=0.9,
+        )
+    )
+    db.commit()
+
+    incoming = _reflection(db, 832, "incoming")
+    llm = CountingLLM({
+        "decisions": [{
+            "hypothesis_id": hypothesis.id,
+            "relation": "UNRELATED",
+            "confidence": 0.9,
+            "reason": "model missed pending continuity",
+            "revision_signals": [],
+        }]
+    })
+    aggregator = HypothesisAggregator(
+        db,
+        relation_judge=HypothesisRelationJudge(llm),
+        retriever=MultiRetriever([hypothesis.id]),
+        score_threshold=0.0,
+    )
+
+    result = aggregator.process(incoming)
+
+    payload = json.loads(llm.last_messages[-1]["content"])
+    pending = payload["hypotheses"][0]["pending_signals"]
+    assert len(pending) == 1
+    assert pending[0]["target_field"] == "response_structure"
+    assert pending[0]["observed_data"] == "数据流 -> 模块接口"
+    assert result["action"] == "skipped_ambiguous_relation"
+    assert len(service.list_all(include_inactive=False)) == 1

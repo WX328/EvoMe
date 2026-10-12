@@ -12,6 +12,8 @@ PARAM_COMMAND_NAMES = frozenset({
     "response-policy",
     "revision-rollback",
     "learning-invalidate",
+    "tool-approve",
+    "tool-deny",
 })
 
 COMMAND_NAMES = frozenset(
@@ -48,6 +50,9 @@ COMMAND_NAMES = frozenset(
         "token-usage",
         "audit",
         "skills",
+        "tool-approvals",
+        "tool-approve",
+        "tool-deny",
         "exit",
     }
 )

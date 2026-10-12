@@ -8,6 +8,23 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 EVOME_DB_URL = os.getenv("EVOME_DB_URL", "sqlite:///./evome.db")
 
+# S1 Agent Loop. Disabled by default for migration safety; enable with
+# EVOME_AGENT_LOOP_ENABLED=1 after applying the patch.
+EVOME_AGENT_LOOP_ENABLED = os.getenv(
+    "EVOME_AGENT_LOOP_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_AGENT_MAX_STEPS = max(1, int(os.getenv("EVOME_AGENT_MAX_STEPS", "6")))
+
+# S2 Tool Use. File tools are always workspace-scoped. Bash stays off until
+# explicitly enabled; S3 adds approval/permission policy.
+EVOME_TOOL_WORKSPACE = os.getenv("EVOME_TOOL_WORKSPACE", ".")
+EVOME_BASH_TOOL_ENABLED = os.getenv(
+    "EVOME_BASH_TOOL_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_BASH_TIMEOUT_SECONDS = max(1, int(os.getenv("EVOME_BASH_TIMEOUT_SECONDS", "20")))
+EVOME_TOOL_MAX_OUTPUT_CHARS = max(1000, int(os.getenv("EVOME_TOOL_MAX_OUTPUT_CHARS", "12000")))
+EVOME_BASH_PERMISSION = os.getenv("EVOME_BASH_PERMISSION", "ask").strip().lower()
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.
@@ -25,7 +42,7 @@ EVOME_MAX_TOKENS_REVISION = int(os.getenv("EVOME_MAX_TOKENS_REVISION", "1200"))
 # JSON-helper prompts. The post-turn assessor and the experience gate only need
 # enough of the response to judge intent and outcome.
 EVOME_PROMPT_RESPONSE_CHAR_LIMIT = int(
-    os.getenv("EVOME_PROMPT_RESPONSE_CHAR_LIMIT", "1200")
+    os.getenv("EVOME_PROMPT_RESPONSE_CHAR_LIMIT", "800")
 )
 
 # Phase 5.7D: per-memory character cap for memories embedded into internal

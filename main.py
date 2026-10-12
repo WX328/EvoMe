@@ -497,7 +497,8 @@ def main() -> None:
         "/revision-apply-auto  /candidate-approve <id>  /candidate-reject <id>  "
         "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
         "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
-        "/status  /token-usage  /audit  /skills  /exit\n"
+        "/status  /token-usage  /audit  /skills  /tool-approvals  "
+        "/tool-approve <id>  /tool-deny <id>  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -683,6 +684,31 @@ def main() -> None:
                 show_token_usage(runtime); continue
             if user_input == "/audit":
                 show_interactions(runtime); continue
+            if user_input == "/tool-approvals":
+                items = runtime.list_pending_tool_approvals()
+                if not items:
+                    print("暂无待确认 Tool 调用")
+                for item in items:
+                    print(
+                        f"{item.id} [{item.risk}] tool={item.tool_name} "
+                        f"args={item.arguments} reason={item.reason}"
+                    )
+                continue
+            if user_input.startswith("/tool-approve "):
+                approval_id = user_input.split(maxsplit=1)[1].strip()
+                result = runtime.approve_tool_call(approval_id)
+                if result is None:
+                    print("Agent Loop 未启用。")
+                elif result.success:
+                    print(f"✅ Tool 已执行：{result.tool_name}\n{result.output}")
+                else:
+                    print(f"❌ Tool 执行失败：{result.error}")
+                continue
+            if user_input.startswith("/tool-deny "):
+                approval_id = user_input.split(maxsplit=1)[1].strip()
+                ok = runtime.deny_tool_call(approval_id)
+                print("已拒绝。" if ok else "未找到该待确认请求。")
+                continue
             if user_input == "/skills":
                 show_skills(runtime); continue
 

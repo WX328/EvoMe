@@ -1,6 +1,8 @@
 from langgraph.graph import END, START, StateGraph
 
+from app.agent import AgentLoop
 from app.hypothesis.canonical import build_canonical_signal
+from app.tools import ApprovalStore, PermissionPolicy, build_default_tool_registry
 from app.learning.post_turn_assessor import PostTurnAssessor
 from app.models import ReflectionRecord
 from app.strategy.state import EvoMeState
@@ -39,6 +41,14 @@ class DefaultConversationStrategy:
         evaluation_service,
         post_turn_assessor: PostTurnAssessor,
         skill_registry,
+        enable_agent_loop: bool = False,
+        agent_max_steps: int = 6,
+        tool_workspace: str = ".",
+        enable_bash_tool: bool = False,
+        bash_timeout_seconds: int = 20,
+        tool_max_output_chars: int = 12000,
+        bash_permission: str = "ask",
+        approval_store: ApprovalStore | None = None,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -53,6 +63,25 @@ class DefaultConversationStrategy:
         self.evaluation_service = evaluation_service
         self.post_turn_assessor = post_turn_assessor
         self.skill_registry = skill_registry
+        self.tool_registry = build_default_tool_registry(
+            skill_registry=skill_registry,
+            workspace_root=tool_workspace,
+            enable_bash=enable_bash_tool,
+            bash_timeout_seconds=bash_timeout_seconds,
+            max_output_chars=tool_max_output_chars,
+        )
+        self.approval_store = approval_store or ApprovalStore()
+        self.agent_loop = (
+            AgentLoop(
+                llm=llm,
+                tool_registry=self.tool_registry,
+                max_steps=agent_max_steps,
+                permission_policy=PermissionPolicy(bash_mode=bash_permission),
+                approval_store=self.approval_store,
+            )
+            if enable_agent_loop
+            else None
+        )
         self.graph = self._build_graph()
 
     def _retrieve_memory(self, state: EvoMeState) -> dict:
@@ -86,10 +115,80 @@ class DefaultConversationStrategy:
             {"role": "user", "content": state["user_input"]},
         ]
 
+    @staticmethod
+    def _agent_step_dict(step) -> dict:
+        call = step.tool_call
+        return {
+            "index": step.index,
+            "action": step.action,
+            "tool_name": call.name if call is not None else None,
+            "arguments": dict(call.arguments) if call is not None else {},
+            "error": step.error,
+        }
+
+    @staticmethod
+    def _memory_state_from_agent(result) -> tuple[list[str], float]:
+        contents: list[str] = []
+        confidences: list[float] = []
+        for step in result.steps:
+            call = step.tool_call
+            if call is None or call.name != "recall_relevant_memory":
+                continue
+            output = step.tool_output
+            if not isinstance(output, (list, tuple)):
+                continue
+            for item in output:
+                content = getattr(item, "content", None)
+                if content is None and isinstance(item, dict):
+                    content = item.get("content")
+                if content:
+                    contents.append(str(content))
+                confidence = getattr(item, "confidence", None)
+                if confidence is None and isinstance(item, dict):
+                    confidence = item.get("confidence")
+                if confidence is not None:
+                    try:
+                        confidences.append(float(confidence))
+                    except (TypeError, ValueError):
+                        pass
+        quality = sum(confidences) / len(confidences) if confidences else 0.0
+        return contents, quality
+
+    def _run_agent(self, state: EvoMeState) -> dict:
+        if self.agent_loop is None:
+            return {"response": self.llm.chat(self._response_messages(state))}
+
+        result = self.agent_loop.run(
+            user_input=state["user_input"],
+            context_messages=[{"role": "system", "content": SYSTEM_PROMPT}],
+        )
+        memories, memory_quality = self._memory_state_from_agent(result)
+        skills_used = [
+            call.name
+            for call in result.tool_calls
+            if call.name
+        ]
+        return {
+            "response": result.answer,
+            "relevant_memories": memories,
+            "memory_quality": memory_quality,
+            "skills_used": skills_used,
+            "agent_steps": [self._agent_step_dict(step) for step in result.steps],
+            "agent_termination_reason": result.termination_reason,
+            "tool_error_count": result.tool_error_count,
+        }
+
     def _respond(self, state: EvoMeState) -> dict:
-        return {"response": self.llm.chat(self._response_messages(state))}
+        return self._run_agent(state)
 
     def stream_response(self, state: EvoMeState):
+        if self.agent_loop is not None:
+            result = self._run_agent(state)
+            state.update(result)
+            if result["response"]:
+                yield result["response"]
+            return
+
         messages = self._response_messages(state)
         stream_chat = getattr(self.llm, "stream_chat", None)
         if callable(stream_chat):
@@ -143,6 +242,14 @@ class DefaultConversationStrategy:
         metadata = {
             "skills_used": state.get("skills_used", []),
             "learning_eligibility": state.get("learning_eligibility", {}),
+            "evolution_deferred_by_cadence": bool(
+                state.get("evolution_deferred_by_cadence", False)
+            ),
+            "agent": {
+                "termination_reason": state.get("agent_termination_reason", ""),
+                "tool_error_count": int(state.get("tool_error_count", 0)),
+                "steps": state.get("agent_steps", []),
+            },
         }
         evaluation = state.get("evaluation")
         if evaluation:
@@ -203,9 +310,12 @@ class DefaultConversationStrategy:
             result=assessment.get("context") if isinstance(assessment, dict) else {},
             relevant_memories=state.get("relevant_memories", []),
             available_skills=available_skills,
-            available_tools=[],
+            available_tools=[tool.name for tool in self.tool_registry.list_tools()],
             memory_quality=float(state.get("memory_quality", 0.0)),
             task_type_hint=gate.get("task_type"),
+            prefer_task_type_hint=str(gate.get("decision_source", "")).startswith(
+                "deterministic"
+            ),
         )
         return {"context_data": context_data}
 
@@ -317,9 +427,13 @@ class DefaultConversationStrategy:
             "relevant_memories": [],
             "memory_quality": 0.0,
             "skills_used": [],
+            "agent_steps": [],
+            "agent_termination_reason": "",
+            "tool_error_count": 0,
             "learning_eligibility": {},
             "evaluation": {},
             "post_turn_assessment": {},
+            "evolution_deferred_by_cadence": False,
             "personal_memory_candidates": [],
             "personal_memories_saved": 0,
             "context_data": {},
@@ -335,10 +449,16 @@ class DefaultConversationStrategy:
     def prepare_fast_state(self, *, user_input: str, session_id: str) -> EvoMeState:
         """Synchronous critical path before the first answer token."""
         state = self._initial_state(user_input=user_input, session_id=session_id)
-        state.update(self._retrieve_memory(state))
+        if self.agent_loop is None:
+            state.update(self._retrieve_memory(state))
         return state
 
-    def process_slow_state(self, state: EvoMeState) -> EvoMeState:
+    def process_slow_state(
+        self,
+        state: EvoMeState,
+        *,
+        run_evolution: bool = True,
+    ) -> EvoMeState:
         """Post-response learning path. Safe to execute asynchronously.
 
         Learning Eligibility is the first Slow-Path boundary. Every turn may be
@@ -348,8 +468,14 @@ class DefaultConversationStrategy:
         state = dict(state)
         state.update(self._classify_learning_eligibility(state))
         eligibility = state["learning_eligibility"]
+        evolution_enabled = bool(eligibility.get("allow_evolution")) and bool(
+            run_evolution
+        )
+        state["evolution_deferred_by_cadence"] = bool(
+            eligibility.get("allow_evolution") and not run_evolution
+        )
 
-        if eligibility.get("allow_evolution"):
+        if evolution_enabled:
             state.update(self._assess_post_turn(state))
 
         # InteractionRecord is append-only audit and is intentionally written
@@ -360,7 +486,7 @@ class DefaultConversationStrategy:
             state.update(self._extract_personal_memory(state))
             state.update(self._write_personal_memory(state))
 
-        if not eligibility.get("allow_evolution"):
+        if not evolution_enabled:
             return state
 
         state.update(self._experience_gate(state))

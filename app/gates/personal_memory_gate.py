@@ -3,6 +3,12 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.gates.preference_guard import (
+    explicitly_disallows_storage,
+    has_ambiguous_preference_negation,
+    is_quoted_preference_discussion,
+)
+
 
 PERSONAL_MEMORY_GATE_PROMPT = """
 你是 EvoMe 的 Personal Memory Gate。
@@ -66,20 +72,6 @@ class PersonalMemoryGate:
         "synthetic data",
         "test only",
     )
-    _NO_STORE_MARKERS = (
-        "不要记住",
-        "别记住",
-        "不要保存",
-        "别保存",
-        "不用记住",
-        "不用保存",
-    )
-    _AMBIGUOUS_NEGATION_MARKERS = (
-        "不是说",
-        "并不是",
-        "不代表",
-    )
-
     def __init__(self, llm):
         self.llm = llm
 
@@ -98,9 +90,7 @@ class PersonalMemoryGate:
         if not text:
             return {"should_save": False, "memories": [], "decision_source": "deterministic_hard_skip"}
 
-        if cls._contains_any(text, cls._TESTING_MARKERS) or cls._contains_any(
-            text, cls._NO_STORE_MARKERS
-        ):
+        if cls._contains_any(text, cls._TESTING_MARKERS) or explicitly_disallows_storage(text):
             return {
                 "should_save": False,
                 "memories": [],
@@ -109,7 +99,12 @@ class PersonalMemoryGate:
 
         # Negated/contrastive wording can reverse the apparent preference.
         # Leave those cases to the semantic gate instead of guessing.
-        if cls._contains_any(text, cls._AMBIGUOUS_NEGATION_MARKERS):
+        if has_ambiguous_preference_negation(text):
+            return None
+
+        # A preference mentioned as the subject of a question/example is not
+        # itself a user preference. Let the semantic gate decide if needed.
+        if is_quoted_preference_discussion(text):
             return None
 
         durable_preference = cls._contains_any(text, cls._DURABLE_PREFERENCE_MARKERS)
@@ -136,7 +131,7 @@ class PersonalMemoryGate:
                     "memory_type": "preference",
                     "content": text[:500],
                     "importance": 0.9,
-                    "confidence": 1.0,
+                    "confidence": 0.95,
                 }
             ],
             "decision_source": "deterministic_explicit_preference",
