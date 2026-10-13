@@ -38,16 +38,32 @@ class FileSystemTools:
         start = max(1, int(start_line))
         end = len(lines) if end_line is None else max(start, int(end_line))
         selected = lines[start - 1 : end]
-        numbered = "\n".join(
-            f"{line_no}: {line}"
-            for line_no, line in enumerate(selected, start=start)
-        )
+        # Page on line boundaries so end_line describes content actually sent
+        # to the model, rather than the full requested range before clipping.
+        rendered: list[str] = []
+        size = 0
+        partial_line = False
+        for line_no, line in enumerate(selected, start=start):
+            numbered = f"{line_no}: {line}"
+            needed = len(numbered) + bool(rendered)
+            if size + needed > self.max_output_chars:
+                if not rendered:
+                    rendered.append(self._clip(numbered))
+                    partial_line = True
+                break
+            rendered.append(numbered)
+            size += needed
+        actual_end = start + len(rendered) - 1
+        truncated = partial_line or len(rendered) < len(selected)
         return {
             "path": str(target.relative_to(self.guard.root)),
             "start_line": start,
-            "end_line": start + max(0, len(selected) - 1),
+            "end_line": actual_end,
             "total_lines": len(lines),
-            "content": self._clip(numbered),
+            "content": "\n".join(rendered),
+            "truncated": truncated,
+            "line_truncated": partial_line,
+            "next_start_line": actual_end + 1 if truncated and not partial_line else None,
         }
 
     def write_file(

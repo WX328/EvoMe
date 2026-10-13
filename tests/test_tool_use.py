@@ -4,6 +4,7 @@ import pytest
 
 from app.tools.builtin import build_default_tool_registry
 from app.tools.executor import ToolExecutor
+from app.tools.filesystem import FileSystemTools
 from app.skills.registry import SkillRegistry
 
 
@@ -81,3 +82,31 @@ def test_bash_can_be_explicitly_enabled(tmp_path):
     registry = build_registry(tmp_path, enable_bash=True)
     names = {tool.name for tool in registry.list_tools()}
     assert "bash" in names
+
+
+def test_read_file_reports_actual_page_range_and_can_continue(tmp_path):
+    source = [f"line-{i}: " + "x" * 70 for i in range(60)]
+    (tmp_path / "long.txt").write_text("\n".join(source), encoding="utf-8")
+    fs = FileSystemTools(workspace_root=tmp_path, max_output_chars=1000)
+    start = 1
+    actual = []
+    while True:
+        page = fs.read_file("long.txt", start_line=start)
+        rows = page["content"].splitlines()
+        assert len(page["content"]) <= 1000
+        assert page["end_line"] == start + len(rows) - 1
+        actual.extend(row.split(": ", 1)[1] for row in rows)
+        if not page["truncated"]:
+            assert page["next_start_line"] is None
+            break
+        assert not page["line_truncated"]
+        assert page["next_start_line"] == page["end_line"] + 1
+        start = page["next_start_line"]
+    assert actual == source
+
+
+def test_single_oversized_line_is_explicitly_partial(tmp_path):
+    (tmp_path / "line.txt").write_text("x" * 2000, encoding="utf-8")
+    page = FileSystemTools(workspace_root=tmp_path, max_output_chars=1000).read_file("line.txt")
+    assert page["truncated"] and page["line_truncated"]
+    assert page["next_start_line"] is None

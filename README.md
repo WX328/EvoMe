@@ -230,3 +230,57 @@ outcomes and minimal metadata are retained in a bounded in-memory history;
 no arguments, command text, file contents or prompts are logged there.
 Hooks are local trusted Python callbacks, not executable user prompts. The
 file guard does *not* sandbox arbitrary shell commands.
+
+## S05 Todo / Planning
+
+设置 `EVOME_AGENT_LOOP_ENABLED=1` 与 `EVOME_PLANNING_ENABLED=1`
+可启用基于多步骤 Todo 的 Agent 执行计划。S05 默认关闭以保证 S01-S04 行为不变。
+规划器负责生成至多 `EVOME_PLAN_MAX_TASKS` 个任务，逐个使用现有 Agent Loop
+及其 ToolExecutor 执行，步骤有独立状态、执行摘要和有限重规划预算。
+
+- `/plan <目标>`：生成计划并立即执行可执行的步骤
+- `/plans`：查看计划列表；`/plan-show <id>`：查看每步完整结果和 Todo 状态
+- `/plan-run <id>`：继续待处理步骤，或从暂停步骤的断点续跑
+- `/plan-replan <id>`：失败或暂停后按剩余预算重新规划
+- `/plan-cancel <id>`：取消计划；等待中的 S03 审批同时作废
+
+若写文件或运行 Shell 需要审批，计划进入 `waiting_approval`。
+执行 `/tool-approve <id>` 后再用 `/plan-run <计划ID>` 继续；
+拒绝审批会令步骤失败，不会将未执行操作记为已完成。
+可选 `EVOME_PLAN_AUTO_REPLAN=1`：只对失败过程中使用过只读工具的任务
+尝试自动重新规划（最多 `EVOME_PLAN_MAX_REPLANS` 次）。
+S03 Permission 和 S04 Hooks 仍是每次真实 Tool 调用的硬边界。
+
+每批的工具/决策轮数上限取 `EVOME_AGENT_MAX_STEPS` 和
+`EVOME_PLAN_STEP_MAX_STEPS` 的较小值。最后一次成功的工具调用后，额外保留一次
+只能回答、不能执行工具的收尾机会；模型必须明确确认任务完成，否则仍显示未完成。
+若当前步骤仍需读取资料，且此前只有成功的只读工具调用，会保留原始工具结果、
+消息和重复调用记录，自动续跑最多 `EVOME_PLAN_STEP_MAX_CONTINUATIONS` 批（默认 2，
+设为 0 可关闭自动续跑）。每次 `/plan` 或 `/plan-run` 对每步分别执行这一有限预算。
+预算用尽后状态为 `paused`，可用 `/plan-run <id>` 继续原步骤，不必重新规划。
+有工具错误、需要审批或涉及写入的步骤不会自动续跑；新调用仍经过权限和 Hooks。
+重新规划会替换所有旧的未完成步骤，
+已完成和被替换的步骤保留为历史记录。
+
+长文件按行分页读取，返回实际 `end_line`、`truncated` 和 `next_start_line`。
+单行超过输出上限时会明确标记 `line_truncated`，不会把部分内容当作全文。
+`/plan-show <id>` 还会显示工具调用及实际读取范围，便于定位缺少的证据。
+
+每步结果完整保存在内存中；普通列表的省略摘要会提示 `/plan-show <id>`，
+计划完成时直接展示最后一步的完整回答。Agent 回答使用独立的
+`EVOME_MAX_TOKENS_AGENT`（默认 4096），内部 JSON 辅助任务继续使用原有预算。
+模型报告输出长度耗尽时，截断的 Agent JSON 不会作为工具指令或完成结果执行。
+
+Agent 的决策 JSON 只包含工具参数或 `task_complete`，长篇回答在独立的文本阶段生成，
+避免 Markdown、引号和换行破坏控制消息。格式异常只额外重试一次；连续异常显示
+`protocol_error`，不会误报步数耗尽，也不会信任自动修复的 JSON。文本回答达到输出
+上限时仍显示未完成。独立文本阶段会增加一次模型调用，可用 `/token-usage` 查看用量。
+
+计划执行时，每次只处理当前步骤，其他任务由调度器继续执行。
+若目标包含查看执行记录，模型可调用只读 `plan_show` 工具，实际计划 ID 由运行时提供；
+无需模型猜测 ID 或执行 CLI/Shell 命令。综合步骤可以使用已完成步骤的文件证据，
+但查看计划记录不能代替读取源码。连续没有新工具调用且未确认完成时，会明确提示
+没有进展并暂停，避免自动重复。手动 `/plan-show <id>` 始终可查看当前完整记录。
+
+S05 的计划和 Todo 记录仅保存在当前进程内，重启后清空；
+不是持久化任务队列，也不会自动写入 Personal Memory。

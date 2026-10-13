@@ -1,6 +1,6 @@
 from langgraph.graph import END, START, StateGraph
 
-from app.agent import AgentLoop
+from app.agent import AgentLoop, PlanStore
 from app.hooks.manager import HookManager
 from app.hypothesis.canonical import build_canonical_signal
 from app.tools import ApprovalStore, PermissionPolicy, build_default_tool_registry
@@ -51,6 +51,14 @@ class DefaultConversationStrategy:
         bash_permission: str = "ask",
         approval_store: ApprovalStore | None = None,
         hook_manager: HookManager | None = None,
+        planning_enabled: bool = False,
+        plan_store: PlanStore | None = None,
+        plan_max_tasks: int = 5,
+        plan_step_max_steps: int = 4,
+        plan_step_max_continuations: int = 2,
+        plan_max_replans: int = 1,
+        plan_auto_replan: bool = False,
+        plan_require_file_evidence: bool = False,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -81,6 +89,14 @@ class DefaultConversationStrategy:
                 permission_policy=PermissionPolicy(bash_mode=bash_permission),
                 approval_store=self.approval_store,
                 hook_manager=hook_manager,
+                planning_enabled=planning_enabled,
+                plan_store=plan_store,
+                plan_max_tasks=plan_max_tasks,
+                plan_step_max_steps=plan_step_max_steps,
+                plan_step_max_continuations=plan_step_max_continuations,
+                plan_max_replans=plan_max_replans,
+                plan_auto_replan=plan_auto_replan,
+                plan_require_file_evidence=plan_require_file_evidence,
             )
             if enable_agent_loop
             else None

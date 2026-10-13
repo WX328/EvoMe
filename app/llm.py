@@ -8,6 +8,7 @@ from app.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    EVOME_MAX_TOKENS_AGENT,
     EVOME_MAX_TOKENS_CHAT,
     EVOME_MAX_TOKENS_CONTEXT,
     EVOME_MAX_TOKENS_EVALUATION,
@@ -19,6 +20,7 @@ from app.config import (
     EVOME_MAX_TOKENS_REVISION,
 )
 from app.telemetry import GLOBAL_TOKEN_USAGE
+from app.llm_errors import AnswerOutputLimitError
 
 
 class DeepSeekClient:
@@ -71,6 +73,8 @@ class DeepSeekClient:
     def _max_tokens_for(purpose: str) -> int:
         if purpose == "fast_chat":
             return EVOME_MAX_TOKENS_CHAT
+        if purpose in {"agent_loop", "agent_answer"}:
+            return EVOME_MAX_TOKENS_AGENT
         if purpose == "evaluation":
             return EVOME_MAX_TOKENS_EVALUATION
         if purpose in {"learning_eligibility", "personal_memory_gate", "experience_gate"}:
@@ -116,15 +120,23 @@ class DeepSeekClient:
         max_tokens: int | None = None,
     ) -> str:
         resolved_purpose = purpose or self._infer_purpose(messages, fallback="fast_chat")
+        options = {}
+        if resolved_purpose == "agent_answer":
+            options["extra_body"] = {"thinking": {"type": "disabled"}}
         response = self.client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens or self._max_tokens_for(resolved_purpose),
             stream=False,
+            **options,
         )
         self._record_usage(purpose=resolved_purpose, response=response)
-        return response.choices[0].message.content or ""
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        if resolved_purpose == "agent_answer" and getattr(choice, "finish_reason", "") == "length":
+            raise AnswerOutputLimitError(content)
+        return content
 
     def stream_chat(
         self,
@@ -197,20 +209,46 @@ class DeepSeekClient:
         finish_reason = str(getattr(choice, "finish_reason", "") or "")
         if finish_reason == "length":
             print(f"\n⚠️ LLM JSON 输出触发长度上限：purpose={resolved_purpose}")
+            if resolved_purpose in {"agent_loop", "agent_plan"}:
+                # A repaired, truncated tool call must never be executed, nor
+                # may a partial final answer be accepted as a completed task.
+                partial = (
+                    repair_json(choice.message.content or "{}", return_objects=True)
+                    if resolved_purpose == "agent_loop" else {}
+                )
+                answer = (
+                    str(partial.get("answer", ""))[:1200]
+                    if isinstance(partial, dict) and partial.get("action") == "final"
+                    else ""
+                )
+                return {
+                    "action": "output_limit",
+                    "answer": answer + (
+                        "\n\nAgent 输出达到长度上限，任务未确认完成。"
+                        "请缩小当前任务，或调整 EVOME_MAX_TOKENS_AGENT 后重试。"
+                    ),
+                }
         content = (choice.message.content or "{}").strip()
 
         try:
             return json.loads(content)
         except json.JSONDecodeError as exc:
-            print("\n⚠️ LLM 返回了非标准 JSON")
-            print(f"JSON Error: {exc}")
-            print(f"Raw content:\n{content}\n")
+            # Do not dump raw model output: it may contain secrets or file
+            # content obtained through read_file. Log diagnostics only.
+            print(
+                f"\n⚠️ LLM JSON 格式异常：purpose={resolved_purpose}, "
+                f"error={exc.msg}, pos={exc.pos}；尝试恢复。"
+            )
 
         try:
             repaired = repair_json(content, return_objects=True)
             if isinstance(repaired, dict):
+                if resolved_purpose in {"agent_loop", "agent_plan"}:
+                    # Tool calls, plan actions, and task completion assertions
+                    # must never be trusted after structural JSON repair.
+                    return {**repaired, "_json_repaired": True}
                 return repaired
         except Exception as exc:
-            print(f"JSON repair failed: {exc}")
+            print(f"JSON repair failed: {type(exc).__name__}")
 
         return {}

@@ -26,7 +26,11 @@ def build_default_tool_registry(
     definitions = [
         ToolDefinition(
             name="read_file",
-            description="读取 EvoMe 工作区内的 UTF-8 文本文件，可指定行范围。",
+            description=(
+                "读取 EvoMe 工作区内的 UTF-8 文本文件，可指定行范围。"
+                "truncated=true 时内容不完整；有 next_start_line 时从该行继续读取。"
+                "line_truncated=true 表示单行超过输出上限，不能当作完整内容。"
+            ),
             input_schema={
                 "path": {"type": "string"},
                 "start_line": {"type": "integer", "default": 1},

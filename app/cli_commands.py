@@ -14,6 +14,11 @@ PARAM_COMMAND_NAMES = frozenset({
     "learning-invalidate",
     "tool-approve",
     "tool-deny",
+    "plan",
+    "plan-show",
+    "plan-run",
+    "plan-replan",
+    "plan-cancel",
 })
 
 COMMAND_NAMES = frozenset(
@@ -51,6 +56,12 @@ COMMAND_NAMES = frozenset(
         "audit",
         "skills",
         "hooks",
+        "plans",
+        "plan",
+        "plan-show",
+        "plan-run",
+        "plan-replan",
+        "plan-cancel",
         "tool-approvals",
         "tool-approve",
         "tool-deny",

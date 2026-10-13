@@ -499,7 +499,9 @@ def main() -> None:
         "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
         "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
         "/status  /token-usage  /audit  /skills  /hooks  /tool-approvals  "
-        "/tool-approve <id>  /tool-deny <id>  /exit\n"
+        "/tool-approve <id>  /tool-deny <id>  /plans  /plan <goal>  "
+        "/plan-show <id>  /plan-run <id>  /plan-replan <id>  "
+        "/plan-cancel <id>  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -696,6 +698,43 @@ def main() -> None:
                         f"risk={entry.risk or '-'} status={entry.status or '-'}"
                         + (f" reason={entry.reason}" if entry.reason else "")
                     )
+                continue
+            if user_input == "/plans":
+                try:
+                    items = runtime.list_plans()
+                    if not items:
+                        print("暂无执行计划")
+                    for plan in items:
+                        print(
+                            f"{plan.id} [{plan.status}] "
+                            f"{plan.completed_count}/{len(plan.steps)} "
+                            f"{plan.goal[:120]}"
+                        )
+                except Exception as exc:
+                    print(f"❌ Planning Error: {exc}")
+                continue
+            if user_input.startswith((
+                "/plan ", "/plan-show ", "/plan-run ",
+                "/plan-replan ", "/plan-cancel ",
+            )):
+                try:
+                    command, value = user_input.split(maxsplit=1)
+                    value = value.strip()
+                    if not value:
+                        raise ValueError("请提供目标或计划 ID")
+                    if command == "/plan":
+                        plan = runtime.create_plan(value)
+                    elif command == "/plan-show":
+                        plan = runtime.get_plan(value)
+                    elif command == "/plan-run":
+                        plan = runtime.resume_plan(value)
+                    elif command == "/plan-replan":
+                        plan = runtime.replan(value)
+                    else:
+                        plan = runtime.cancel_plan(value)
+                    print(runtime.describe_plan(plan.id, detail=command == "/plan-show"))
+                except Exception as exc:
+                    print(f"❌ Planning Error: {exc}")
                 continue
             if user_input == "/tool-approvals":
                 items = runtime.list_pending_tool_approvals()

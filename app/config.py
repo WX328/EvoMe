@@ -34,10 +34,29 @@ EVOME_HOOK_PROTECT_SECRETS = os.getenv(
     "EVOME_HOOK_PROTECT_SECRETS", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# S05 Todo/Planning is opt-in to preserve the S01-S04 conversation behavior.
+EVOME_PLANNING_ENABLED = os.getenv(
+    "EVOME_PLANNING_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_PLAN_MAX_TASKS = max(1, min(10, int(os.getenv("EVOME_PLAN_MAX_TASKS", "5"))))
+EVOME_PLAN_STEP_MAX_STEPS = max(1, min(12, int(os.getenv("EVOME_PLAN_STEP_MAX_STEPS", "4"))))
+EVOME_PLAN_STEP_MAX_CONTINUATIONS = max(0, min(3, int(os.getenv("EVOME_PLAN_STEP_MAX_CONTINUATIONS", "2"))))
+EVOME_PLAN_MAX_REPLANS = max(0, min(3, int(os.getenv("EVOME_PLAN_MAX_REPLANS", "1"))))
+EVOME_PLAN_AUTO_REPLAN = os.getenv(
+    "EVOME_PLAN_AUTO_REPLAN", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Require actual file-tool evidence before marking code-reading plan steps done.
+EVOME_PLAN_REQUIRE_FILE_EVIDENCE = os.getenv(
+    "EVOME_PLAN_REQUIRE_FILE_EVIDENCE", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.
 EVOME_MAX_TOKENS_CHAT = int(os.getenv("EVOME_MAX_TOKENS_CHAT", "4096"))
+# Agent JSON includes the user-facing answer, unlike internal JSON helpers.
+EVOME_MAX_TOKENS_AGENT = int(os.getenv("EVOME_MAX_TOKENS_AGENT", "4096"))
 EVOME_MAX_TOKENS_JSON_DEFAULT = int(os.getenv("EVOME_MAX_TOKENS_JSON_DEFAULT", "768"))
 EVOME_MAX_TOKENS_EVALUATION = int(os.getenv("EVOME_MAX_TOKENS_EVALUATION", "512"))
 EVOME_MAX_TOKENS_GATE = int(os.getenv("EVOME_MAX_TOKENS_GATE", "384"))

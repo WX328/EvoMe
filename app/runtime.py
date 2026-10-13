@@ -6,12 +6,20 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.agent import PlanStore
 from app.audit.service import AuditService
 from app.background import BackgroundEvolutionQueue
 from app.config import (
     DEEPSEEK_MODEL,
     EVOME_AGENT_LOOP_ENABLED,
     EVOME_AGENT_MAX_STEPS,
+    EVOME_PLANNING_ENABLED,
+    EVOME_PLAN_MAX_TASKS,
+    EVOME_PLAN_STEP_MAX_STEPS,
+    EVOME_PLAN_STEP_MAX_CONTINUATIONS,
+    EVOME_PLAN_MAX_REPLANS,
+    EVOME_PLAN_AUTO_REPLAN,
+    EVOME_PLAN_REQUIRE_FILE_EVIDENCE,
     EVOME_HOOKS_ENABLED,
     EVOME_HOOK_HISTORY_LIMIT,
     EVOME_HOOK_PROTECT_SECRETS,
@@ -156,6 +164,7 @@ class EvoMeRuntime:
         self.post_turn_assessor = PostTurnAssessor(self.llm)
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
         self.tool_approval_store = ApprovalStore()
+        self.plan_store = PlanStore()
         self.hook_manager = (
             HookManager(history_limit=EVOME_HOOK_HISTORY_LIMIT)
             if EVOME_HOOKS_ENABLED
@@ -243,6 +252,14 @@ class EvoMeRuntime:
             bash_permission=EVOME_BASH_PERMISSION,
             approval_store=self.tool_approval_store,
             hook_manager=self.hook_manager,
+            planning_enabled=EVOME_PLANNING_ENABLED and self.enable_agent_loop,
+            plan_store=self.plan_store,
+            plan_max_tasks=EVOME_PLAN_MAX_TASKS,
+            plan_step_max_steps=EVOME_PLAN_STEP_MAX_STEPS,
+            plan_step_max_continuations=EVOME_PLAN_STEP_MAX_CONTINUATIONS,
+            plan_max_replans=EVOME_PLAN_MAX_REPLANS,
+            plan_auto_replan=EVOME_PLAN_AUTO_REPLAN,
+            plan_require_file_evidence=EVOME_PLAN_REQUIRE_FILE_EVIDENCE,
         )
 
     @property
@@ -643,16 +660,61 @@ class EvoMeRuntime:
     def list_hook_events(self, limit: int = 20):
         return self.hook_manager.recent(limit=limit) if self.hook_manager else []
 
+    def _planner(self):
+        agent = self.strategy.agent_loop
+        if agent is None or agent.planner is None:
+            raise ValueError("S05 Planning 未启用；请检查 EVOME_PLANNING_ENABLED=1")
+        return agent.planner
+
+    def list_plans(self):
+        return self._planner().list()
+
+    def get_plan(self, plan_id: str):
+        return self._planner().get(plan_id)
+
+    def describe_plan(self, plan_id: str, *, detail: bool = False) -> str:
+        planner = self._planner()
+        return planner.describe(planner.get(plan_id), detail=detail)
+
+    def create_plan(self, goal: str):
+        planner = self._planner()
+        plan = planner.create_from_llm(goal)
+        return planner.run(plan.id)
+
+    def resume_plan(self, plan_id: str):
+        return self._planner().run(plan_id)
+
+    def replan(self, plan_id: str):
+        return self._planner().replan(plan_id)
+
+    def cancel_plan(self, plan_id: str):
+        planner = self._planner()
+        plan = planner.get(plan_id)
+        for step in plan.steps:
+            if step.approval_id:
+                self.strategy.agent_loop.executor.deny(step.approval_id)
+        return planner.cancel(plan_id)
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
     def approve_tool_call(self, approval_id: str):
-        return self.strategy.agent_loop.executor.approve(approval_id) if self.strategy.agent_loop else None
+        agent = self.strategy.agent_loop
+        if agent is None:
+            return None
+        result = agent.executor.approve(approval_id)
+        if agent.planner is not None:
+            agent.planner.on_approval(approval_id, result)
+        return result
 
     def deny_tool_call(self, approval_id: str) -> bool:
-        if self.strategy.agent_loop is None:
+        agent = self.strategy.agent_loop
+        if agent is None:
             return False
-        return self.strategy.agent_loop.executor.deny(approval_id)
+        was_denied = agent.executor.deny(approval_id)
+        if was_denied and agent.planner is not None:
+            agent.planner.on_approval(approval_id, None, denied=True)
+        return was_denied
 
     def token_usage_summary(self) -> dict[str, Any]:
         return GLOBAL_TOKEN_USAGE.summary()

@@ -20,10 +20,23 @@ class AgentStep:
 
 
 @dataclass(frozen=True)
+class AgentCheckpoint:
+    """In-process continuation state; never persisted as user memory."""
+
+    user_input: str
+    messages: tuple[dict[str, str], ...]
+    steps: tuple[AgentStep, ...]
+    seen_calls: frozenset[str]
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     answer: str
     steps: tuple[AgentStep, ...]
     termination_reason: str
+    approval_id: str = ""
+    plan_id: str = ""
+    checkpoint: AgentCheckpoint | None = None
 
     @property
     def tool_calls(self) -> tuple[ToolCall, ...]:
