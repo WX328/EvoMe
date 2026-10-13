@@ -405,3 +405,31 @@ The default memory directory is workspace-relative and symlinks are refused.
 3. /agent-memory-list; /agent-memory-find EvoMe Python 代码审查只读
 4. Restart process, then re-run the find query; record persists.
 5. /agent-memory-propose 本次临时任务只读取文件（should stage nothing).
+
+## S10 Durable Task System
+
+S10 is a file-backed dependency DAG, separate from S05 in-memory Planning.
+Turn on EVOME_AGENT_LOOP_ENABLED=1 and EVOME_TASK_SYSTEM_ENABLED=1.
+Records are under .tasks/task_XXXXXXXX.json (workspace relative, Git-ignored).
+
+- Each task has a title, optional description, status, blockedBy, owner, timestamps, version and result.
+- States: pending → in_progress → completed. A task is ready when every blockedBy dependency is completed.
+- Read commands: /task-list, /task-ready, /task-show <id>.
+- Explicit operator commands: /task-create <title>, /task-depend <id> <dependency_id>, /task-start <id> [owner], /task-done <id> [owner], /task-release <id> [owner].
+- Model tools: task_list, task_ready, task_get (read-only); task_create, task_add_dependency, task_claim, task_complete, task_release (S03 approval required).
+- Dependencies must already exist; no self links, duplicates, cycles or changes after task claim.
+- A task can be completed only by its current owner. Releases allow manually restarting abandoned claims.
+- Task JSON updates use temporary files and os.replace. Invalid/corrupt JSON and missing dependencies are treated as errors, not silently ignored.
+- S05 execution plans remain unchanged; S06 Research Subagent has no Task System tools.
+- S08 context compaction cannot delete task state. S09 memory is a separate store.
+- Direct write_file and edit_file attempts into .tasks are denied by S03. When Bash is enabled, keep EVOME_BASH_PERMISSION at ask or deny and do not approve arbitrary shell writes.
+- Task claiming does NOT run jobs: S11 adds asynchronous execution. This store is single-process; atomic multi-process task claims belong to S13.
+
+### S10 manual acceptance
+
+1. Create two tasks with /task-create Setup database and /task-create Build API. Copy their IDs.
+2. Link the second to the first via /task-depend <second> <first>.
+3. /task-ready should show only the first; /task-start <second> should be blocked.
+4. /task-start <first>, then /task-done <first>. Now /task-ready should show second.
+5. Exit and restart python main.py, then /task-list and /task-show <second>. Both the state and dependency should persist.
+6. Agent tool test: ask EvoMe to call task_create; /tool-approvals must show approval before disk changes.

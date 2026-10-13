@@ -14,3 +14,6 @@ scripts/__pycache__/
 
 # Local S09 Agent working memory (can contain private project preferences)
 .memory/
+
+# Local S10 persistent task state
+.tasks/

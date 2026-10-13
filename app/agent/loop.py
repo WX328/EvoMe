@@ -9,6 +9,7 @@ from app.agent.schema import AgentCheckpoint, AgentRunResult, AgentStep, ToolCal
 from app.agent.subagent import ResearchSubagent
 from app.agent.compaction import ContextBudgetError, ContextCompactor
 from app.agent.memory import AgentMemoryStore
+from app.agent.task_system import TaskStore
 from app.skills.loader import SkillLoader
 from app.agent.planning import PlanningService, PlanStore
 from app.hooks.manager import HookContext, HookManager
@@ -89,6 +90,7 @@ class AgentLoop:
         context_max_chars: int = 16000,
         context_keep_recent_messages: int = 6,
         agent_memory_store: AgentMemoryStore | None = None,
+        task_store: TaskStore | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -104,6 +106,7 @@ class AgentLoop:
         self.max_steps = max_steps
         self.skill_loader = skill_loader
         self.agent_memory_store = agent_memory_store
+        self.task_store = task_store
         self.context_compactor = (
             ContextCompactor(
                 max_chars=context_max_chars,
@@ -194,6 +197,37 @@ class AgentLoop:
                 tool_name="recall_agent_memory",
                 handler=self.agent_memory_store.recall,
             ))
+
+        if self.task_store is not None:
+            for name, description, schema, handler in (
+                ("task_list", "只读列出 S10 持久化任务图及阻塞状态。",
+                 {}, self.task_store.list_tasks),
+                ("task_ready", "只读列出无未完成依赖的待领取任务。",
+                 {}, self.task_store.ready_tasks),
+                ("task_get", "只读查看一个任务及其 blockedBy 依赖。",
+                 {"task_id": {"type": "string"}}, self.task_store.get_task),
+                ("task_create", "创建持久化任务，需人工审批；不实际执行任务。",
+                 {"title": {"type": "string"}, "description": {"type": "string"},
+                  "blockedBy": {"type": "array"}}, self.task_store.create_task),
+                ("task_add_dependency", "新增 blockedBy 依赖，防止环路，需审批。",
+                 {"task_id": {"type": "string"},
+                  "dependency_id": {"type": "string"}}, self.task_store.add_dependency),
+                ("task_claim", "领取无阻塞任务，需审批；不实际执行任务。",
+                 {"task_id": {"type": "string"}, "owner": {"type": "string"}},
+                 self.task_store.claim_task),
+                ("task_complete", "明确核实完成后标记任务完成，需审批。",
+                 {"task_id": {"type": "string"}, "owner": {"type": "string"},
+                  "result": {"type": "string"}}, self.task_store.complete_task),
+                ("task_release", "当前 owner 主动释放未完成任务，需审批。",
+                 {"task_id": {"type": "string"}, "owner": {"type": "string"}},
+                 self.task_store.release_task),
+            ):
+                self.tool_registry.register_tool(ToolDefinition(
+                    name=name, description=description, input_schema=schema,
+                ))
+                self.tool_registry.register_implementation(ToolImplementation(
+                    name=f"s10_{name}_v1", tool_name=name, handler=handler,
+                ))
 
     def checkpoint_after_approval(
         self,

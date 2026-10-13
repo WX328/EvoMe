@@ -506,7 +506,10 @@ def main() -> None:
         "/agent-memory-list  /agent-memory-find <query>  "
         "/agent-memory-propose <user statement>  /agent-memory-pending  "
         "/agent-memory-approve <id>  /agent-memory-deny <id>  "
-        "/agent-memory-preview  /agent-memory-consolidate  /exit\n"
+        "/agent-memory-preview  /agent-memory-consolidate  "
+        "/task-list  /task-ready  /task-show <id>  /task-create <title>  "
+        "/task-depend <id> <dependency>  /task-start <id> [owner]  "
+        "/task-done <id> [owner]  /task-release <id> [owner]  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -781,6 +784,65 @@ def main() -> None:
                     print(runtime.consolidate_agent_memories())
                 except Exception as exc:
                     print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input in {"/task-list", "/task-ready"}:
+                try:
+                    tasks = (
+                        runtime.list_durable_tasks()
+                        if user_input == "/task-list"
+                        else runtime.ready_durable_tasks()
+                    )
+                    if not tasks:
+                        print("S10 暂无符合条件的持久化任务")
+                    for task in tasks:
+                        blockers = ",".join(task["blockedByOpen"]) or "-"
+                        print(
+                            f"  {task['id']} [{task['status']}] "
+                            f"ready={task['ready']} blockedByOpen={blockers} "
+                            f"owner={task['owner'] or '-'} | {task['title']}"
+                        )
+                except Exception as exc:
+                    print(f"S10 Task Error: {exc}")
+                continue
+            if user_input.startswith("/task-show "):
+                try:
+                    task_id = user_input.split(maxsplit=1)[1].strip()
+                    print(runtime.get_durable_task(task_id))
+                except Exception as exc:
+                    print(f"S10 Task Error: {exc}")
+                continue
+            if user_input.startswith("/task-create "):
+                try:
+                    title = user_input.split(maxsplit=1)[1].strip()
+                    task = runtime.create_durable_task(title)
+                    print(f"S10 已创建 {task['id']} [pending] {task['title']}")
+                except Exception as exc:
+                    print(f"S10 Task Error: {exc}")
+                continue
+            if user_input.startswith("/task-depend "):
+                try:
+                    _, task_id, dependency_id = user_input.split()
+                    task = runtime.add_durable_dependency(task_id, dependency_id)
+                    print(f"S10 {task['id']} blockedBy={task['blockedBy']}")
+                except Exception as exc:
+                    print(f"S10 Task Error: {exc}")
+                continue
+            if user_input.startswith(("/task-start ", "/task-done ", "/task-release ")):
+                try:
+                    tokens = user_input.split()
+                    if not 2 <= len(tokens) <= 3:
+                        raise ValueError("用法：/task-start|task-done|task-release <id> [owner]")
+                    action, task_id = tokens[:2]
+                    owner = tokens[2] if len(tokens) == 3 else "operator"
+                    if action == "/task-start":
+                        task = runtime.claim_durable_task(task_id, owner)
+                    elif action == "/task-done":
+                        task = runtime.complete_durable_task(task_id, owner)
+                    else:
+                        task = runtime.release_durable_task(task_id, owner)
+                    print(f"S10 {task['id']} [{task['status']}] owner={task['owner'] or '-'}")
+                except Exception as exc:
+                    print(f"S10 Task Error: {exc}")
                 continue
             if user_input == "/context-stats":
                 print(runtime.context_compaction_stats())

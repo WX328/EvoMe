@@ -91,6 +91,12 @@ EVOME_AGENT_MEMORY_RECALL_CHARS = max(
     400, min(6000, int(os.getenv("EVOME_AGENT_MEMORY_RECALL_CHARS", "1800")))
 )
 
+# S10 durable Task System, separate from S05 session plans and S11 workers.
+EVOME_TASK_SYSTEM_ENABLED = os.getenv(
+    "EVOME_TASK_SYSTEM_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_TASK_DIRECTORY = os.getenv("EVOME_TASK_DIRECTORY", ".tasks")
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

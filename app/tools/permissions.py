@@ -28,12 +28,17 @@ class PermissionPolicy:
         bash_mode: str = "ask",
         workspace_root: str | Path = ".",
         protected_memory_directory: str | Path | None = None,
+        protected_task_directory: str | Path | None = None,
     ) -> None:
         self.bash_mode = bash_mode
         self.workspace_root = Path(workspace_root).resolve()
         self.protected_memory_directory = (
             Path(protected_memory_directory).resolve()
             if protected_memory_directory is not None else None
+        )
+        self.protected_task_directory = (
+            Path(protected_task_directory).resolve()
+            if protected_task_directory is not None else None
         )
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PermissionDecision:
@@ -51,6 +56,27 @@ class PermissionPolicy:
                         )
                 except (ValueError, OSError, RuntimeError):
                     return PermissionDecision("deny", "high", "unresolvable memory write target")
+        if self.protected_task_directory is not None and tool_name in {"write_file", "edit_file"}:
+            path = arguments.get("path")
+            if isinstance(path, str):
+                try:
+                    requested = (self.workspace_root / path).resolve(strict=False)
+                    if requested.is_relative_to(self.protected_task_directory):
+                        return PermissionDecision(
+                            "deny", "high",
+                            "S10 task state must be modified through the TaskStore",
+                        )
+                except (ValueError, OSError, RuntimeError):
+                    return PermissionDecision("deny", "high", "unresolvable task write target")
+        if tool_name in {"task_list", "task_get", "task_ready"}:
+            return PermissionDecision("allow", "low", "read-only durable task lookup")
+        if tool_name in {
+            "task_create", "task_add_dependency", "task_claim",
+            "task_complete", "task_release",
+        }:
+            return PermissionDecision(
+                "ask", "medium", "persistent task mutation requires approval"
+            )
         if tool_name in {"read_file", "glob", "recall_relevant_memory", "plan_show", "delegate_research", "load_skill", "recall_agent_memory"}:
             return PermissionDecision("allow", "low", "read-only or memory retrieval")
 

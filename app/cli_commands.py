@@ -25,6 +25,12 @@ PARAM_COMMAND_NAMES = frozenset({
     "agent-memory-propose",
     "agent-memory-approve",
     "agent-memory-deny",
+    "task-create",
+    "task-depend",
+    "task-show",
+    "task-start",
+    "task-done",
+    "task-release",
 })
 
 COMMAND_NAMES = frozenset(
@@ -72,6 +78,14 @@ COMMAND_NAMES = frozenset(
         "agent-memory-deny",
         "agent-memory-preview",
         "agent-memory-consolidate",
+        "task-list",
+        "task-ready",
+        "task-show",
+        "task-create",
+        "task-depend",
+        "task-start",
+        "task-done",
+        "task-release",
         "hooks",
         "plans",
         "plan",

@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent import PlanStore
+from app.agent.task_system import TaskStore
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
 from app.audit.service import AuditService
@@ -14,6 +15,8 @@ from app.background import BackgroundEvolutionQueue
 from app.config import (
     DEEPSEEK_MODEL,
     EVOME_AGENT_LOOP_ENABLED,
+    EVOME_TASK_SYSTEM_ENABLED,
+    EVOME_TASK_DIRECTORY,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -180,6 +183,13 @@ class EvoMeRuntime:
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
         self.tool_approval_store = ApprovalStore()
         self.plan_store = PlanStore()
+        self.task_store = (
+            TaskStore(
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                directory=EVOME_TASK_DIRECTORY,
+            )
+            if EVOME_TASK_SYSTEM_ENABLED and self.enable_agent_loop else None
+        )
         self.agent_memory_store = (
             AgentMemoryStore(
                 workspace_root=EVOME_TOOL_WORKSPACE,
@@ -297,6 +307,7 @@ class EvoMeRuntime:
             context_max_chars=EVOME_CONTEXT_MAX_CHARS,
             context_keep_recent_messages=EVOME_CONTEXT_KEEP_RECENT_MESSAGES,
             agent_memory_store=self.agent_memory_store,
+            task_store=self.task_store,
         )
 
     @property
@@ -818,6 +829,38 @@ class EvoMeRuntime:
     def consolidate_agent_memories(self):
         # Explicit operator-only action with snapshot/rollback.
         return self._agent_memory().store.consolidate_duplicates()
+
+    def _durable_tasks(self) -> TaskStore:
+        if self.task_store is None:
+            raise ValueError(
+                "S10 Task System 未启用；检查 EVOME_AGENT_LOOP_ENABLED "
+                "和 EVOME_TASK_SYSTEM_ENABLED"
+            )
+        return self.task_store
+
+    def list_durable_tasks(self):
+        return self._durable_tasks().list_tasks()
+
+    def ready_durable_tasks(self):
+        return self._durable_tasks().ready_tasks()
+
+    def get_durable_task(self, task_id: str):
+        return self._durable_tasks().get_task(task_id)
+
+    def create_durable_task(self, title: str):
+        return self._durable_tasks().create_task(title)
+
+    def add_durable_dependency(self, task_id: str, dependency_id: str):
+        return self._durable_tasks().add_dependency(task_id, dependency_id)
+
+    def claim_durable_task(self, task_id: str, owner: str = "operator"):
+        return self._durable_tasks().claim_task(task_id, owner)
+
+    def complete_durable_task(self, task_id: str, owner: str = "operator"):
+        return self._durable_tasks().complete_task(task_id, owner)
+
+    def release_durable_task(self, task_id: str, owner: str = "operator"):
+        return self._durable_tasks().release_task(task_id, owner)
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
