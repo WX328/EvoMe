@@ -116,6 +116,7 @@ def test_write_plan_pauses_for_approval_then_resumes_without_duplicate():
     agent, calls = make_agent([
         {"action": "tool", "tool_name": "write_file",
          "arguments": {"path": "demo.txt", "content": "ok"}},
+        {"action": "final", "answer": "批准后已验证当前写入步骤"},
         {"action": "final", "answer": "最后检查完成"},
     ], permission_policy=PermissionPolicy(), hook_manager=hooks)
     plan = agent.planner.create("创建并检查", ["创建一个文件", "检查结果"])

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 
 from app.agent.schema import AgentCheckpoint, AgentRunResult, AgentStep, ToolCall
 from app.agent.planning import PlanningService, PlanStore
 from app.hooks.manager import HookContext, HookManager
 from app.llm_errors import AnswerOutputLimitError
-from app.tools.base import ToolDefinition, ToolImplementation
+from app.tools.base import ToolDefinition, ToolImplementation, ToolResult
 from app.tools.executor import ToolExecutor
 from app.tools.permissions import ApprovalStore, PermissionPolicy
 from app.tools.registry import ToolRegistry
@@ -109,6 +109,61 @@ class AgentLoop:
             self.tool_registry.register_implementation(ToolImplementation(
                 name="runtime_plan_show", tool_name="plan_show", handler=self.planner.inspect,
             ))
+
+    def checkpoint_after_approval(
+        self,
+        checkpoint: AgentCheckpoint,
+        approval_id: str,
+        result: ToolResult,
+    ) -> AgentCheckpoint:
+        """Resume from a confirmed S03 result, without repeating the side effect.
+
+        A pending tool result is *not* a completed step. The approved tool is
+        inserted into the same decision transcript and the model must finish
+        the remainder of the original task on the next /plan-run.
+        """
+        if not result.success or result.status != "executed":
+            raise ValueError("approved tool did not execute successfully")
+        if not checkpoint.steps:
+            raise ValueError("approval checkpoint contains no pending tool")
+        last = checkpoint.steps[-1]
+        call = last.tool_call
+        if (
+            call is None
+            or not last.error.startswith(f"approval required: {approval_id} ")
+            or result.tool_name != call.name
+        ):
+            raise ValueError("approval does not match pending checkpoint tool")
+        completed = replace(last, tool_output=result.output, error="")
+        decision = {
+            "action": "tool",
+            "tool_name": call.name,
+            "arguments": call.arguments,
+        }
+        messages = [
+            *(dict(item) for item in checkpoint.messages),
+            {
+                "role": "assistant",
+                "content": json.dumps(decision, ensure_ascii=False, default=str),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"[TOOL_RESULT] tool={call.name} success=True\n"
+                    f"output={self._serialize_tool_output(result.output)}\n"
+                    "error=\n"
+                    "[AGENT_RUNTIME] 人工已批准并实际执行该工具；"
+                    "不要再次执行相同操作。继续验证当前步骤剩余要求，"
+                    "只有全部完成才返回 task_complete=true。"
+                ),
+            },
+        ]
+        return AgentCheckpoint(
+            user_input=checkpoint.user_input,
+            messages=tuple(messages),
+            steps=(*checkpoint.steps[:-1], completed),
+            seen_calls=checkpoint.seen_calls,
+        )
 
     def _tool_catalog(self) -> str:
         rows = []
@@ -353,18 +408,38 @@ class AgentLoop:
                 )
 
             if action == "final":
-                complete = decision.get("task_complete") is not False
-                has_legacy_answer = isinstance(decision.get("answer"), str) and decision["answer"].strip()
-                if not has_legacy_answer and not isinstance(decision.get("task_complete"), bool):
-                    answer = ""
+                flag = decision.get("task_complete")
+                has_legacy_answer = (
+                    isinstance(decision.get("answer"), str)
+                    and bool(decision["answer"].strip())
+                )
+                if isinstance(flag, bool):
+                    complete = flag
+                elif "task_complete" not in decision and has_legacy_answer:
+                    # S01-S04 scripted/legacy adapters used final.answer with
+                    # no task_complete field. Never accept non-bool flags.
+                    complete = True
                 else:
-                    try:
-                        answer = self._answer(decision, messages, complete=complete)
-                    except AnswerOutputLimitError as exc:
-                        return AgentRunResult(
-                            answer=exc.partial_answer + "\n\n回答达到输出上限，任务未确认完成。",
-                            steps=tuple(steps), termination_reason="output_limit",
-                        )
+                    steps.append(AgentStep(
+                        index=index,
+                        action="invalid_decision",
+                        error="task_complete must be boolean",
+                    ))
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[AGENT_RUNTIME] final 必须包含布尔类型 "
+                            'task_complete: true 或 false；不要用字符串或 null。'
+                        ),
+                    })
+                    continue
+                try:
+                    answer = self._answer(decision, messages, complete=complete)
+                except AnswerOutputLimitError as exc:
+                    return AgentRunResult(
+                        answer=exc.partial_answer + "\n\n回答达到输出上限，任务未确认完成。",
+                        steps=tuple(steps), termination_reason="output_limit",
+                    )
                 if answer and not complete:
                     steps.append(AgentStep(index=index, action="partial"))
                     return AgentRunResult(
@@ -455,6 +530,7 @@ class AgentLoop:
                     steps=tuple(steps),
                     termination_reason="approval_required",
                     approval_id=result.approval_id,
+                    checkpoint=checkpoint(),
                 )
 
             steps.append(
