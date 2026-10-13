@@ -23,6 +23,9 @@ from app.config import (
     EVOME_SUBAGENT_ENABLED,
     EVOME_SUBAGENT_MAX_STEPS,
     EVOME_SUBAGENT_MAX_CALLS,
+    EVOME_SKILL_LOADING_ENABLED,
+    EVOME_SKILL_DIRECTORY,
+    EVOME_SKILL_MAX_CONTENT_CHARS,
     EVOME_HOOKS_ENABLED,
     EVOME_HOOK_HISTORY_LIMIT,
     EVOME_HOOK_PROTECT_SECRETS,
@@ -266,6 +269,9 @@ class EvoMeRuntime:
             subagent_enabled=EVOME_SUBAGENT_ENABLED and self.enable_agent_loop,
             subagent_max_steps=EVOME_SUBAGENT_MAX_STEPS,
             subagent_max_calls=EVOME_SUBAGENT_MAX_CALLS,
+            skill_loading_enabled=EVOME_SKILL_LOADING_ENABLED and self.enable_agent_loop,
+            skill_directory=EVOME_SKILL_DIRECTORY,
+            skill_max_content_chars=EVOME_SKILL_MAX_CONTENT_CHARS,
         )
 
     @property
@@ -708,6 +714,20 @@ class EvoMeRuntime:
         # Always enter via the parent's real ToolExecutor so permission checks
         # and S04 hooks cannot be bypassed by CLI commands.
         return agent.executor.execute("delegate_research", {"task": task})
+
+    def list_instruction_skills(self) -> list[dict[str, str]]:
+        agent = self.strategy.agent_loop
+        if agent is None or agent.skill_loader is None:
+            raise ValueError("S07 Skill Loading 未启用；检查 EVOME_AGENT_LOOP_ENABLED / EVOME_SKILL_LOADING_ENABLED")
+        return agent.skill_loader.catalog()
+
+    def load_instruction_skill(self, name: str):
+        agent = self.strategy.agent_loop
+        if agent is None or agent.skill_loader is None:
+            raise ValueError("S07 Skill Loading 未启用；检查 EVOME_AGENT_LOOP_ENABLED / EVOME_SKILL_LOADING_ENABLED")
+        # Use the normal S03 + S04 tool boundary, never call the loader
+        # directly from the operator CLI.
+        return agent.executor.execute("load_skill", {"name": name})
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()

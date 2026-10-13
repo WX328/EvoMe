@@ -4,6 +4,7 @@ from app.agent import AgentLoop, PlanStore
 from app.hooks.manager import HookManager
 from app.hypothesis.canonical import build_canonical_signal
 from app.tools import ApprovalStore, PermissionPolicy, build_default_tool_registry
+from app.skills.loader import SkillLoader
 from app.learning.post_turn_assessor import PostTurnAssessor
 from app.models import ReflectionRecord
 from app.strategy.state import EvoMeState
@@ -62,6 +63,9 @@ class DefaultConversationStrategy:
         subagent_enabled: bool = False,
         subagent_max_steps: int = 4,
         subagent_max_calls: int = 2,
+        skill_loading_enabled: bool = False,
+        skill_directory: str = "skills",
+        skill_max_content_chars: int = 16000,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -103,6 +107,14 @@ class DefaultConversationStrategy:
                 subagent_enabled=subagent_enabled,
                 subagent_max_steps=subagent_max_steps,
                 subagent_max_calls=subagent_max_calls,
+                skill_loader=(
+                    SkillLoader(
+                        workspace_root=tool_workspace,
+                        directory=skill_directory,
+                        max_content_chars=skill_max_content_chars,
+                    )
+                    if skill_loading_enabled else None
+                ),
             )
             if enable_agent_loop
             else None

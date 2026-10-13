@@ -302,3 +302,29 @@ S05 的计划和 Todo 记录仅保存在当前进程内，重启后清空；
 - 本阶段仅同步、单层；不涉及并行 Agent Team、子任务持久化或自动重试。
 
 示例：`/subagent 读取 app/agent/schema.py，解释数据结构，不修改文件`
+
+## S07 Skill Loading — progressive disclosure
+
+S07 is **not** the executable `SkillRegistry` used by Personal Memory.
+It adds read-only, on-demand instructions from `skills/<name>/SKILL.md`.
+
+- Level 1, cheap catalog: `name` + `description` only,
+  inserted into the Agent conversation. The body is **not** included by default.
+- Level 2, when useful: the model calls `load_skill({"name":"code-review"})`.
+  The document body enters context as a **ToolResult**, never as a privileged SYSTEM rule.
+- Level 3, optional: referenced `references/`, `scripts/`,
+  and `assets/` are **not automatically loaded or executed**; reading
+  supporting files still requires ordinary permission-checked tools.
+- Disk scans are bounded (40 skills, small metadata headers, max body 16K chars by default).
+  Each skill must have a direct directory `skills/<slug>/SKILL.md`,
+  with simple one-line YAML frontmatter `name` (matching the directory)
+  and `description`. Symlinks, path traversal and oversized files
+  are rejected. Complex multiline YAML is not supported by this minimal loader.
+- S07 is opt-in: set `EVOME_AGENT_LOOP_ENABLED=1` and
+  `EVOME_SKILL_LOADING_ENABLED=1`. The disk directory is
+  workspace-relative (default `skills`).
+- `/skills` continues showing the original executable SkillRegistry.
+  `/skill-docs` shows only the documentation catalog;
+  `/skill-load code-review` loads one skill through S03 + S04.
+- Example Agent request: "先调用 load_skill 加载 code-review，然后只读分析
+  app/agent/schema.py，给出改进建议，不要修改文件。"

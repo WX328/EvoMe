@@ -58,6 +58,15 @@ EVOME_SUBAGENT_ENABLED = os.getenv(
 EVOME_SUBAGENT_MAX_STEPS = max(1, min(10, int(os.getenv("EVOME_SUBAGENT_MAX_STEPS", "4"))))
 EVOME_SUBAGENT_MAX_CALLS = max(1, min(5, int(os.getenv("EVOME_SUBAGENT_MAX_CALLS", "2"))))
 
+# S07 on-demand SKILL.md instructions, separate from executable SkillRegistry.
+EVOME_SKILL_LOADING_ENABLED = os.getenv(
+    "EVOME_SKILL_LOADING_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_SKILL_DIRECTORY = os.getenv("EVOME_SKILL_DIRECTORY", "skills")
+EVOME_SKILL_MAX_CONTENT_CHARS = max(
+    1000, min(32000, int(os.getenv("EVOME_SKILL_MAX_CONTENT_CHARS", "16000")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

@@ -501,7 +501,8 @@ def main() -> None:
         "/status  /token-usage  /audit  /skills  /hooks  /tool-approvals  "
         "/tool-approve <id>  /tool-deny <id>  /plans  /plan <goal>  "
         "/plan-show <id>  /plan-run <id>  /plan-replan <id>  "
-        "/plan-cancel <id>  /subagent <read-only task>  /exit\n"
+        "/plan-cancel <id>  /subagent <read-only task>  "
+        "/skill-docs  /skill-load <name>  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -698,6 +699,35 @@ def main() -> None:
                         f"risk={entry.risk or '-'} status={entry.status or '-'}"
                         + (f" reason={entry.reason}" if entry.reason else "")
                     )
+                continue
+            if user_input == "/skill-docs":
+                try:
+                    catalog = runtime.list_instruction_skills()
+                    if not catalog:
+                        print("没有找到有效 SKILL.md。请检查 skills/<name>/SKILL.md。")
+                    for item in catalog:
+                        print(f"  {item['name']} — {item['description']}")
+                except Exception as exc:
+                    print(f"❌ Skill Loading Error: {exc}")
+                continue
+            if user_input == "/skill-load":
+                print("用法：/skill-load <name>")
+                continue
+            if user_input.startswith("/skill-load "):
+                try:
+                    name = user_input.split(maxsplit=1)[1].strip()
+                    result = runtime.load_instruction_skill(name)
+                    if result.success:
+                        output = result.output
+                        print(
+                            f"✅ Loaded skill: {output['name']}\n"
+                            f"  来源：{output['relative_path']}\n\n"
+                            f"{output['content']}"
+                        )
+                    else:
+                        print(f"❌ Skill Loading Error: {result.error}")
+                except Exception as exc:
+                    print(f"❌ Skill Loading Error: {exc}")
                 continue
             if user_input == "/subagent":
                 print("用法：/subagent <只读研究任务>")
