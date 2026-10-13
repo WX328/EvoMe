@@ -20,6 +20,9 @@ from app.config import (
     EVOME_PLAN_MAX_REPLANS,
     EVOME_PLAN_AUTO_REPLAN,
     EVOME_PLAN_REQUIRE_FILE_EVIDENCE,
+    EVOME_SUBAGENT_ENABLED,
+    EVOME_SUBAGENT_MAX_STEPS,
+    EVOME_SUBAGENT_MAX_CALLS,
     EVOME_HOOKS_ENABLED,
     EVOME_HOOK_HISTORY_LIMIT,
     EVOME_HOOK_PROTECT_SECRETS,
@@ -260,6 +263,9 @@ class EvoMeRuntime:
             plan_max_replans=EVOME_PLAN_MAX_REPLANS,
             plan_auto_replan=EVOME_PLAN_AUTO_REPLAN,
             plan_require_file_evidence=EVOME_PLAN_REQUIRE_FILE_EVIDENCE,
+            subagent_enabled=EVOME_SUBAGENT_ENABLED and self.enable_agent_loop,
+            subagent_max_steps=EVOME_SUBAGENT_MAX_STEPS,
+            subagent_max_calls=EVOME_SUBAGENT_MAX_CALLS,
         )
 
     @property
@@ -694,6 +700,14 @@ class EvoMeRuntime:
             if step.approval_id:
                 self.strategy.agent_loop.executor.deny(step.approval_id)
         return planner.cancel(plan_id)
+
+    def run_research_subagent(self, task: str):
+        agent = self.strategy.agent_loop
+        if agent is None or agent.subagent is None:
+            raise ValueError("S06 Subagent 未启用；检查 EVOME_AGENT_LOOP_ENABLED 与 EVOME_SUBAGENT_ENABLED")
+        # Always enter via the parent's real ToolExecutor so permission checks
+        # and S04 hooks cannot be bypassed by CLI commands.
+        return agent.executor.execute("delegate_research", {"task": task})
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()

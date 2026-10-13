@@ -26,7 +26,7 @@ class PermissionPolicy:
         self.bash_mode = bash_mode
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PermissionDecision:
-        if tool_name in {"read_file", "glob", "recall_relevant_memory", "plan_show"}:
+        if tool_name in {"read_file", "glob", "recall_relevant_memory", "plan_show", "delegate_research"}:
             return PermissionDecision("allow", "low", "read-only or memory retrieval")
 
         if tool_name in {"write_file", "edit_file"}:

@@ -208,6 +208,25 @@ class PlanningService:
                             next_line = output.get("next_start_line")
                             location += f"（未读完，下一段从 {next_line} 行开始）" if next_line else "（单行内容被截断）"
                     lines.append(f"    {entry.index}. {call.name}{location} — {entry.error or '成功'}")
+                    if call.name == "delegate_research" and isinstance(entry.tool_output, dict):
+                        delegated = entry.tool_output
+                        if delegated.get("status") == "completed":
+                            lines.append(
+                                f"      Research Subagent："
+                                f"{delegated.get('tool_call_count', 0)} 次工具调用"
+                            )
+                            for source in delegated.get("evidence", [])[:20]:
+                                if not isinstance(source, dict):
+                                    continue
+                                source_path = source.get("path", "")
+                                span = (
+                                    f" [{source['start_line']}:{source['end_line']}]"
+                                    if "start_line" in source and "end_line" in source else ""
+                                )
+                                lines.append(
+                                    f"        ↳ {source.get('tool', '?')} {source_path}{span}"
+                                    + ("（截断）" if source.get("truncated") else "")
+                                )
         if not detail:
             completed = [step for step in plan.steps if step.status == "completed"]
             if plan.status == "completed" and completed:
@@ -279,17 +298,30 @@ class PlanningService:
         pages: dict[str, list[dict]] = {}
         for entry in history:
             call = entry.tool_call
-            if call is None or call.name != "read_file" or entry.error:
-                continue
-            if not isinstance(entry.tool_output, dict):
+            if call is None or entry.error or not isinstance(entry.tool_output, dict):
                 continue
             output = entry.tool_output
-            pathname = cls._normalize_path(
-                output.get("path") or call.arguments.get("path", "")
-            )
-            if not pathname:
+            if call.name == "read_file":
+                read_rows = [output]
+            elif (
+                call.name == "delegate_research"
+                and output.get("status") == "completed"
+                and isinstance(output.get("evidence"), list)
+            ):
+                # S06 child returns source provenance, not file content. Its
+                # own permission-checked read_file trace is the evidence.
+                read_rows = [
+                    row for row in output["evidence"]
+                    if isinstance(row, dict) and row.get("tool") == "read_file"
+                ]
+            else:
                 continue
-            pages.setdefault(pathname, []).append(output)
+            for row in read_rows:
+                pathname = cls._normalize_path(
+                    row.get("path") or call.arguments.get("path", "")
+                )
+                if pathname:
+                    pages.setdefault(pathname, []).append(row)
 
         if not pages:
             return False
@@ -443,13 +475,23 @@ class PlanningService:
     def _file_tool_evidence(cls, history: tuple[AgentStep, ...]) -> bool:
         if cls._verified_reads(history):
             return True
-        return any(
-            step.tool_call is not None
-            and step.tool_call.name == "glob"
-            and not step.error
-            and isinstance(step.tool_output, dict)
-            for step in history
-        )
+        for step in history:
+            call = step.tool_call
+            if call is None or step.error or not isinstance(step.tool_output, dict):
+                continue
+            if call.name == "glob":
+                return True
+            if (
+                call.name == "delegate_research"
+                and step.tool_output.get("status") == "completed"
+                and isinstance(step.tool_output.get("evidence"), list)
+                and any(
+                    isinstance(row, dict) and row.get("tool") == "glob"
+                    for row in step.tool_output["evidence"]
+                )
+            ):
+                return True
+        return False
 
     def _has_required_file_evidence(self, plan: TaskPlan, step: TodoStep) -> bool:
         if not self.require_file_evidence:

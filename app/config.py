@@ -51,6 +51,13 @@ EVOME_PLAN_REQUIRE_FILE_EVIDENCE = os.getenv(
     "EVOME_PLAN_REQUIRE_FILE_EVIDENCE", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# S06 Research Subagent: independent read-only child Agent with bounded steps.
+EVOME_SUBAGENT_ENABLED = os.getenv(
+    "EVOME_SUBAGENT_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_SUBAGENT_MAX_STEPS = max(1, min(10, int(os.getenv("EVOME_SUBAGENT_MAX_STEPS", "4"))))
+EVOME_SUBAGENT_MAX_CALLS = max(1, min(5, int(os.getenv("EVOME_SUBAGENT_MAX_CALLS", "2"))))
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 
 from app.agent.schema import AgentCheckpoint, AgentRunResult, AgentStep, ToolCall
+from app.agent.subagent import ResearchSubagent
 from app.agent.planning import PlanningService, PlanStore
 from app.hooks.manager import HookContext, HookManager
 from app.llm_errors import AnswerOutputLimitError
@@ -74,6 +75,9 @@ class AgentLoop:
         plan_max_replans: int = 1,
         plan_auto_replan: bool = False,
         plan_require_file_evidence: bool = False,
+        subagent_enabled: bool = False,
+        subagent_max_steps: int = 4,
+        subagent_max_calls: int = 2,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -87,6 +91,16 @@ class AgentLoop:
             hook_manager=hook_manager,
         )
         self.max_steps = max_steps
+        self.subagent_max_calls = max(1, min(5, int(subagent_max_calls)))
+        self.subagent = (
+            ResearchSubagent(
+                llm=llm,
+                source_registry=tool_registry,
+                hook_manager=hook_manager,
+                max_steps=subagent_max_steps,
+            )
+            if subagent_enabled else None
+        )
         self.planner = (
             PlanningService(
                 self,
@@ -108,6 +122,22 @@ class AgentLoop:
             ))
             self.tool_registry.register_implementation(ToolImplementation(
                 name="runtime_plan_show", tool_name="plan_show", handler=self.planner.inspect,
+            ))
+
+        if self.subagent is not None:
+            self.tool_registry.register_tool(ToolDefinition(
+                name="delegate_research",
+                description=(
+                    "委托独立 Research Subagent 在工作区只读检查源码/资料，"
+                    "返回摘要和真实工具证据。仅允许 read_file、glob；"
+                    "不能写文件、运行 Shell 或再次委派。"
+                ),
+                input_schema={"task": {"type": "string"}},
+            ))
+            self.tool_registry.register_implementation(ToolImplementation(
+                name="s06_research_v1",
+                tool_name="delegate_research",
+                handler=self.subagent.run,
             ))
 
     def checkpoint_after_approval(
@@ -508,7 +538,20 @@ class AgentLoop:
                 continue
             seen_calls.add(call_key)
 
-            result = self.executor.execute(tool_name, arguments)
+            if tool_name == "delegate_research" and sum(
+                1
+                for step in steps
+                if step.tool_call is not None
+                and step.tool_call.name == "delegate_research"
+            ) >= self.subagent_max_calls:
+                result = ToolResult(
+                    tool_name=tool_name,
+                    success=False,
+                    status="denied",
+                    error="S06 delegate_research call budget exceeded",
+                )
+            else:
+                result = self.executor.execute(tool_name, arguments)
             if result.status == "approval_required":
                 steps.append(
                     AgentStep(

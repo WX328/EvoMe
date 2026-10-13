@@ -501,7 +501,7 @@ def main() -> None:
         "/status  /token-usage  /audit  /skills  /hooks  /tool-approvals  "
         "/tool-approve <id>  /tool-deny <id>  /plans  /plan <goal>  "
         "/plan-show <id>  /plan-run <id>  /plan-replan <id>  "
-        "/plan-cancel <id>  /exit\n"
+        "/plan-cancel <id>  /subagent <read-only task>  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -698,6 +698,34 @@ def main() -> None:
                         f"risk={entry.risk or '-'} status={entry.status or '-'}"
                         + (f" reason={entry.reason}" if entry.reason else "")
                     )
+                continue
+            if user_input == "/subagent":
+                print("用法：/subagent <只读研究任务>")
+                continue
+            if user_input.startswith("/subagent "):
+                try:
+                    task = user_input.split(maxsplit=1)[1].strip()
+                    result = runtime.run_research_subagent(task)
+                    if not result.success:
+                        print(f"❌ Research Subagent 未完成：{result.error}")
+                    else:
+                        output = result.output
+                        print(
+                            f"✅ Research Subagent completed | "
+                            f"tool_calls={output['tool_call_count']}\n"
+                            f"{output['summary']}"
+                        )
+                        for row in output["evidence"]:
+                            lines = (
+                                f" [{row['start_line']}:{row['end_line']}]"
+                                if "start_line" in row and "end_line" in row else ""
+                            )
+                            print(
+                                f"  · {row['tool']} {row['path']}{lines}"
+                                + ("（截断）" if row.get("truncated") else "")
+                            )
+                except Exception as exc:
+                    print(f"❌ Research Subagent Error: {exc}")
                 continue
             if user_input == "/plans":
                 try:

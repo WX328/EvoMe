@@ -284,3 +284,21 @@ Agent 的决策 JSON 只包含工具参数或 `task_complete`，长篇回答在�
 
 S05 的计划和 Todo 记录仅保存在当前进程内，重启后清空；
 不是持久化任务队列，也不会自动写入 Personal Memory。
+
+## S06 Research Subagent
+
+开启 `EVOME_AGENT_LOOP_ENABLED=1` 和 `EVOME_SUBAGENT_ENABLED=1` 后，
+主 Agent 增加 `delegate_research` 工具，可委派独立、只读的研究任务。
+命令行也支持 `/subagent <任务>`，用于定向手工验收。
+
+- 子 Agent 使用独立的 AgentLoop 和上下文；不传入主 Agent 的对话和 Personal Memory。
+- 子 Agent 只拥有 read_file / glob，没有写文件、Shell、创建计划或再次委派的能力。
+- 每个子任务最多 EVOME_SUBAGENT_MAX_STEPS 次 Agent 决策，默认 4。
+  主 Agent 每次运行最多 EVOME_SUBAGENT_MAX_CALLS 次委派，默认 2。
+- 子 Agent 的只读操作仍经过 S03 PermissionPolicy 与 S04 Hooks，
+  并额外限制 .env、密钥等敏感文件。
+- 只有完成且有实际文件检索证据，才将子任务视作成功；
+  返回结构化摘要、证据路径、行范围与工具调用数。
+- 本阶段仅同步、单层；不涉及并行 Agent Team、子任务持久化或自动重试。
+
+示例：`/subagent 读取 app/agent/schema.py，解释数据结构，不修改文件`

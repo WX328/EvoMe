@@ -59,6 +59,9 @@ class DefaultConversationStrategy:
         plan_max_replans: int = 1,
         plan_auto_replan: bool = False,
         plan_require_file_evidence: bool = False,
+        subagent_enabled: bool = False,
+        subagent_max_steps: int = 4,
+        subagent_max_calls: int = 2,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -97,6 +100,9 @@ class DefaultConversationStrategy:
                 plan_max_replans=plan_max_replans,
                 plan_auto_replan=plan_auto_replan,
                 plan_require_file_evidence=plan_require_file_evidence,
+                subagent_enabled=subagent_enabled,
+                subagent_max_steps=subagent_max_steps,
+                subagent_max_calls=subagent_max_calls,
             )
             if enable_agent_loop
             else None
