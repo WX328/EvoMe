@@ -5,6 +5,7 @@ from app.hooks.manager import HookManager
 from app.hypothesis.canonical import build_canonical_signal
 from app.tools import ApprovalStore, PermissionPolicy, build_default_tool_registry
 from app.skills.loader import SkillLoader
+from app.agent.memory import AgentMemoryStore
 from app.learning.post_turn_assessor import PostTurnAssessor
 from app.models import ReflectionRecord
 from app.strategy.state import EvoMeState
@@ -69,6 +70,7 @@ class DefaultConversationStrategy:
         context_compact_enabled: bool = False,
         context_max_chars: int = 16000,
         context_keep_recent_messages: int = 6,
+        agent_memory_store: AgentMemoryStore | None = None,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -96,7 +98,13 @@ class DefaultConversationStrategy:
                 llm=llm,
                 tool_registry=self.tool_registry,
                 max_steps=agent_max_steps,
-                permission_policy=PermissionPolicy(bash_mode=bash_permission),
+                permission_policy=PermissionPolicy(
+                    bash_mode=bash_permission,
+                    workspace_root=tool_workspace,
+                    protected_memory_directory=(
+                        agent_memory_store.root if agent_memory_store is not None else None
+                    ),
+                ),
                 approval_store=self.approval_store,
                 hook_manager=hook_manager,
                 planning_enabled=planning_enabled,
@@ -121,6 +129,7 @@ class DefaultConversationStrategy:
                 context_compact_enabled=context_compact_enabled,
                 context_max_chars=context_max_chars,
                 context_keep_recent_messages=context_keep_recent_messages,
+                agent_memory_store=agent_memory_store,
             )
             if enable_agent_loop
             else None

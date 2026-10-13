@@ -7,11 +7,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent import PlanStore
+from app.agent.memory import AgentMemoryStore
+from app.agent.memory_pipeline import AgentMemoryPipeline
 from app.audit.service import AuditService
 from app.background import BackgroundEvolutionQueue
 from app.config import (
     DEEPSEEK_MODEL,
     EVOME_AGENT_LOOP_ENABLED,
+    EVOME_AGENT_MEMORY_ENABLED,
+    EVOME_AGENT_MEMORY_DIR,
+    EVOME_AGENT_MEMORY_AUTO_STAGE,
+    EVOME_AGENT_MEMORY_RECALL_CHARS,
     EVOME_AGENT_MAX_STEPS,
     EVOME_PLANNING_ENABLED,
     EVOME_PLAN_MAX_TASKS,
@@ -174,6 +180,18 @@ class EvoMeRuntime:
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
         self.tool_approval_store = ApprovalStore()
         self.plan_store = PlanStore()
+        self.agent_memory_store = (
+            AgentMemoryStore(
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                directory=EVOME_AGENT_MEMORY_DIR,
+                max_recall_chars=EVOME_AGENT_MEMORY_RECALL_CHARS,
+            )
+            if EVOME_AGENT_MEMORY_ENABLED and self.enable_agent_loop else None
+        )
+        self.agent_memory_pipeline = (
+            AgentMemoryPipeline(store=self.agent_memory_store, llm=self.llm)
+            if self.agent_memory_store is not None else None
+        )
         self.hook_manager = (
             HookManager(history_limit=EVOME_HOOK_HISTORY_LIMIT)
             if EVOME_HOOKS_ENABLED
@@ -278,6 +296,7 @@ class EvoMeRuntime:
             context_compact_enabled=EVOME_CONTEXT_COMPACT_ENABLED and self.enable_agent_loop,
             context_max_chars=EVOME_CONTEXT_MAX_CHARS,
             context_keep_recent_messages=EVOME_CONTEXT_KEEP_RECENT_MESSAGES,
+            agent_memory_store=self.agent_memory_store,
         )
 
     @property
@@ -404,7 +423,11 @@ class EvoMeRuntime:
                 float(evaluation.get("score", 0.0)),
                 bool(evaluation.get("success", False)),
             )
-        return self._result_from_state(state, strategy_name=self.strategy_full_name)
+        result = self._result_from_state(state, strategy_name=self.strategy_full_name)
+        self._maybe_stage_agent_memory(
+            user_input, termination=state.get("agent_termination_reason", ""),
+        )
+        return result
 
     def _process_revision_analysis_job(self) -> dict[str, Any]:
         """Run pending Phase 4 analyses in the background without a user turn."""
@@ -646,6 +669,9 @@ class EvoMeRuntime:
 
         response = "".join(chunks)
         state["response"] = response
+        self._maybe_stage_agent_memory(
+            user_input, termination=state.get("agent_termination_reason", ""),
+        )
 
         # Copy only serializable/plain state into the queued closure. ORM objects
         # are never sent across threads.
@@ -740,6 +766,58 @@ class EvoMeRuntime:
         if agent is None or agent.context_compactor is None:
             return {"enabled": False}
         return agent.context_compactor.stats()
+
+    def _agent_memory(self) -> AgentMemoryPipeline:
+        if self.agent_memory_pipeline is None:
+            raise ValueError(
+                "S09 Agent Memory 未启用；检查 EVOME_AGENT_LOOP_ENABLED / "
+                "EVOME_AGENT_MEMORY_ENABLED"
+            )
+        return self.agent_memory_pipeline
+
+    def _maybe_stage_agent_memory(self, user_input: str, *, termination: str) -> None:
+        if (
+            not EVOME_AGENT_MEMORY_AUTO_STAGE
+            or self.agent_memory_pipeline is None
+            or termination != "final_answer"
+        ):
+            return
+        try:
+            self.agent_memory_pipeline.propose(user_input)
+        except Exception:
+            # An optional extraction failure must never invalidate the user
+            # response, approval state, existing SQLite memory, or task audit.
+            pass
+
+    def list_agent_memories(self):
+        return self._agent_memory().store.catalog()
+
+    def recall_agent_memories(self, query: str):
+        # Read through the same S03/S04 ToolExecutor boundary as Agent Loop.
+        agent = self.strategy.agent_loop
+        if agent is None or agent.agent_memory_store is None:
+            raise ValueError("S09 Agent Memory 未启用")
+        return agent.executor.execute("recall_agent_memory", {"query": query})
+
+    def propose_agent_memories(self, user_input: str):
+        return self._agent_memory().propose(user_input)
+
+    def pending_agent_memories(self):
+        return self._agent_memory().list_pending()
+
+    def approve_agent_memory(self, candidate_id: str):
+        # Operator-only: no LLM or Agent tool may persist a candidate.
+        return self._agent_memory().confirm(candidate_id)
+
+    def deny_agent_memory(self, candidate_id: str) -> bool:
+        return self._agent_memory().deny(candidate_id)
+
+    def preview_agent_memory_consolidation(self):
+        return self._agent_memory().store.preview_consolidation()
+
+    def consolidate_agent_memories(self):
+        # Explicit operator-only action with snapshot/rollback.
+        return self._agent_memory().store.consolidate_duplicates()
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()

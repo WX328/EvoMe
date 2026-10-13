@@ -21,6 +21,10 @@ PARAM_COMMAND_NAMES = frozenset({
     "plan-cancel",
     "subagent",
     "skill-load",
+    "agent-memory-find",
+    "agent-memory-propose",
+    "agent-memory-approve",
+    "agent-memory-deny",
 })
 
 COMMAND_NAMES = frozenset(
@@ -60,6 +64,14 @@ COMMAND_NAMES = frozenset(
         "skill-docs",
         "skill-load",
         "context-stats",
+        "agent-memory-list",
+        "agent-memory-find",
+        "agent-memory-propose",
+        "agent-memory-pending",
+        "agent-memory-approve",
+        "agent-memory-deny",
+        "agent-memory-preview",
+        "agent-memory-consolidate",
         "hooks",
         "plans",
         "plan",

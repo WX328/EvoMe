@@ -11,3 +11,6 @@ patches/
 # Local pre-edit backups (not source of truth)
 _backup_before_tokenfix/
 scripts/__pycache__/
+
+# Local S09 Agent working memory (can contain private project preferences)
+.memory/

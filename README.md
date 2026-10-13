@@ -358,3 +358,50 @@ not summarize with a second LLM; it does **not** remove execution audit records.
   EVOME_CONTEXT_MAX_CHARS=4000 and ask the Agent to read several long files.
   Source evidence remains in the AgentStep audit even when parts of it no
   longer fit in the model's active context.
+
+## S09 Agent Working Memory (file-backed)
+
+S09 adds a **separate** opt-in Agent working-memory store under `.memory`/
+(default). EvoMe's existing SQLite Personal Memory and legacy /memory command
+are unchanged. Do not confuse this project/workflow reference with an approved
+user profile or a replacement for S08 Context Compact.
+
+- A record is `.memory/<slug>.md` with strict name/type/description frontmatter.
+  `.memory/MEMORY.md` is a compact catalog index, rebuilt after each approved write.
+  The directory is ignored by Git by default because records may be sensitive.
+- Recall selects by deterministic keyword/bigram overlap on catalog metadata.
+  It then loads at most five relevant bodies with a total character cap.
+  The main Agent receives recalled data as a normal USER-level runtime note,
+  **never** as SYSTEM. S06 Research Subagent does not inherit S09 memories.
+- Only four working-memory categories are accepted: user, feedback, project,
+  reference. The existing SQL personal-memory type system is left unchanged.
+- To propose a candidate, the user/operator explicitly invokes
+  `/agent-memory-propose <durable user statement>`. The LLM extracts candidates
+  from that text only; the pipeline rejects temporary scope, hypothetical
+  context, hallucinated quotes and credential-like data.
+- Proposals are staged in process memory, **not written**. Review via
+  `/agent-memory-pending`, then `/agent-memory-approve <id>` or
+  `/agent-memory-deny <id>`. A record body is the **exact user quote**.
+  Never treat tool output or the Agent's answer as a user fact.
+- Optional `EVOME_AGENT_MEMORY_AUTO_STAGE=1` stages proposals only when a
+  normal Agent answer completes successfully, and does not auto-save them.
+  It may add an extra extraction call. The default is **off**.
+- `/agent-memory-list` lists catalog metadata. `/agent-memory-find <query>`
+  uses the read-only S03/S04 ToolExecutor path. Restart EvoMe to verify
+  the same saved record can be recalled from disk in a fresh session.
+- `/agent-memory-preview` shows exact same-type duplicates. Explicit
+  `/agent-memory-consolidate` removes only those duplicates with snapshot
+  rollback if any step fails. Conflicts/stale facts are **not** automatically
+  deleted or rewritten by an LLM.
+- Local store is intended for one EvoMe process at a time. Do not put
+  long-term secrets in memory. Avoid using S09 as lossless conversation logging.
+
+Enable: EVOME_AGENT_LOOP_ENABLED=1 and EVOME_AGENT_MEMORY_ENABLED=1.
+The default memory directory is workspace-relative and symlinks are refused.
+
+### Operator verification
+1. /agent-memory-propose 以后在 EvoMe 项目的 Python 代码审查中，默认只读。
+2. /agent-memory-pending, then /agent-memory-approve <id>.
+3. /agent-memory-list; /agent-memory-find EvoMe Python 代码审查只读
+4. Restart process, then re-run the find query; record persists.
+5. /agent-memory-propose 本次临时任务只读取文件（should stage nothing).

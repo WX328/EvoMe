@@ -502,7 +502,11 @@ def main() -> None:
         "/tool-approve <id>  /tool-deny <id>  /plans  /plan <goal>  "
         "/plan-show <id>  /plan-run <id>  /plan-replan <id>  "
         "/plan-cancel <id>  /subagent <read-only task>  "
-        "/skill-docs  /skill-load <name>  /context-stats  /exit\n"
+        "/skill-docs  /skill-load <name>  /context-stats  "
+        "/agent-memory-list  /agent-memory-find <query>  "
+        "/agent-memory-propose <user statement>  /agent-memory-pending  "
+        "/agent-memory-approve <id>  /agent-memory-deny <id>  "
+        "/agent-memory-preview  /agent-memory-consolidate  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -699,6 +703,84 @@ def main() -> None:
                         f"risk={entry.risk or '-'} status={entry.status or '-'}"
                         + (f" reason={entry.reason}" if entry.reason else "")
                     )
+                continue
+            if user_input == "/agent-memory-list":
+                try:
+                    items = runtime.list_agent_memories()
+                    if not items:
+                        print("S09 尚无 Agent 工作记忆（/memory 是独立的 SQLite Personal Memory）")
+                    for item in items:
+                        print(f"  {item['name']} [{item['type']}] {item['description']}")
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input.startswith("/agent-memory-find "):
+                try:
+                    query = user_input.split(maxsplit=1)[1].strip()
+                    result = runtime.recall_agent_memories(query)
+                    if not result.success:
+                        print(f"S09 Memory Error: {result.error}")
+                    else:
+                        payload = result.output
+                        print(f"S09 selected {payload['selected']} records")
+                        for item in payload["memories"]:
+                            print(f"  [{item['type']}] {item['name']}: {item['body']}"
+                                  + (" (truncated)" if item['truncated'] else ""))
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input.startswith("/agent-memory-propose "):
+                try:
+                    utterance = user_input.split(maxsplit=1)[1].strip()
+                    response = runtime.propose_agent_memories(utterance)
+                    if not response["pending"]:
+                        print(f"无可审核候选：{response.get('reason', 'no durable evidence')}")
+                    for item in response["pending"]:
+                        print(
+                            f"  候选 {item['id']} [{item['type']}] {item['name']} "
+                            f"{item['description']} | 原话：{item['source_quote']}"
+                        )
+                    if response["pending"]:
+                        print("注意：候选尚未写入磁盘，确认后使用 /agent-memory-approve <id>")
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input == "/agent-memory-pending":
+                try:
+                    for item in runtime.pending_agent_memories():
+                        print(
+                            f"  {item.id} [{item.memory_type}] {item.name}: "
+                            f"{item.description} | {item.source_quote}"
+                        )
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input.startswith("/agent-memory-approve "):
+                try:
+                    candidate_id = user_input.split(maxsplit=1)[1].strip()
+                    item = runtime.approve_agent_memory(candidate_id)
+                    print(f"S09 已保存：{item.name} [{item.memory_type}] -> {item.relative_path}")
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input.startswith("/agent-memory-deny "):
+                try:
+                    candidate_id = user_input.split(maxsplit=1)[1].strip()
+                    print("S09 已拒绝" if runtime.deny_agent_memory(candidate_id) else "未找到候选")
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input == "/agent-memory-preview":
+                try:
+                    print(runtime.preview_agent_memory_consolidation())
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
+                continue
+            if user_input == "/agent-memory-consolidate":
+                try:
+                    print(runtime.consolidate_agent_memories())
+                except Exception as exc:
+                    print(f"S09 Memory Error: {exc}")
                 continue
             if user_input == "/context-stats":
                 print(runtime.context_compaction_stats())

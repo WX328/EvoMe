@@ -78,6 +78,19 @@ EVOME_CONTEXT_KEEP_RECENT_MESSAGES = max(
     2, min(20, int(os.getenv("EVOME_CONTEXT_KEEP_RECENT_MESSAGES", "6")))
 )
 
+# S09 Agent working memory is separate from existing SQLite Personal Memory.
+# Persistent writes require explicit candidate approval; auto-stage never saves.
+EVOME_AGENT_MEMORY_ENABLED = os.getenv(
+    "EVOME_AGENT_MEMORY_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_AGENT_MEMORY_DIR = os.getenv("EVOME_AGENT_MEMORY_DIR", ".memory")
+EVOME_AGENT_MEMORY_AUTO_STAGE = os.getenv(
+    "EVOME_AGENT_MEMORY_AUTO_STAGE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_AGENT_MEMORY_RECALL_CHARS = max(
+    400, min(6000, int(os.getenv("EVOME_AGENT_MEMORY_RECALL_CHARS", "1800")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

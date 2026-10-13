@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -22,11 +23,35 @@ class PendingApproval:
 
 
 class PermissionPolicy:
-    def __init__(self, *, bash_mode: str = "ask") -> None:
+    def __init__(
+        self, *,
+        bash_mode: str = "ask",
+        workspace_root: str | Path = ".",
+        protected_memory_directory: str | Path | None = None,
+    ) -> None:
         self.bash_mode = bash_mode
+        self.workspace_root = Path(workspace_root).resolve()
+        self.protected_memory_directory = (
+            Path(protected_memory_directory).resolve()
+            if protected_memory_directory is not None else None
+        )
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PermissionDecision:
-        if tool_name in {"read_file", "glob", "recall_relevant_memory", "plan_show", "delegate_research", "load_skill"}:
+        # S09 writes go through explicit candidate confirmation, never through
+        # a normal Agent file-edit Tool, even if that Tool is approved.
+        if self.protected_memory_directory is not None and tool_name in {"write_file", "edit_file"}:
+            raw_path = arguments.get("path")
+            if isinstance(raw_path, str):
+                try:
+                    requested = (self.workspace_root / raw_path).resolve(strict=False)
+                    if requested.is_relative_to(self.protected_memory_directory):
+                        return PermissionDecision(
+                            "deny", "high",
+                            "S09 working memory is protected: approve an extracted candidate instead",
+                        )
+                except (ValueError, OSError, RuntimeError):
+                    return PermissionDecision("deny", "high", "unresolvable memory write target")
+        if tool_name in {"read_file", "glob", "recall_relevant_memory", "plan_show", "delegate_research", "load_skill", "recall_agent_memory"}:
             return PermissionDecision("allow", "low", "read-only or memory retrieval")
 
         if tool_name in {"write_file", "edit_file"}:
