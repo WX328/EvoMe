@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 
 from app.agent.schema import AgentCheckpoint, AgentRunResult, AgentStep, ToolCall
 from app.agent.subagent import ResearchSubagent
+from app.agent.compaction import ContextBudgetError, ContextCompactor
 from app.skills.loader import SkillLoader
 from app.agent.planning import PlanningService, PlanStore
 from app.hooks.manager import HookContext, HookManager
@@ -40,6 +42,8 @@ _AGENT_SYSTEM_PROMPT = """
 - 决策 JSON 中不要写 answer、长篇正文、目录清单或分析；正文会在独立的文本阶段生成。
 - 如当前任务要求读取文件，必须先获得实际 Tool Result 才能声称读过文件。
 - 若任务尚未完成，final 必须包含 "task_complete": false，不得虚构已完成。
+- 遇到 [AGENT_CONTEXT_COMPACTED] 时，里面只有历史工具元数据，不包含已省略的源文件内容；
+  不得声称那些旧内容仍完整可见，必要时读取尚未获取的行范围。
 """.strip()
 
 
@@ -80,6 +84,9 @@ class AgentLoop:
         subagent_max_steps: int = 4,
         subagent_max_calls: int = 2,
         skill_loader: SkillLoader | None = None,
+        context_compact_enabled: bool = False,
+        context_max_chars: int = 16000,
+        context_keep_recent_messages: int = 6,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
@@ -94,6 +101,13 @@ class AgentLoop:
         )
         self.max_steps = max_steps
         self.skill_loader = skill_loader
+        self.context_compactor = (
+            ContextCompactor(
+                max_chars=context_max_chars,
+                keep_recent_messages=context_keep_recent_messages,
+            )
+            if context_compact_enabled else None
+        )
         self.subagent_max_calls = max(1, min(5, int(subagent_max_calls)))
         self.subagent = (
             ResearchSubagent(
@@ -101,6 +115,9 @@ class AgentLoop:
                 source_registry=tool_registry,
                 hook_manager=hook_manager,
                 max_steps=subagent_max_steps,
+                context_compact_enabled=context_compact_enabled,
+                context_max_chars=context_max_chars,
+                context_keep_recent_messages=context_keep_recent_messages,
             )
             if subagent_enabled else None
         )
@@ -212,7 +229,78 @@ class AgentLoop:
             messages=tuple(messages),
             steps=(*checkpoint.steps[:-1], completed),
             seen_calls=checkpoint.seen_calls,
+            compactions=checkpoint.compactions,
+            compacted_chars=checkpoint.compacted_chars,
         )
+
+    @staticmethod
+    def _read_progress_note(steps: list[AgentStep]) -> str:
+        """Build read pagination state from actual successful ToolResults.
+
+        This is a compact runtime hint, not a reconstruction of source text.
+        On long reads S08 may trim raw ToolResults, so the model must always
+        see which line range remains outstanding. No tools run here.
+        """
+        pages: dict[str, list[tuple[int, int, int, bool, bool]]] = defaultdict(list)
+        for entry in steps:
+            call = entry.tool_call
+            output = entry.tool_output
+            if (
+                call is None or call.name != "read_file"
+                or entry.error or not isinstance(output, dict)
+            ):
+                continue
+            path = output.get("path")
+            first = output.get("start_line")
+            last = output.get("end_line")
+            total = output.get("total_lines")
+            if not isinstance(path, str) or not path or not all(
+                type(value) is int for value in (first, last, total)
+            ):
+                continue
+            if first < 1 or last < first - 1 or total < 0:
+                continue
+            safe_path = path.replace("\\", "/").replace("\n", " ").replace("\r", " ")[:120]
+            pages[safe_path].append(
+                (
+                    first, last, total,
+                    bool(output.get("line_truncated")),
+                    bool(output.get("truncated")),
+                )
+            )
+        if not pages:
+            return ""
+
+        rows = [
+            "[AGENT_READ_PROGRESS] Trusted runtime metadata from completed "
+            "read_file tools; not source contents. Read the remaining range "
+            "with start_line=next_unread_line when needed. Do not repeat old "
+            "read_file arguments. Only claim full-file coverage when complete."
+        ]
+        for path, metadata in sorted(pages.items())[:12]:
+            total = max(part[2] for part in metadata)
+            covered = 0
+            ranges = []
+            clipped = False
+            for start, end, _, line_truncated, _ in sorted(metadata):
+                clipped = clipped or line_truncated
+                ranges.append(f"{start}-{end}")
+                if start <= covered + 1:
+                    covered = max(covered, end)
+            next_unread = max(1, covered + 1)
+            final_page = max(metadata, key=lambda item: item[1])
+            complete = (
+                not clipped and not final_page[4]
+                and all(item[2] == total for item in metadata)
+                and (total == 0 or covered >= total)
+            )
+            rows.append(
+                f"file={json.dumps(path, ensure_ascii=False)} "
+                f"total_lines={total} ranges={','.join(ranges[-12:])} "
+                f"next_unread_line={next_unread if not complete else 'none'} "
+                f"complete={str(complete).lower()}"
+            )
+        return "\n".join(rows)[:1300]
 
     def _tool_catalog(self) -> str:
         rows = []
@@ -410,6 +498,8 @@ class AgentLoop:
 
         steps: list[AgentStep] = []
         seen_calls: set[str] = set()
+        compaction_count = resume_from.compactions if resume_from else 0
+        context_saved_chars = resume_from.compacted_chars if resume_from else 0
         if resume_from is not None:
             if resume_from.user_input != user_input:
                 raise ValueError("checkpoint belongs to a different task")
@@ -427,6 +517,41 @@ class AgentLoop:
                 messages=tuple(dict(message) for message in messages),
                 steps=tuple(steps),
                 seen_calls=frozenset(seen_calls),
+                compactions=compaction_count,
+                compacted_chars=context_saved_chars,
+            )
+
+        def compact_context(
+            transcript: list[dict[str, str]],
+            *,
+            update_active: bool = False,
+        ) -> list[dict[str, str]]:
+            nonlocal compaction_count, context_saved_chars
+            if self.context_compactor is None:
+                return transcript
+            compacted, report = self.context_compactor.compact(
+                transcript, user_input=user_input, steps=steps,
+            )
+            if report is not None:
+                compaction_count += 1
+                context_saved_chars += report.saved_chars
+                steps.append(AgentStep(
+                    index=max((step.index for step in steps), default=0) + 1,
+                    action="context_compaction",
+                    tool_output=report.as_dict(),
+                ))
+            if update_active:
+                # Checkpoints now hold the compact model transcript, while
+                # steps and seen_calls retain the full execution audit.
+                transcript[:] = compacted
+            return compacted
+
+        def context_overflow(exc: ContextBudgetError) -> AgentRunResult:
+            return AgentRunResult(
+                answer=f"S08 上下文预算不足，未继续执行：{exc}",
+                steps=tuple(steps),
+                termination_reason="context_overflow",
+                checkpoint=checkpoint(),
             )
 
         budget = (
@@ -435,6 +560,23 @@ class AgentLoop:
             else max(1, min(self.max_steps, int(max_steps_override)))
         )
         for _ in range(budget):
+            # Regenerate one authoritative pagination hint from AgentStep
+            # metadata. Older hints are discarded; no compaction can erase
+            # the record of which ranges were already read.
+            messages[:] = [
+                item for item in messages
+                if not (
+                    item.get("role") == "user"
+                    and item.get("content", "").startswith("[AGENT_READ_PROGRESS]")
+                )
+            ]
+            progress = self._read_progress_note(steps)
+            if progress:
+                messages.append({"role": "user", "content": progress})
+            try:
+                compact_context(messages, update_active=True)
+            except ContextBudgetError as exc:
+                return context_overflow(exc)
             decision = self._strict_decision(messages, steps)
             index = max((step.index for step in steps), default=0) + 1
             action = str(decision.get("action", "")).strip().lower()
@@ -549,6 +691,9 @@ class AgentLoop:
                 default=str,
             )
             if call_key in seen_calls:
+                # Preserve the S01/S05 safety contract: a repeated call is
+                # blocked and remains a visible error. Never silently replay
+                # a write, and never claim a duplicate read is new progress.
                 error = "duplicate tool call blocked"
                 steps.append(
                     AgentStep(
@@ -637,6 +782,10 @@ class AgentLoop:
         # Reserve a final-answer-only turn after the tool/decision budget. It
         # may assess completion, but must never execute another tool or plan.
         # Keep the transcript, replacing only the decision prompt/catalog.
+        try:
+            compact_context(messages, update_active=True)
+        except ContextBudgetError as exc:
+            return context_overflow(exc)
         transcript = messages[2:]
         if steps and not any(step.error for step in steps):
             final_messages = [
@@ -652,6 +801,10 @@ class AgentLoop:
                 )},
                 *transcript,
             ]
+            try:
+                final_messages = compact_context(final_messages)
+            except ContextBudgetError as exc:
+                return context_overflow(exc)
             decision = self._strict_decision(final_messages, steps)
             action = str(decision.get("action", "")).strip().lower()
             if action == "protocol_error":
@@ -688,6 +841,10 @@ class AgentLoop:
             )},
             *transcript,
         ]
+        try:
+            fallback_messages = compact_context(fallback_messages)
+        except ContextBudgetError as exc:
+            return context_overflow(exc)
         answer = self.llm.chat(
             fallback_messages,
             purpose="fast_chat",

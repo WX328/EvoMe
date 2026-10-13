@@ -67,6 +67,17 @@ EVOME_SKILL_MAX_CONTENT_CHARS = max(
     1000, min(32000, int(os.getenv("EVOME_SKILL_MAX_CONTENT_CHARS", "16000")))
 )
 
+# S08 Context Compact. Opt-in; bounded model-facing history only.
+EVOME_CONTEXT_COMPACT_ENABLED = os.getenv(
+    "EVOME_CONTEXT_COMPACT_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_CONTEXT_MAX_CHARS = max(
+    4000, min(200000, int(os.getenv("EVOME_CONTEXT_MAX_CHARS", "16000")))
+)
+EVOME_CONTEXT_KEEP_RECENT_MESSAGES = max(
+    2, min(20, int(os.getenv("EVOME_CONTEXT_KEEP_RECENT_MESSAGES", "6")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

@@ -60,12 +60,18 @@ class ResearchSubagent:
         hook_manager: HookManager | None = None,
         max_steps: int = 4,
         max_summary_chars: int = 1600,
+        context_compact_enabled: bool = False,
+        context_max_chars: int = 16000,
+        context_keep_recent_messages: int = 6,
     ) -> None:
         self.llm = llm
         self.hook_manager = hook_manager
         self.max_steps = max(1, min(10, int(max_steps)))
         self.max_summary_chars = max(200, min(4000, int(max_summary_chars)))
         self.registry = self._restricted_registry(source_registry)
+        self.context_compact_enabled = bool(context_compact_enabled)
+        self.context_max_chars = int(context_max_chars)
+        self.context_keep_recent_messages = int(context_keep_recent_messages)
 
     @staticmethod
     def _restricted_registry(source: ToolRegistry) -> ToolRegistry:
@@ -138,6 +144,9 @@ class ResearchSubagent:
             hook_manager=self.hook_manager,
             planning_enabled=False,
             subagent_enabled=False,
+            context_compact_enabled=self.context_compact_enabled,
+            context_max_chars=self.context_max_chars,
+            context_keep_recent_messages=self.context_keep_recent_messages,
         )
         result = child.run(
             user_input=task.strip(),

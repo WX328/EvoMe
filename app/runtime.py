@@ -23,6 +23,9 @@ from app.config import (
     EVOME_SUBAGENT_ENABLED,
     EVOME_SUBAGENT_MAX_STEPS,
     EVOME_SUBAGENT_MAX_CALLS,
+    EVOME_CONTEXT_COMPACT_ENABLED,
+    EVOME_CONTEXT_MAX_CHARS,
+    EVOME_CONTEXT_KEEP_RECENT_MESSAGES,
     EVOME_SKILL_LOADING_ENABLED,
     EVOME_SKILL_DIRECTORY,
     EVOME_SKILL_MAX_CONTENT_CHARS,
@@ -272,6 +275,9 @@ class EvoMeRuntime:
             skill_loading_enabled=EVOME_SKILL_LOADING_ENABLED and self.enable_agent_loop,
             skill_directory=EVOME_SKILL_DIRECTORY,
             skill_max_content_chars=EVOME_SKILL_MAX_CONTENT_CHARS,
+            context_compact_enabled=EVOME_CONTEXT_COMPACT_ENABLED and self.enable_agent_loop,
+            context_max_chars=EVOME_CONTEXT_MAX_CHARS,
+            context_keep_recent_messages=EVOME_CONTEXT_KEEP_RECENT_MESSAGES,
         )
 
     @property
@@ -728,6 +734,12 @@ class EvoMeRuntime:
         # Use the normal S03 + S04 tool boundary, never call the loader
         # directly from the operator CLI.
         return agent.executor.execute("load_skill", {"name": name})
+
+    def context_compaction_stats(self) -> dict:
+        agent = self.strategy.agent_loop
+        if agent is None or agent.context_compactor is None:
+            return {"enabled": False}
+        return agent.context_compactor.stats()
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()

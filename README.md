@@ -328,3 +328,33 @@ It adds read-only, on-demand instructions from `skills/<name>/SKILL.md`.
   `/skill-load code-review` loads one skill through S03 + S04.
 - Example Agent request: "先调用 load_skill 加载 code-review，然后只读分析
   app/agent/schema.py，给出改进建议，不要修改文件。"
+
+## S08 Context Compact
+
+S08 is an opt-in, deterministic **model-facing transcript** compactor. It does
+not summarize with a second LLM; it does **not** remove execution audit records.
+
+- Enable with EVOME_AGENT_LOOP_ENABLED=1 and EVOME_CONTEXT_COMPACT_ENABLED=1.
+- EVOME_CONTEXT_MAX_CHARS=16000 controls the maximum characters of messages
+  before each Agent decision. This is a character budget, **not** an exact token
+  budget. Usage estimates shown by /context-stats use roughly 4 chars/token.
+- EVOME_CONTEXT_KEEP_RECENT_MESSAGES=6 retains the most recent conversational
+  messages as much as possible. Pinned SYSTEM messages and the original task
+  are never truncated. Oversized recent tool results are marked as excerpts.
+- Older messages are replaced with a small provenance note derived from real
+  AgentStep metadata (tool names, targets, read ranges, success/failure), not
+  from the tool content or an AI-generated interpretation. No SKILL.md body,
+  raw source code or file-write content is inserted into this compact summary.
+- Checkpoint.steps, ToolCall and seen_calls remain unchanged. Human approvals
+  are still necessary and duplicate tool execution remains blocked.
+- If system instructions and the original user request alone exceed the
+  configured budget, S08 fails closed as context_overflow; no new Tool runs.
+- Applies to regular Agent runs, resumed S05 plans and S06 child runs.
+  The /plan-show detailed trace shows per-compaction character/token estimates.
+- /context-stats shows cumulative main Agent compaction metrics for this
+  process. Child executions have separate per-run budgets; they do not update
+  the parent's cumulative display.
+- To manually trigger compaction during testing, temporarily set
+  EVOME_CONTEXT_MAX_CHARS=4000 and ask the Agent to read several long files.
+  Source evidence remains in the AgentStep audit even when parts of it no
+  longer fit in the model's active context.

@@ -59,6 +59,7 @@ COMMAND_NAMES = frozenset(
         "skills",
         "skill-docs",
         "skill-load",
+        "context-stats",
         "hooks",
         "plans",
         "plan",

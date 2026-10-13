@@ -66,6 +66,9 @@ class DefaultConversationStrategy:
         skill_loading_enabled: bool = False,
         skill_directory: str = "skills",
         skill_max_content_chars: int = 16000,
+        context_compact_enabled: bool = False,
+        context_max_chars: int = 16000,
+        context_keep_recent_messages: int = 6,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -115,6 +118,9 @@ class DefaultConversationStrategy:
                     )
                     if skill_loading_enabled else None
                 ),
+                context_compact_enabled=context_compact_enabled,
+                context_max_chars=context_max_chars,
+                context_keep_recent_messages=context_keep_recent_messages,
             )
             if enable_agent_loop
             else None

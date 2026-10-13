@@ -502,7 +502,7 @@ def main() -> None:
         "/tool-approve <id>  /tool-deny <id>  /plans  /plan <goal>  "
         "/plan-show <id>  /plan-run <id>  /plan-replan <id>  "
         "/plan-cancel <id>  /subagent <read-only task>  "
-        "/skill-docs  /skill-load <name>  /exit\n"
+        "/skill-docs  /skill-load <name>  /context-stats  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -699,6 +699,9 @@ def main() -> None:
                         f"risk={entry.risk or '-'} status={entry.status or '-'}"
                         + (f" reason={entry.reason}" if entry.reason else "")
                     )
+                continue
+            if user_input == "/context-stats":
+                print(runtime.context_compaction_stats())
                 continue
             if user_input == "/skill-docs":
                 try:

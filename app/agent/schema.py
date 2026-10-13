@@ -27,6 +27,8 @@ class AgentCheckpoint:
     messages: tuple[dict[str, str], ...]
     steps: tuple[AgentStep, ...]
     seen_calls: frozenset[str]
+    compactions: int = 0
+    compacted_chars: int = 0
 
 
 @dataclass(frozen=True)

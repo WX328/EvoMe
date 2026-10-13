@@ -195,6 +195,14 @@ class PlanningService:
                     if call is None:
                         if entry.action == "invalid_json_retry":
                             lines.append(f"    {entry.index}. JSON 格式重试（未执行工具）")
+                        if entry.action == "context_compaction" and isinstance(entry.tool_output, dict):
+                            metrics = entry.tool_output
+                            lines.append(
+                                f"    {entry.index}. S08 上下文压缩："
+                                f"{metrics.get('before_chars', 0)} → "
+                                f"{metrics.get('after_chars', 0)} chars，"
+                                f"约省 {metrics.get('estimated_tokens_before', 0) - metrics.get('estimated_tokens_after', 0)} tokens"
+                            )
                         continue
                     args = call.arguments
                     target = args.get("path", args.get("pattern", ""))
@@ -273,6 +281,9 @@ class PlanningService:
             "总体目标和已完成步骤仅供参考，其他待办由调度器随后执行。"
             "本步骤完成就返回 task_complete=true，不要提前做后续步骤。"
             "如果本步骤仅要求列出目录，成功的 glob 结果足够，不需要 read_file 或跨目录分析。"
+            "读取长文件时，依据真实 read_file 结果的 end_line/next_start_line "
+            "继续未读行段，不得反复读取同一页；"
+            "上下文若出现 [AGENT_READ_PROGRESS]，按其 next_unread_line 分页续读。"
             "只有本步骤明确要求查看计划记录时才调用 plan_show，不要因总体目标提到它而提前调用。"
             "不得因后续步骤尚未完成就把当前已完成步骤判为未完成。"
         )}]
@@ -683,6 +694,16 @@ class PlanningService:
 
                 step.status = "failed"
                 step.note = str(result.answer or result.termination_reason).strip()
+                if result.tool_error_count:
+                    # Surface the true tool error, not only the model's
+                    # optimistic final prose. This makes /plan-show useful
+                    # when an incomplete file read is incorrectly declared done.
+                    recent_errors = [item for item in result.steps if item.error][-3:]
+                    details = " | ".join(
+                        f"{item.tool_call.name if item.tool_call else item.action}: {item.error}"
+                        for item in recent_errors
+                    )
+                    step.note += "\n[AGENT_RUNTIME] 工具错误：" + self._short(details, 550)
                 plan.status = "failed"
                 plan.error = (
                     f"step {step.number}: {result.termination_reason}; "
