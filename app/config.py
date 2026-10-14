@@ -133,6 +133,17 @@ EVOME_S14_MCP_TIMEOUT = max(
     0.25, min(20.0, float(os.getenv("EVOME_S14_MCP_TIMEOUT", "6.0")))
 )
 
+# S15 integrates S01-S14 around one foreground loop. No new executor.
+EVOME_S15_HARNESS_ENABLED = os.getenv(
+    "EVOME_S15_HARNESS_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S15_MAX_EVENTS = max(
+    8, min(80, int(os.getenv("EVOME_S15_MAX_EVENTS", "32")))
+)
+EVOME_S15_EVENT_CONTEXT_CHARS = max(
+    500, min(6000, int(os.getenv("EVOME_S15_EVENT_CONTEXT_CHARS", "3600")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

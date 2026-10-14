@@ -707,3 +707,97 @@ Limitations: This profile is **one-process**; it does not share a connection
 with worker threads/other EvoMe instances. Some MCP servers require richer
 capabilities than S14's tool-only stdio subset; their unsupported outputs are
 not forwarded to the model. The lack of credentials by default is deliberate.
+
+## S15 Integrated Harness — Many mechanisms, one foreground loop
+
+S15 does **not** create another Agent, executor, permission layer or
+autonomous scheduler. It connects the existing S01–S14 capabilities to the
+same foreground S01 AgentLoop and makes asynchronous status observable at
+the next conversation turn.
+
+### Enable S15
+
+Add to your private .env (do not commit or print it):
+
+    EVOME_S15_HARNESS_ENABLED=1
+    EVOME_S15_MAX_EVENTS=32
+    EVOME_S15_EVENT_CONTEXT_CHARS=3600
+
+S01 Agent Loop must be enabled. Existing optional switches for S10 tasks,
+S11 background research, S12 cron, S13 teams and S14 MCP are independent;
+S15 never enables them or launches jobs by itself.
+
+Embedded/test instances require an explicit enable_harness=True argument.
+The interactive CLI opts in. This prevents injected-LLM tests from draining
+team inboxes unexpectedly.
+
+### One runtime pipeline
+
+    User input
+      -> foreground strategy: prepare existing state
+      -> S15: collect S11/S12/S13/slow-job/approval notifications
+      -> S15: inject bounded capability metadata and untrusted event data
+      -> EXISTING S01 AgentLoop (the only foreground model execution loop)
+         -> S04 before_agent hook
+         -> S02 live ToolRegistry, S07 skills, S09 memory
+         -> S08 compaction within same loop
+         -> LLM final or tool
+         -> S03 PermissionPolicy -> S04 before_tool -> ToolExecutor
+         -> S04 after_tool -> same model messages
+         -> S04 after_agent
+      -> S15 never executes or approves tools.
+
+Dynamic S14 MCP tools enter the exact same live ToolRegistry after the
+operator connects a server and leave when it disconnects. S15 merely
+observes capabilities; it never bypasses S03 permission checks.
+
+### CLI commands
+
+- /harness-status: read-only current capability status and event counts.
+- /harness-events: read-only last 20 notifications (up to 100 in RAM).
+- /harness-sync: collect fresh events without sending a user message or
+  launching anything. The next normal conversation turn will receive any
+  pending notifications as USER-role untrusted data, not system instructions.
+
+The CLI polls whenever it reads a prompt, even if the input is empty.
+S13 /team-inbox retains its original fuller message view; S13-only injection
+remains unchanged when S15 is disabled.
+
+### Manual acceptance
+
+1. /harness-status: verify active, and flags for S10–S14 match the current
+   running modules instead of blindly trusting environment declarations.
+2. /mcp-connect demo, then /harness-status: external tool names should appear.
+   /mcp-disconnect demo should remove them from the next snapshot.
+3. /cron-after 15 | 读取 app/agent/schema.py 并概述
+   Wait at least 15 seconds while EvoMe remains running.
+4. /harness-sync, then /harness-events. Look for S12 dispatch and S11
+   task_finished events. S12's own task_finished notice may follow a polling
+   cycle later. Use /task-show <actual_id> for authoritative persisted state.
+5. Ask: "刚刚的后台任务执行到哪一步了？". Only this actual model turn receives
+   pending events. It must verify real task state, not claim success from a
+   notification alone.
+6. Run an S13 read-only team task, then check /harness-events and /team-inbox.
+   S15 notification delivery never re-executes the task, and the S13 operator
+   report view remains available.
+
+### Limits and safety
+
+- S15 is a bounded in-process, best-effort AT-MOST-ONCE event bridge; it is
+  NOT a durable broker. A crash may lose an event, while S10 durable task
+  results and S12 schedule state still remain on disk.
+- Old pending events may be dropped when buffers reach capacity;
+  overflow_dropped counts these losses. Local event history is bounded.
+- Source failures cannot stop the foreground agent; errors are reflected as
+  class names, not arbitrary exception strings containing local paths.
+- Pending approval notifications never copy raw tool arguments, credentials
+  or file contents. Stale approvals are removed before model injection.
+  Only S03 may actually approve/deny an external tool call.
+- All source notifications and teammate text enter as USER-role untrusted
+  data, with explicit instructions to verify evidence. They are never memory
+  updates or privileged policy text.
+- The existing S04 Hooks, S08 compaction, S09 memory guards and S11/S12/S13
+  read-only restrictions remain in force.
+- One EvoMe process per workspace. S15 does not add worktree automation,
+  distributed task leases, autonomous code writes or workflow journals
+  (the last belongs to S16).

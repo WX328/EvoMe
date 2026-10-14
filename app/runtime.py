@@ -13,6 +13,7 @@ from app.agent.background_tasks import BackgroundTaskService
 from app.agent.cron_store import ScheduleStore
 from app.agent.cron_scheduler import CronScheduler
 from app.agent.team_runtime import TeamRuntime
+from app.agent.integrated_harness import IntegratedHarness
 from app.tools.mcp_plugin import MCPPluginManager
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
@@ -34,6 +35,9 @@ from app.config import (
     EVOME_S14_MCP_ENABLED,
     EVOME_S14_MCP_CONFIG,
     EVOME_S14_MCP_TIMEOUT,
+    EVOME_S15_HARNESS_ENABLED,
+    EVOME_S15_MAX_EVENTS,
+    EVOME_S15_EVENT_CONTEXT_CHARS,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -123,6 +127,7 @@ class EvoMeRuntime:
         enable_scheduler: bool = False,
         enable_teams: bool = False,
         enable_mcp: bool = False,
+        enable_harness: bool = False,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
@@ -336,6 +341,27 @@ class EvoMeRuntime:
         )
         if self.cron_scheduler is not None:
             self.cron_scheduler.start()  # skip downtime triggers, then poll
+        # The coordinator has no execution authority; it collects status
+        # snapshots only. Embedded/test runtimes do not opt in by default.
+        self.harness: IntegratedHarness | None = None
+        if (
+            EVOME_S15_HARNESS_ENABLED and enable_harness
+            and self.strategy.agent_loop is not None
+        ):
+            self.harness = IntegratedHarness(
+                agent=self.strategy.agent_loop,
+                background_queue=self.background_queue,
+                task_worker=self.task_background_service,
+                cron_scheduler=self.cron_scheduler,
+                team_runtime=self.team_runtime,
+                mcp_manager=self.mcp_manager,
+                approval_store=self.tool_approval_store,
+                on_team_message=self._remember_team_event,
+                max_events=EVOME_S15_MAX_EVENTS,
+                max_context_chars=EVOME_S15_EVENT_CONTEXT_CHARS,
+            )
+            self.strategy.harness_context_provider = self.harness.context_messages
+            self.strategy.harness_delivery_callback = self.harness.settle_turn
 
     def _build_strategy(
         self,
@@ -1076,12 +1102,23 @@ class EvoMeRuntime:
     def team_shutdown(self):
         return self._team().shutdown()
 
+    def _remember_team_event(self, item: dict[str, Any]) -> None:
+        # Preserve the existing /team-inbox operator view even when S15
+        # owns the main inbound notification stream.
+        self._pending_team_events.append(item)
+        self._pending_team_events = self._pending_team_events[-25:]
+
     def poll_team_events(self):
+        if self.harness is not None:
+            return [
+                item for item in self.poll_harness_events()
+                if item["source"] == "s13_team"
+            ]
         if self.team_runtime is None:
             return []
         events = self.team_runtime.consume_lead_inbox()
-        self._pending_team_events.extend(events)
-        self._pending_team_events = self._pending_team_events[-25:]
+        for item in events:
+            self._remember_team_event(item)
         return events
 
     def team_inbox(self):
@@ -1135,6 +1172,21 @@ class EvoMeRuntime:
         if agent is None:
             raise ValueError("Agent Loop disabled")
         return agent.executor.execute(fullname, arguments)
+
+    def harness_status(self) -> dict[str, Any]:
+        if self.harness is None:
+            return {"state": "disabled"}
+        return self.harness.status()
+
+    def harness_events(self, limit: int = 20):
+        if self.harness is None:
+            return []
+        return self.harness.events(limit=limit)
+
+    def poll_harness_events(self):
+        if self.harness is None:
+            return []
+        return self.harness.poll()
 
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
@@ -1238,6 +1290,8 @@ class EvoMeRuntime:
         return self.background_queue.wait(target, timeout=timeout)
 
     def shutdown(self, *, wait: bool = True) -> None:
+        if self.harness is not None:
+            self.harness.shutdown()
         if self.mcp_manager is not None:
             self.mcp_manager.close()
         if self.team_runtime is not None:

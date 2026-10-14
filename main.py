@@ -525,26 +525,36 @@ def main() -> None:
         "/team-stop <member>  /team-recover <task_id>  /team-shutdown  "
         "/mcp-servers  /mcp-connect <server>  /mcp-tools  "
         "/mcp-call <mcp__server__tool> <JSON>  "
-        "/mcp-disconnect <server>  /exit\n"
+        "/mcp-disconnect <server>  "
+        "/harness-status  /harness-events  /harness-sync  /exit\n"
     )
 
     with SessionLocal() as db:
         runtime = EvoMeRuntime(
-            db, enable_scheduler=True, enable_teams=True, enable_mcp=True,
+            db, enable_scheduler=True, enable_teams=True,
+            enable_mcp=True, enable_harness=True,
         )
         while True:
             user_input = input("You > ").strip()
             # Deliver completed team messages on the next foreground turn.
             # Operator commands never forward them into the learning path.
             try:
-                team_events = runtime.poll_team_events()
-                for item in team_events:
-                    print(
-                        f"[TEAM {item['from']}:{item['type']}] "
-                        f"{str(item['content'])[:500]}"
-                    )
+                if runtime.harness is not None:
+                    for item in runtime.poll_harness_events():
+                        print(
+                            f"[HARNESS {item['source']}:{item['kind']}] "
+                            f"{item['ref']} {item['status']} "
+                            f"{item['content'][:180]}"
+                        )
+                else:
+                    team_events = runtime.poll_team_events()
+                    for item in team_events:
+                        print(
+                            f"[TEAM {item['from']}:{item['type']}] "
+                            f"{str(item['content'])[:500]}"
+                        )
             except Exception as exc:
-                print(f"S13 inbox warning: {exc}")
+                print(f"Harness event warning: {exc}")
             if not user_input:
                 continue
             user_input = normalize_cli_input(user_input)
@@ -1019,6 +1029,34 @@ def main() -> None:
                     print(f"S13 {output}")
                 except Exception as exc:
                     print(f"S13 Team Error: {exc}")
+                continue
+            if user_input == "/harness-status":
+                try:
+                    print("S15 Harness:", runtime.harness_status())
+                except Exception as exc:
+                    print(f"S15 Harness Error: {exc}")
+                continue
+            if user_input == "/harness-events":
+                try:
+                    rows = runtime.harness_events()
+                    if not rows:
+                        print("S15 暂无观测事件")
+                    for item in rows:
+                        print(
+                            f"  [{item['source']}:{item['kind']}] "
+                            f"{item['ref']} status={item['status']} "
+                            f"{item['content'][:220]}"
+                        )
+                except Exception as exc:
+                    print(f"S15 Harness Error: {exc}")
+                continue
+            if user_input == "/harness-sync":
+                try:
+                    rows = runtime.poll_harness_events()
+                    print(f"S15 已同步 {len(rows)} 条新事件；仅在下一轮对话注入，"
+                          "不会自动执行或审批工具。")
+                except Exception as exc:
+                    print(f"S15 Harness Error: {exc}")
                 continue
             if user_input == "/mcp-servers":
                 try:

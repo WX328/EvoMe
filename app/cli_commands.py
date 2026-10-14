@@ -111,6 +111,7 @@ COMMAND_NAMES = frozenset(
         "team-stop", "team-shutdown", "team-recover",
         "mcp-servers", "mcp-connect", "mcp-disconnect",
         "mcp-tools", "mcp-call",
+        "harness-status", "harness-events", "harness-sync",
         "hooks",
         "plans",
         "plan",
