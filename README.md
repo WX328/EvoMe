@@ -469,3 +469,58 @@ separate one-worker background queue from the slow learning/evolution lane.
 
 S10 manual task claims are still separate. Do NOT use /task-start for a task
 that you want S11 to enqueue; /task-bg-run claims it as part of submission.
+
+## S12 Cron Scheduler
+
+S12 is an opt-in, local, single-process scheduler around the existing S10
+TaskStore + S11 *read-only* BackgroundTaskService. It does not grant new shell,
+filesystem-write or autonomous-approval capabilities.
+
+Enable EVOME_AGENT_LOOP_ENABLED=1, EVOME_TASK_SYSTEM_ENABLED=1,
+EVOME_S11_BACKGROUND_ENABLED=1, and EVOME_S12_CRON_ENABLED=1.
+Each persistent schedule is stored atomically under .schedules/ and Git-ignored.
+Session-only delayed triggers live exclusively in RAM.
+
+Commands:
+- /cron-at 2026-10-15T09:00:00+08:00 | 读取 app/agent/schema.py
+  (timezone-aware ISO8601; choose a future clock time)
+- /cron-add "*/5 * * * *" +08:00 3 | 读取 app/agent/schema.py
+  (cron: minute hour * * weekday; explicit fixed UTC offset; max runs 1..30)
+- /cron-after 15 | 读取 app/agent/schema.py
+  (session-only delay in seconds, 5..86400; not persisted)
+- /cron-list, /cron-show <id>, /cron-events, /cron-tick (manual poll)
+- /cron-pause <id>, /cron-resume <id>, /cron-cancel <id>
+  (pause/resume/cancel work only for durable schedules).
+
+Safety / failure semantics:
+- Only the operator's CLI can create or manage schedules. Agent model tools
+  are not registered for these operations. S11 re-validates read-only intent
+  at every dispatch; no write, shell or deploy actions execute from a schedule.
+- S12 records the next durable trigger *before* submitting an S11 job, giving
+  at-most-once trigger attempts per process; a crash in between may lose a
+  scheduled firing. Exactly-once remote execution is NOT guaranteed.
+- On startup, overdue one-shot triggers are marked missed; missed recurring
+  ticks are skipped to their next future occurrence. No automatic catch-up.
+- Each firing creates a NEW S10 task, preserving past task execution history.
+  Failed dispatches appear in /cron-events and last_error (durable triggers).
+  Failed S11 tasks still require manual /task-bg-recover. Cron will not retry
+  the same failed task on its own, although its next scheduled occurrence may
+  create an independent new task.
+- Cron supports only five fields with day-of-month and month set to "*".
+  Minute, hour and weekday support "*", integers, ranges, lists and */n.
+  Weekdays are 0=Sunday through 6=Saturday. Time zones are fixed UTC offsets;
+  daylight-saving rules are NOT automatically applied.
+- At most 50 durable definitions, at most 30 runs per definition, and 20
+  ephemeral session triggers. One polling thread; one S11 worker thread.
+  This is not a Windows service: EvoMe must remain running for scheduled
+  triggers to execute. The scheduler stops before worker shutdown.
+- Internal .schedules data is protected against normal write_file/edit_file
+  actions, and S11 research cannot read schedule metadata.
+- /cron-events includes an in-process notification trail; task results and
+  durable schedule state can be inspected after restart with /task-show and
+  /cron-show.
+
+For non-CLI embedded runtimes, scheduling also requires explicitly constructing
+`EvoMeRuntime(..., enable_scheduler=True)`. Ordinary unit-test runtimes keep
+scheduling off even if the environment flag is set, preventing test-triggered
+jobs against a developer's local task data.

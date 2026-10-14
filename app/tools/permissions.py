@@ -29,6 +29,7 @@ class PermissionPolicy:
         workspace_root: str | Path = ".",
         protected_memory_directory: str | Path | None = None,
         protected_task_directory: str | Path | None = None,
+        protected_schedule_directory: str | Path | None = None,
     ) -> None:
         self.bash_mode = bash_mode
         self.workspace_root = Path(workspace_root).resolve()
@@ -39,6 +40,10 @@ class PermissionPolicy:
         self.protected_task_directory = (
             Path(protected_task_directory).resolve()
             if protected_task_directory is not None else None
+        )
+        self.protected_schedule_directory = (
+            Path(protected_schedule_directory).resolve()
+            if protected_schedule_directory is not None else None
         )
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PermissionDecision:
@@ -68,6 +73,17 @@ class PermissionPolicy:
                         )
                 except (ValueError, OSError, RuntimeError):
                     return PermissionDecision("deny", "high", "unresolvable task write target")
+        if self.protected_schedule_directory is not None and tool_name in {"write_file", "edit_file"}:
+            path = arguments.get("path")
+            if isinstance(path, str):
+                try:
+                    requested = (self.workspace_root / path).resolve(strict=False)
+                    if requested.is_relative_to(self.protected_schedule_directory):
+                        return PermissionDecision(
+                            "deny", "high", "S12 schedule state cannot be edited through file tools"
+                        )
+                except (ValueError, OSError, RuntimeError):
+                    return PermissionDecision("deny", "high", "unresolvable schedule write target")
         if tool_name in {"task_list", "task_get", "task_ready"}:
             return PermissionDecision("allow", "low", "read-only durable task lookup")
         if tool_name in {

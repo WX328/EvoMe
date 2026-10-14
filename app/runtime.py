@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.agent import PlanStore
 from app.agent.task_system import TaskStore
 from app.agent.background_tasks import BackgroundTaskService
+from app.agent.cron_store import ScheduleStore
+from app.agent.cron_scheduler import CronScheduler
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
 from app.audit.service import AuditService
@@ -20,6 +22,9 @@ from app.config import (
     EVOME_TASK_DIRECTORY,
     EVOME_S11_BACKGROUND_ENABLED,
     EVOME_S11_MAX_STEPS,
+    EVOME_S12_CRON_ENABLED,
+    EVOME_S12_CRON_DIR,
+    EVOME_S12_POLL_SECONDS,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -106,6 +111,7 @@ class EvoMeRuntime:
         *,
         enable_background: bool = True,
         enable_agent_loop: bool | None = None,
+        enable_scheduler: bool = False,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
@@ -186,6 +192,22 @@ class EvoMeRuntime:
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
         self.tool_approval_store = ApprovalStore()
         self.plan_store = PlanStore()
+        # Runtime tests and explicit offline/injected-LLM configurations can
+        # disable the Agent Loop or background worker independently of .env.
+        # Never start a scheduler in those modes merely because the env flag
+        # is set; normal CLI access reports that S12 is unavailable.
+        s12_active = (
+            EVOME_S12_CRON_ENABLED and enable_scheduler and enable_background
+            and self.enable_agent_loop and EVOME_TASK_SYSTEM_ENABLED
+            and EVOME_S11_BACKGROUND_ENABLED
+        )
+        self.schedule_store = (
+            ScheduleStore(
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                directory=EVOME_S12_CRON_DIR,
+            )
+            if s12_active else None
+        )
         self.task_store = (
             TaskStore(
                 workspace_root=EVOME_TOOL_WORKSPACE,
@@ -251,6 +273,9 @@ class EvoMeRuntime:
                     self.agent_memory_store.root
                     if self.agent_memory_store is not None else None
                 ),
+                schedule_root=(
+                    self.schedule_store.root if self.schedule_store is not None else None
+                ),
                 max_steps=EVOME_S11_MAX_STEPS,
                 max_output_chars=EVOME_TOOL_MAX_OUTPUT_CHARS,
             )
@@ -258,6 +283,17 @@ class EvoMeRuntime:
                 and self.task_store is not None)
             else None
         )
+        self.cron_scheduler = (
+            CronScheduler(
+                store=self.schedule_store,
+                worker=self.task_background_service,
+                poll_seconds=EVOME_S12_POLL_SECONDS,
+            )
+            if self.schedule_store is not None
+            and self.task_background_service is not None else None
+        )
+        if self.cron_scheduler is not None:
+            self.cron_scheduler.start()  # skip downtime triggers, then poll
 
     def _build_strategy(
         self,
@@ -328,6 +364,9 @@ class EvoMeRuntime:
             context_keep_recent_messages=EVOME_CONTEXT_KEEP_RECENT_MESSAGES,
             agent_memory_store=self.agent_memory_store,
             task_store=self.task_store,
+            protected_schedule_directory=(
+                self.schedule_store.root if self.schedule_store is not None else None
+            ),
         )
 
     @property
@@ -907,6 +946,47 @@ class EvoMeRuntime:
     def recover_background_task(self, task_id: str):
         return self._task_worker().recover(task_id)
 
+    def _cron(self) -> CronScheduler:
+        if self.cron_scheduler is None:
+            raise ValueError(
+                "S12 Cron Scheduler 未启用；检查 Agent Loop、S10、S11 和 "
+                "EVOME_S12_CRON_ENABLED=1"
+            )
+        return self.cron_scheduler
+
+    def create_cron_at(self, *, at: str, title: str):
+        return self._cron().create_at(at=at, title=title)
+
+    def create_cron_recurring(self, *, expression: str, utc_offset: str, max_runs: int, title: str):
+        return self._cron().create_cron(
+            expression=expression, utc_offset=utc_offset,
+            max_runs=max_runs, title=title,
+        )
+
+    def create_cron_session(self, *, seconds: float, title: str):
+        return self._cron().create_session(delay_seconds=seconds, title=title)
+
+    def list_cron_schedules(self):
+        return self._cron().list()
+
+    def show_cron_schedule(self, schedule_id: str):
+        return self._cron().get(schedule_id)
+
+    def pause_cron_schedule(self, schedule_id: str):
+        return self._cron().pause(schedule_id)
+
+    def resume_cron_schedule(self, schedule_id: str):
+        return self._cron().resume(schedule_id)
+
+    def cancel_cron_schedule(self, schedule_id: str):
+        return self._cron().cancel(schedule_id)
+
+    def poll_cron_schedules(self):
+        return self._cron().tick()
+
+    def cron_events(self):
+        return self._cron().events()
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
@@ -1009,6 +1089,9 @@ class EvoMeRuntime:
         return self.background_queue.wait(target, timeout=timeout)
 
     def shutdown(self, *, wait: bool = True) -> None:
+        # Stop new triggers before waiting for existing S11 worker jobs.
+        if self.cron_scheduler is not None:
+            self.cron_scheduler.shutdown(wait=wait)
         if self.task_background_service is not None:
             self.task_background_service.shutdown(wait=wait)
         if self.background_queue is not None:

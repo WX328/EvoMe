@@ -17,3 +17,6 @@ scripts/__pycache__/
 
 # Local S10 persistent task state
 .tasks/
+
+# S12 local durable schedules (private task names/timestamps)
+.schedules/

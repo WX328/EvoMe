@@ -106,6 +106,15 @@ EVOME_S11_MAX_STEPS = max(
     2, min(10, int(os.getenv("EVOME_S11_MAX_STEPS", "6")))
 )
 
+# S12 opt-in Cron Scheduler: persisted triggers require S10 + S11.
+EVOME_S12_CRON_ENABLED = os.getenv(
+    "EVOME_S12_CRON_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S12_CRON_DIR = os.getenv("EVOME_S12_CRON_DIR", ".schedules")
+EVOME_S12_POLL_SECONDS = max(
+    0.2, min(60.0, float(os.getenv("EVOME_S12_POLL_SECONDS", "1.0")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

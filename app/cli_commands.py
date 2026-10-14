@@ -35,6 +35,8 @@ PARAM_COMMAND_NAMES = frozenset({
     "task-bg-show",
     "task-bg-wait",
     "task-bg-recover",
+    "cron-at", "cron-add", "cron-after",
+    "cron-show", "cron-pause", "cron-resume", "cron-cancel",
 })
 
 COMMAND_NAMES = frozenset(
@@ -95,6 +97,9 @@ COMMAND_NAMES = frozenset(
         "task-bg-show",
         "task-bg-wait",
         "task-bg-recover",
+        "cron-at", "cron-add", "cron-after", "cron-list",
+        "cron-show", "cron-pause", "cron-resume", "cron-cancel",
+        "cron-events", "cron-tick",
         "hooks",
         "plans",
         "plan",

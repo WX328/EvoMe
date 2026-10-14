@@ -511,11 +511,15 @@ def main() -> None:
         "/task-depend <id> <dependency>  /task-start <id> [owner]  "
         "/task-done <id> [owner]  /task-release <id> [owner]  "
         "/task-bg-run <id>  /task-bg-list  /task-bg-show <id>  "
-        "/task-bg-wait <id> [seconds]  /task-bg-recover <id>  /exit\n"
+        "/task-bg-wait <id> [seconds]  /task-bg-recover <id>  "
+        "/cron-at <ISO> | <只读任务>  /cron-add <expr> <offset> <runs> | <只读任务>  "
+        "/cron-after <seconds> | <只读任务>  /cron-list  /cron-show <id>  "
+        "/cron-pause <id>  /cron-resume <id>  /cron-cancel <id>  "
+        "/cron-events  /cron-tick  /exit\n"
     )
 
     with SessionLocal() as db:
-        runtime = EvoMeRuntime(db)
+        runtime = EvoMeRuntime(db, enable_scheduler=True)
         while True:
             user_input = input("You > ").strip()
             if not user_input:
@@ -845,6 +849,64 @@ def main() -> None:
                     print(f"S10 {task['id']} [{task['status']}] owner={task['owner'] or '-'}")
                 except Exception as exc:
                     print(f"S10 Task Error: {exc}")
+                continue
+            if user_input in {"/cron-list", "/cron-events", "/cron-tick"}:
+                try:
+                    if user_input == "/cron-list":
+                        rows = runtime.list_cron_schedules()
+                    elif user_input == "/cron-events":
+                        rows = runtime.cron_events()
+                    else:
+                        rows = runtime.poll_cron_schedules()
+                    print("S12 尚无记录" if not rows else "")
+                    for item in rows:
+                        print(item)
+                except Exception as exc:
+                    print(f"S12 Cron Error: {exc}")
+                continue
+            if user_input.startswith(("/cron-at ", "/cron-add ", "/cron-after ")):
+                try:
+                    import shlex
+                    head, sep, title = user_input.partition("|")
+                    if not sep or not title.strip():
+                        raise ValueError("请使用 | 分隔时间参数与只读任务名称")
+                    pieces = shlex.split(head)
+                    mode = pieces[0]
+                    if mode == "/cron-at" and len(pieces) == 2:
+                        row = runtime.create_cron_at(at=pieces[1], title=title.strip())
+                    elif mode == "/cron-add" and len(pieces) == 4:
+                        row = runtime.create_cron_recurring(
+                            expression=pieces[1], utc_offset=pieces[2],
+                            max_runs=int(pieces[3]), title=title.strip(),
+                        )
+                    elif mode == "/cron-after" and len(pieces) == 2:
+                        row = runtime.create_cron_session(
+                            seconds=float(pieces[1]), title=title.strip(),
+                        )
+                    else:
+                        raise ValueError("命令格式错误；参考启动帮助中的 cron 示例")
+                    print(
+                        f"S12 已创建 {row['id']} [{row['kind']}] "
+                        f"next={row['next_run_at']} status={row['status']}"
+                    )
+                except Exception as exc:
+                    print(f"S12 Cron Error: {exc}")
+                continue
+            if user_input.startswith(("/cron-show ", "/cron-pause ", "/cron-resume ", "/cron-cancel ")):
+                try:
+                    command, schedule_id = user_input.split(maxsplit=1)
+                    schedule_id = schedule_id.strip()
+                    if command == "/cron-show":
+                        row = runtime.show_cron_schedule(schedule_id)
+                    elif command == "/cron-pause":
+                        row = runtime.pause_cron_schedule(schedule_id)
+                    elif command == "/cron-resume":
+                        row = runtime.resume_cron_schedule(schedule_id)
+                    else:
+                        row = runtime.cancel_cron_schedule(schedule_id)
+                    print(f"S12 {row}")
+                except Exception as exc:
+                    print(f"S12 Cron Error: {exc}")
                 continue
             if user_input == "/task-bg-list":
                 try:

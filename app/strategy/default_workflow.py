@@ -73,6 +73,7 @@ class DefaultConversationStrategy:
         context_keep_recent_messages: int = 6,
         agent_memory_store: AgentMemoryStore | None = None,
         task_store: TaskStore | None = None,
+        protected_schedule_directory: str | None = None,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -109,6 +110,7 @@ class DefaultConversationStrategy:
                     protected_task_directory=(
                         task_store.root if task_store is not None else None
                     ),
+                    protected_schedule_directory=protected_schedule_directory,
                 ),
                 approval_store=self.approval_store,
                 hook_manager=hook_manager,
