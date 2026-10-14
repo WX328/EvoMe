@@ -97,6 +97,15 @@ EVOME_TASK_SYSTEM_ENABLED = os.getenv(
 ).strip().lower() in {"1", "true", "yes", "on"}
 EVOME_TASK_DIRECTORY = os.getenv("EVOME_TASK_DIRECTORY", ".tasks")
 
+# S11 background read-only research tasks (opt-in, single worker).
+# Requires S10 TaskStore and EVOME_AGENT_LOOP_ENABLED.
+EVOME_S11_BACKGROUND_ENABLED = os.getenv(
+    "EVOME_S11_BACKGROUND_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S11_MAX_STEPS = max(
+    2, min(10, int(os.getenv("EVOME_S11_MAX_STEPS", "6")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

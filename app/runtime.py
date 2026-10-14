@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.agent import PlanStore
 from app.agent.task_system import TaskStore
+from app.agent.background_tasks import BackgroundTaskService
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
 from app.audit.service import AuditService
@@ -17,6 +18,8 @@ from app.config import (
     EVOME_AGENT_LOOP_ENABLED,
     EVOME_TASK_SYSTEM_ENABLED,
     EVOME_TASK_DIRECTORY,
+    EVOME_S11_BACKGROUND_ENABLED,
+    EVOME_S11_MAX_STEPS,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -238,6 +241,23 @@ class EvoMeRuntime:
             hypothesis_retriever=self.hypothesis_retriever,
         )
         self._ensure_strategy_record()
+        self.task_background_service = (
+            BackgroundTaskService(
+                store=self.task_store,
+                llm_factory=self._new_background_llm,
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                hook_manager=self.hook_manager,
+                memory_root=(
+                    self.agent_memory_store.root
+                    if self.agent_memory_store is not None else None
+                ),
+                max_steps=EVOME_S11_MAX_STEPS,
+                max_output_chars=EVOME_TOOL_MAX_OUTPUT_CHARS,
+            )
+            if (enable_background and EVOME_S11_BACKGROUND_ENABLED
+                and self.task_store is not None)
+            else None
+        )
 
     def _build_strategy(
         self,
@@ -862,6 +882,31 @@ class EvoMeRuntime:
     def release_durable_task(self, task_id: str, owner: str = "operator"):
         return self._durable_tasks().release_task(task_id, owner)
 
+    def _task_worker(self) -> BackgroundTaskService:
+        if self.task_background_service is None:
+            raise ValueError(
+                "S11 Background Tasks 未启用：请检查 S10 与 "
+                "EVOME_S11_BACKGROUND_ENABLED=1"
+            )
+        return self.task_background_service
+
+    def enqueue_background_task(self, task_id: str):
+        # Operator-requested read-only work only. This never executes
+        # arbitrary LLM-proposed commands or background writes.
+        return self._task_worker().submit(task_id)
+
+    def background_task_status(self, task_id: str):
+        return self._task_worker().get_status(task_id)
+
+    def list_background_tasks(self):
+        return self._task_worker().list_status()
+
+    def wait_for_durable_background_task(self, task_id: str, timeout: float = 30):
+        return self._task_worker().wait(task_id, timeout=timeout)
+
+    def recover_background_task(self, task_id: str):
+        return self._task_worker().recover(task_id)
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
@@ -964,6 +1009,8 @@ class EvoMeRuntime:
         return self.background_queue.wait(target, timeout=timeout)
 
     def shutdown(self, *, wait: bool = True) -> None:
+        if self.task_background_service is not None:
+            self.task_background_service.shutdown(wait=wait)
         if self.background_queue is not None:
             self.background_queue.shutdown(wait=wait)
 

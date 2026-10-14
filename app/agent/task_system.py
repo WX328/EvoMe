@@ -18,7 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 TASK_ID = re.compile(r"task_[0-9a-f]{8}\Z")
-_STATUSES = frozenset({"pending", "in_progress", "completed"})
+_STATUSES = frozenset({"pending", "in_progress", "completed", "failed"})
 MAX_TASKS = 250
 MAX_DEPENDENCIES = 32
 MAX_DOCUMENT_BYTES = 12000
@@ -90,7 +90,9 @@ class TaskRecord:
             raise ValueError("invalid blockedBy dependencies")
         if (status == "pending" and (owner or result)) or (
             status == "in_progress" and (not owner or result)
-        ) or (status == "completed" and not owner):
+        ) or (status == "completed" and not owner) or (
+            status == "failed" and (not owner or not result)
+        ):
             raise ValueError("inconsistent task status/owner/result")
         if any(not isinstance(data[field], str) or not data[field] for field in ("created_at", "updated_at")):
             raise ValueError("invalid task timestamps")
@@ -386,3 +388,43 @@ class TaskStore:
             draft = dict(tasks)
             draft[task_id] = changed
             return self._view(changed, draft)
+
+    def fail_task(
+        self, task_id: str, owner: str, error: str,
+    ) -> dict[str, Any]:
+        """Persist a worker failure; S10 dependencies remain blocked."""
+        self._validate_id(task_id)
+        owner = _text(owner, field="owner", limit=80)
+        error = _text(error, field="error", limit=1200)
+        with self._lock:
+            tasks = self._all()
+            if task_id not in tasks:
+                raise KeyError(f"unknown task: {task_id}")
+            record = tasks[task_id]
+            if record.status != "in_progress" or record.owner != owner:
+                raise PermissionError("only the active owner can fail this task")
+            changed = replace(
+                record, status="failed", result=error,
+                updated_at=_utcnow(), version=record.version + 1,
+            )
+            self._save(changed)
+            tasks[task_id] = changed
+            return self._view(changed, tasks)
+
+    def retry_failed_task(self, task_id: str) -> dict[str, Any]:
+        """Explicit operator recovery. No LLM or worker retries automatically."""
+        self._validate_id(task_id)
+        with self._lock:
+            tasks = self._all()
+            if task_id not in tasks:
+                raise KeyError(f"unknown task: {task_id}")
+            record = tasks[task_id]
+            if record.status != "failed":
+                raise ValueError("only a failed task may be manually retried")
+            changed = replace(
+                record, status="pending", owner="", result="",
+                updated_at=_utcnow(), version=record.version + 1,
+            )
+            self._save(changed)
+            tasks[task_id] = changed
+            return self._view(changed, tasks)

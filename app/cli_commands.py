@@ -31,6 +31,10 @@ PARAM_COMMAND_NAMES = frozenset({
     "task-start",
     "task-done",
     "task-release",
+    "task-bg-run",
+    "task-bg-show",
+    "task-bg-wait",
+    "task-bg-recover",
 })
 
 COMMAND_NAMES = frozenset(
@@ -86,6 +90,11 @@ COMMAND_NAMES = frozenset(
         "task-start",
         "task-done",
         "task-release",
+        "task-bg-run",
+        "task-bg-list",
+        "task-bg-show",
+        "task-bg-wait",
+        "task-bg-recover",
         "hooks",
         "plans",
         "plan",

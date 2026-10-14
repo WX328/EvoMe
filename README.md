@@ -433,3 +433,39 @@ Records are under .tasks/task_XXXXXXXX.json (workspace relative, Git-ignored).
 4. /task-start <first>, then /task-done <first>. Now /task-ready should show second.
 5. Exit and restart python main.py, then /task-list and /task-show <second>. Both the state and dependency should persist.
 6. Agent tool test: ask EvoMe to call task_create; /tool-approvals must show approval before disk changes.
+
+## S11 Background Tasks (opt-in, read-only research)
+
+Enable EVOME_AGENT_LOOP_ENABLED=1, EVOME_TASK_SYSTEM_ENABLED=1, and
+EVOME_S11_BACKGROUND_ENABLED=1. S11 shares S10 TaskStore data but has a
+separate one-worker background queue from the slow learning/evolution lane.
+
+1. Create an explicit research task using /task-create 读取 app/agent/schema.py
+2. Use /task-bg-run <task_id> to claim and enqueue. The prompt must start with
+   a research/read keyword, and mutation verbs are rejected.
+3. You can chat normally while the job runs. Check /task-bg-list, /task-bg-show
+   <task_id>, or block briefly using /task-bg-wait <task_id> [seconds].
+4. A dedicated S06 ResearchSubagent with its own background LLM reads only
+   through read_file/glob. Bash, writes, other Agent tools and memory changes
+   are unavailable. S04 hook checks and a mandatory secret-path hook apply.
+5. Successful research with real tool evidence transitions S10 in_progress to
+   completed and saves a bounded summary to the TaskRecord result; downstream
+   blockedBy dependents become ready.
+6. A failed job transitions S10 status to failed with a bounded error message.
+   No retry runs automatically. /task-bg-recover <task_id> explicitly resets
+   failed jobs to pending (or releases orphaned S11 claims).
+7. A process exit/crash may leave S10 in_progress with an S11 owner: restart
+   NEVER automatically re-executes the orphan. After reviewing side effects,
+   use /task-bg-recover <task_id>, then manually re-submit.
+8. Full structured evidence is held only in this process's job records; after
+   restart S10's bounded summary remains, but in-memory job history is lost.
+9. Background research is single-worker, not a concurrent Agent Team.
+   Arbitrary shell/write/deploy jobs and autonomous delegation are out of
+   scope; S03 approvals are never generated, bypassed or auto-accepted
+   in this restricted execution lane.
+10. This lane does not use the foreground SQLite Session or existing
+    PersonalMemory/TaskPlanning systems, and does not change /status
+    background learning jobs. Use /task-bg-list for S11 work.
+
+S10 manual task claims are still separate. Do NOT use /task-start for a task
+that you want S11 to enqueue; /task-bg-run claims it as part of submission.

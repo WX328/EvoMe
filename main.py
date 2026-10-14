@@ -509,7 +509,9 @@ def main() -> None:
         "/agent-memory-preview  /agent-memory-consolidate  "
         "/task-list  /task-ready  /task-show <id>  /task-create <title>  "
         "/task-depend <id> <dependency>  /task-start <id> [owner]  "
-        "/task-done <id> [owner]  /task-release <id> [owner]  /exit\n"
+        "/task-done <id> [owner]  /task-release <id> [owner]  "
+        "/task-bg-run <id>  /task-bg-list  /task-bg-show <id>  "
+        "/task-bg-wait <id> [seconds]  /task-bg-recover <id>  /exit\n"
     )
 
     with SessionLocal() as db:
@@ -843,6 +845,79 @@ def main() -> None:
                     print(f"S10 {task['id']} [{task['status']}] owner={task['owner'] or '-'}")
                 except Exception as exc:
                     print(f"S10 Task Error: {exc}")
+                continue
+            if user_input == "/task-bg-list":
+                try:
+                    items = runtime.list_background_tasks()
+                    if not items:
+                        print("S11 暂无后台任务")
+                    for item in items:
+                        print(
+                            f"  {item['task_id']} [{item['task_status']}] "
+                            f"job={item['job_id'] or '-'} "
+                            f"job_status={item['job_status']} | {item['title']}"
+                        )
+                except Exception as exc:
+                    print(f"S11 Background Error: {exc}")
+                continue
+            if user_input.startswith("/task-bg-run "):
+                try:
+                    task_id = user_input.split(maxsplit=1)[1].strip()
+                    result = runtime.enqueue_background_task(task_id)
+                    print(
+                        f"S11 已提交：{result['task_id']} job={result['job_id']}; "
+                        "只读研究已进入后台队列。通过 /task-bg-show 查看结果。"
+                    )
+                except Exception as exc:
+                    print(f"S11 Background Error: {exc}")
+                continue
+            if user_input.startswith("/task-bg-show "):
+                try:
+                    task_id = user_input.split(maxsplit=1)[1].strip()
+                    state = runtime.background_task_status(task_id)
+                    print(
+                        f"S11 {task_id} task={state['task_status']} "
+                        f"job={state['job_status']} owner={state['owner'] or '-'}"
+                    )
+                    if state.get("summary"):
+                        print(f"  摘要：{state['summary']}")
+                        for row in state.get("evidence", []):
+                            print(f"    · {row.get('tool')} {row.get('path')}")
+                    elif state.get("result"):
+                        print(f"  持久化结果：{state['result']}")
+                    if state.get("error"):
+                        print(f"  error={state['error']}")
+                except Exception as exc:
+                    print(f"S11 Background Error: {exc}")
+                continue
+            if user_input.startswith("/task-bg-wait "):
+                try:
+                    parts = user_input.split()
+                    if len(parts) not in {2, 3}:
+                        raise ValueError("用法：/task-bg-wait <task_id> [seconds]")
+                    seconds = float(parts[2]) if len(parts) == 3 else 30.0
+                    if not 0 <= seconds <= 120:
+                        raise ValueError("timeout must be 0-120 seconds")
+                    state = runtime.wait_for_durable_background_task(
+                        parts[1], timeout=seconds,
+                    )
+                    print(
+                        f"S11 {parts[1]} task={state['task_status']} "
+                        f"job={state['job_status']}"
+                    )
+                except Exception as exc:
+                    print(f"S11 Background Error: {exc}")
+                continue
+            if user_input.startswith("/task-bg-recover "):
+                try:
+                    task_id = user_input.split(maxsplit=1)[1].strip()
+                    task = runtime.recover_background_task(task_id)
+                    print(
+                        f"S11 已手动恢复 {task_id} -> {task['status']}; "
+                        "不会自动执行，请检查后再次使用 /task-bg-run"
+                    )
+                except Exception as exc:
+                    print(f"S11 Background Error: {exc}")
                 continue
             if user_input == "/context-stats":
                 print(runtime.context_compaction_stats())
