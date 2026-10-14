@@ -14,6 +14,9 @@ from app.agent.cron_store import ScheduleStore
 from app.agent.cron_scheduler import CronScheduler
 from app.agent.team_runtime import TeamRuntime
 from app.agent.integrated_harness import IntegratedHarness
+from app.agent.goal_loop import (
+    GoalController, GoalError, PromptGoalEvaluator, CLEAR_ALIASES,
+)
 from app.agent.workflow_store import WorkflowStore
 from app.agent.workflow_runtime import WorkflowRuntime
 from app.tools.base import ToolDefinition, ToolImplementation
@@ -45,6 +48,10 @@ from app.config import (
     EVOME_S16_WORKFLOW_DIR,
     EVOME_S16_MAX_AGENT_CALLS,
     EVOME_S16_MAX_PARALLEL,
+    EVOME_S17_GOAL_ENABLED,
+    EVOME_S17_GOAL_BLOCK_CAP,
+    EVOME_S17_GOAL_MAX_TURNS,
+    EVOME_S17_EVALUATOR_MAX_TOKENS,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -136,6 +143,7 @@ class EvoMeRuntime:
         enable_mcp: bool = False,
         enable_harness: bool = False,
         enable_workflows: bool = False,
+        enable_goals: bool = False,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
@@ -306,6 +314,20 @@ class EvoMeRuntime:
             hypothesis_retriever=self.hypothesis_retriever,
         )
         self._ensure_strategy_record()
+        # No active Goal is restored at startup: an operator must explicitly
+        # set a session-level condition. Independent evaluator has no tools.
+        self.goal_controller: GoalController | None = None
+        if EVOME_S17_GOAL_ENABLED and enable_goals and self.strategy.agent_loop is not None:
+            self.goal_controller = GoalController(
+                PromptGoalEvaluator(
+                    self._new_background_llm,
+                    max_tokens=EVOME_S17_EVALUATOR_MAX_TOKENS,
+                ),
+                block_cap=EVOME_S17_GOAL_BLOCK_CAP,
+                max_turns=EVOME_S17_GOAL_MAX_TURNS,
+                background_running=self._goal_background_running,
+            )
+            self.strategy.agent_loop.goal_controller = self.goal_controller
         self.workflow_runtime: WorkflowRuntime | None = None
         if self.workflow_store is not None and self.strategy.agent_loop is not None:
             self.workflow_runtime = WorkflowRuntime(
@@ -838,6 +860,7 @@ class EvoMeRuntime:
         user_input: str,
         *,
         on_token: Callable[[str], None] | None = None,
+        goal_internal: bool = False,
     ) -> dict[str, Any]:
         """Stream the user-facing answer, then enqueue learning in the background.
 
@@ -845,6 +868,29 @@ class EvoMeRuntime:
         answer generation. Evaluation/reflection/hypothesis work starts only
         after the complete assistant response exists.
         """
+        if goal_internal:
+            if not self._goal().is_goal_turn(user_input):
+                raise GoalError("S17 internal Goal turn must match active condition")
+            state = self.strategy.prepare_fast_state(
+                user_input=user_input, session_id=self.session_id,
+            )
+            chunks: list[str] = []
+            for token in self.strategy.stream_response(state):
+                chunks.append(token)
+                if on_token is not None:
+                    on_token(token)
+            # Goal control traffic is NOT a new personal memory, learning
+            # example, or a trigger for background self-evolution jobs.
+            return {
+                "response": "".join(chunks),
+                "strategy_name": self.strategy_full_name,
+                "background_job_id": None,
+                "background_status": "goal_only",
+                "relevant_memory_count": len(state.get("relevant_memories", [])),
+                "agent_step_count": len(state.get("agent_steps", [])),
+                "agent_termination_reason": state.get("agent_termination_reason", ""),
+                "tool_error_count": int(state.get("tool_error_count", 0)),
+            }
         if self.background_queue is None:
             # Useful for embedders/tests that explicitly disable background mode.
             result = self.run(user_input)
@@ -1280,6 +1326,69 @@ class EvoMeRuntime:
     def workflow_unlock(self, run_id: str, *, confirmed: bool):
         return self._workflow().unlock_orphan(run_id, confirmed=confirmed)
 
+    def _goal_background_running(self) -> bool:
+        # The goal gate cannot assume asynchronous work has finished simply
+        # because the worker model proposed a final answer.
+        workflow = getattr(self, "workflow_runtime", None)
+        if workflow is not None:
+            if any(row["status"] in {"queued", "running"}
+                   for row in workflow.current_runs()):
+                return True
+        worker = getattr(self, "task_background_service", None)
+        if worker is not None:
+            for row in worker.list_status():
+                if row.get("job_id") and row.get("task_status") in {"pending", "in_progress"}:
+                    if row.get("job_status") in {"queued", "running"}:
+                        return True
+        team = getattr(self, "team_runtime", None)
+        if team is not None:
+            if any(row.get("status") == "WORK"
+                   for row in team.status().get("members", [])):
+                return True
+        return False
+
+    def _goal(self) -> GoalController:
+        if self.goal_controller is None:
+            raise ValueError(
+                "S17 Goal Loop 未启用；检查 EVOME_S17_GOAL_ENABLED=1 与 Agent Loop"
+            )
+        return self.goal_controller
+
+    def goal_status(self) -> dict[str, Any]:
+        return self._goal().status()
+
+    def goal_set(self, condition: str) -> dict[str, Any]:
+        goal = self._goal()
+        if goal.waiting_approval_id:
+            # Old approval grants cannot be carried over to a new Goal.
+            self.deny_tool_call(goal.waiting_approval_id)
+        return goal.set(condition)
+
+    def goal_clear(self) -> dict[str, Any]:
+        goal = self._goal()
+        if goal.waiting_approval_id:
+            self.deny_tool_call(goal.waiting_approval_id)
+        return goal.clear()
+
+    def goal_continue(
+        self, *, on_token: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        controller = self._goal()
+        condition = controller.condition
+        if condition is None:
+            raise GoalError("没有活跃 Goal；先使用 /goal <完成条件>")
+        if controller.waiting_approval_id:
+            raise GoalError("Goal 等待 S03 审批；先 /tool-approve 或 /tool-deny")
+        if controller.defer_background and self._goal_background_running():
+            raise GoalError("后台任务仍在执行；请等待完成通知后再继续 Goal")
+        if controller.defer_background and self.harness is not None:
+            # Show bounded, untrusted OBSERVATIONS only. Goal evaluator must
+            # verify tasks using actual tool results or TaskStore.
+            self.harness.poll()
+            controller.note_runtime_events(self.harness.events(limit=12))
+        controller.begin_query()
+        return self.stream_run(condition, on_token=on_token, goal_internal=True)
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
@@ -1288,6 +1397,10 @@ class EvoMeRuntime:
         if agent is None:
             return None
         result = agent.executor.approve(approval_id)
+        if self.goal_controller is not None:
+            self.goal_controller.note_approval(
+                approval_id, success=result.success, status=result.status,
+            )
         if agent.planner is not None:
             agent.planner.on_approval(approval_id, result)
         return result
@@ -1297,6 +1410,10 @@ class EvoMeRuntime:
         if agent is None:
             return False
         was_denied = agent.executor.deny(approval_id)
+        if was_denied and self.goal_controller is not None:
+            self.goal_controller.note_approval(
+                approval_id, success=False, status="denied",
+            )
         if was_denied and agent.planner is not None:
             agent.planner.on_approval(approval_id, None, denied=True)
         return was_denied

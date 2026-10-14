@@ -156,6 +156,20 @@ EVOME_S16_MAX_PARALLEL = max(
     1, min(2, int(os.getenv("EVOME_S16_MAX_PARALLEL", "2")))
 )
 
+# S17 session-scoped Goal Stop hook. Disabled by default; operator starts /goal.
+EVOME_S17_GOAL_ENABLED = os.getenv(
+    "EVOME_S17_GOAL_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S17_GOAL_BLOCK_CAP = max(
+    1, min(12, int(os.getenv("EVOME_S17_GOAL_BLOCK_CAP", "3")))
+)
+EVOME_S17_GOAL_MAX_TURNS = max(
+    2, min(40, int(os.getenv("EVOME_S17_GOAL_MAX_TURNS", "12")))
+)
+EVOME_S17_EVALUATOR_MAX_TOKENS = max(
+    128, min(768, int(os.getenv("EVOME_S17_EVALUATOR_MAX_TOKENS", "384")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

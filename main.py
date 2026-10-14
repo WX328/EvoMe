@@ -3,6 +3,7 @@ import json
 from app.database import Base, engine, SessionLocal
 from app.migrations import migrate_v0_2, migrate_v0_2_1
 from app.runtime import EvoMeRuntime
+from app.agent.goal_loop import CLEAR_ALIASES
 from app.cli_commands import COMMAND_NAMES, normalize_cli_input
 from app.version import APP_VERSION
 
@@ -531,13 +532,15 @@ def main() -> None:
         "/workflow-run <name> <JSON-args>  /workflow-resume <run_id>  "
         "/workflow-show <run_id>  /workflow-events <run_id>  "
         "/workflow-wait <run_id> [seconds]  "
-        "/workflow-unlock <run_id> CONFIRM  /exit\n"
+        "/workflow-unlock <run_id> CONFIRM  "
+        "/goal <完成条件>  /goal  /goal continue  /goal clear  /exit\n"
     )
 
     with SessionLocal() as db:
         runtime = EvoMeRuntime(
             db, enable_scheduler=True, enable_teams=True,
-            enable_mcp=True, enable_harness=True, enable_workflows=True,
+            enable_mcp=True, enable_harness=True,
+            enable_workflows=True, enable_goals=True,
         )
         while True:
             user_input = input("You > ").strip()
@@ -576,6 +579,34 @@ def main() -> None:
                 runtime.shutdown(wait=True)
                 print("EvoMe > 下次见。")
                 break
+            if user_input == "/goal":
+                try:
+                    print(f"S17 Goal: {runtime.goal_status()}")
+                except Exception as exc:
+                    print(f"S17 Goal Error: {exc}")
+                continue
+            if user_input.startswith("/goal "):
+                try:
+                    argument = user_input[len("/goal "):].strip()
+                    if argument.lower() in CLEAR_ALIASES:
+                        print(f"S17 Goal: {runtime.goal_clear()}")
+                        continue
+                    if argument.lower() == "continue":
+                        print("EvoMe Goal > ", end="", flush=True)
+                        result = runtime.goal_continue(
+                            on_token=lambda token: print(token, end="", flush=True),
+                        )
+                    else:
+                        print(f"S17 Goal: {runtime.goal_set(argument)}")
+                        print("EvoMe Goal > ", end="", flush=True)
+                        result = runtime.goal_continue(
+                            on_token=lambda token: print(token, end="", flush=True),
+                        )
+                    print(f"\nS17 {result['agent_termination_reason']} "
+                          f"| {runtime.goal_status()}\n")
+                except Exception as exc:
+                    print(f"\nS17 Goal Error: {type(exc).__name__}: {exc}")
+                continue
             if user_input == "/memory":
                 show_personal_memories(runtime); continue
             if user_input == "/experience":

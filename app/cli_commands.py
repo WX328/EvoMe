@@ -44,6 +44,7 @@ PARAM_COMMAND_NAMES = frozenset({
     "mcp-connect", "mcp-disconnect", "mcp-call",
     "workflow-run", "workflow-resume", "workflow-show",
     "workflow-events", "workflow-wait", "workflow-unlock",
+    "goal",
 })
 
 COMMAND_NAMES = frozenset(
@@ -117,6 +118,7 @@ COMMAND_NAMES = frozenset(
         "workflow-catalog", "workflow-list", "workflow-run",
         "workflow-resume", "workflow-show", "workflow-events",
         "workflow-wait", "workflow-unlock",
+        "goal",
         "hooks",
         "plans",
         "plan",

@@ -931,3 +931,130 @@ Manual acceptance:
 Look at result.files[0].quality.status=unverified and the truncation flags.
 Verify should no longer treat an item missing from an old 420-char excerpt
 as evidence it was absent in the original full Audit report.
+
+## S17 Goal Loop — session-level Stop hook, independent evaluation
+
+S17 is the last mechanism in shareAI-lab/learn-claude-code (current 17-stage
+line). It does NOT introduce another tool executor, a 24/7 daemon, a
+self-starting background worker, or automatic permissions.
+
+Reference: https://github.com/shareAI-lab/learn-claude-code/blob/main/s17_goal_loop/README.zh.md
+
+### Core behavior
+
+  /goal <precise completion criteria>
+
+sets ONE goal in the current EvoMe process and immediately starts working.
+The existing S01 AgentLoop continues to call S02 tools via S03 permission and
+S04 hooks; its exit path calls a separate, tool-free Goal Evaluator before
+claiming goal completion. Unmet criteria cause the evaluator's reason to
+return to the SAME model messages[] and the SAME bounded tool loop.
+
+  model proposes final
+    -> S17 GoalController.after_final(messages)
+       -> background active? defer without judging
+       -> independent tool-free evaluator
+          -> achieved: finish and clear goal
+          -> impossible: stop and clear goal (status failed)
+          -> missing evidence: feed reason into messages[] and continue
+          -> evaluator error: return control, keep goal
+       -> exhausted model turns/blocked Stop hooks: keep goal, return control
+    -> all tool calls still go through S03 PermissionPolicy + S04 Hooks
+
+No active Goal => existing S01 final_answer path is unchanged. Ordinary
+conversation while a Goal is paused is not automatically interpreted as a
+continuation; use /goal continue to resume the saved in-process checkpoint.
+
+### Enable (edit your OWN .env; never commit or paste it)
+
+    EVOME_S17_GOAL_ENABLED=1
+    EVOME_S17_GOAL_BLOCK_CAP=3
+    EVOME_S17_GOAL_MAX_TURNS=12
+    EVOME_S17_EVALUATOR_MAX_TOKENS=384
+
+S01 EVOME_AGENT_LOOP_ENABLED=1 is required. Main.py opts into
+enable_goals=True; embedded/test runtimes must explicitly opt in.
+A freshly restarted EvoMe session has **NO active Goal**; session state and
+the in-memory checkpoint do not survive restart, per the lesson scope.
+
+### Commands
+
+- /goal                 Show condition, evaluator count, elapsed, last reason,
+                        active status, checkpoint and pending approval.
+- /goal <condition>     Set or replace the current goal, START executing
+                        immediately (no extra "begin" command).
+- /goal clear           Clear the active goal. stop/off/reset/none/cancel are
+                        aliases. A matching pending S03 request is denied.
+- /goal continue        Manually resume a paused active goal's checkpoint,
+                        after waiting for any pending background/approval
+                        work. A new turn budget applies each resume.
+
+CLI commands do not become model learning samples. Goal-specific turns use
+the fast path only, without staging new S09 memories or queuing
+post-turn slow-evolution learning based on control text.
+
+### Suggested first test (read-only, low-cost)
+
+    /goal 读取 app/agent/schema.py，列出四个数据类及对应行号；必须有 read_file 的实际工具结果才能结束
+
+Expected behavior:
+1. /goal starts the SAME foreground agent loop.
+2. Worker calls read_file; S03/S04 guards remain active.
+3. Worker proposes final; independent evaluator sees conversation/tool output
+   and returns structured ok/reason/impossible without any tools.
+4. If evidence is lacking, GoalStop adds a bounded reason to user-role
+   context and continues until another final, budget exit or approval.
+5. When criteria are supported, agent_termination_reason=goal_achieved;
+   /goal reports status=achieved, active=false. A claim of success alone is
+   not enough according to evaluator instructions.
+
+### Other manual tests
+
+  /goal 请运行 S16 review-files 的只读审查并核实实际输出
+
+If the worker chooses Workflow, S03 approval pauses it immediately:
+  /tool-approvals
+  /tool-approve <actual-id>
+  /goal continue
+
+Approval **starts** the Workflow, it does not prove that its background
+research has completed. If S16/S11/S13 work is running when a final answer
+is proposed, the Stop gate defers. Check /workflow-show or /task-show and
+continue only after actual results exist.
+
+When S15 Harness has observed a background completion, /goal continue
+may pass bounded, untrusted event metadata into the saved checkpoint.
+Those notifications are NOT a claim-level proof. S03 controls still apply.
+
+### Limits and boundary conditions
+
+- The independent Goal Evaluator has a separate LLM client, strict JSON
+  validation and NO tools, memory or MCP connection. It only evaluates
+  conversation evidence; it does not run tests or inspect files itself.
+- This is a probabilistic evaluator, not cryptographic proof. It may still
+  err. High-stakes changes require deterministic verification or human
+  confirmation.
+- Every /goal execution has a hard AgentLoop step limit (existing S01),
+  an S17 max_turns cap and a consecutive Stop-hook block cap. Reaching a
+  limit does NOT mark the goal achieved or clear its state.
+- S03 approval_required and S04 hook veto are never retried automatically.
+  After an approval, a bounded outcome notice is injected into the saved
+  checkpoint; model must gather final result evidence.
+- Evaluation errors, invalid structured JSON and uninspectable background
+  state FAIL CLOSED: the Goal remains active and needs the operator.
+- A paused Goal checkpoint is IN PROCESS, not user memory and not stored
+  in the S16 journal or SQLite. /exit loses it. No auto-resume on restart.
+- The CLI uses blocking input(); background work does NOT silently restart
+  the foreground model while the console waits for text. When a background
+  notification arrives, enter /goal continue. A Work/GUI host could call
+  goal_continue itself, but S17 CLI does not run a hidden unattended daemon.
+- Source events, tool outputs and evaluator reasons are untrusted user-role
+  content, never new system permissions. Goal evaluation cannot turn a
+  denied write, bash, MCP call or workflow into an authorized call.
+- Goal-only turns deliberately do not create extra S09 personal memories or
+  Phase 5 slow learning samples.
+
+### Tests
+
+    python -m pytest -q tests/test_s17_goal_loop.py
+    python -m pytest -q

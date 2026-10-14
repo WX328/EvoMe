@@ -6,6 +6,7 @@ from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 
 from app.agent.schema import AgentCheckpoint, AgentRunResult, AgentStep, ToolCall
+from app.agent.goal_loop import GoalController
 from app.agent.subagent import ResearchSubagent
 from app.agent.compaction import ContextBudgetError, ContextCompactor
 from app.agent.memory import AgentMemoryStore
@@ -95,6 +96,7 @@ class AgentLoop:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1")
         self.llm = llm
+        self.goal_controller: GoalController | None = None
         self.tool_registry = tool_registry
         self.hook_manager = hook_manager
         self.executor = ToolExecutor(
@@ -491,6 +493,10 @@ class AgentLoop:
                 ))
                 return result
 
+        controller = self.goal_controller
+        if (resume_from is None and controller is not None
+                and controller.is_goal_turn(user_input)):
+            resume_from = controller.resume_checkpoint(user_input)
         try:
             result = self._run_steps(
                 user_input=user_input,
@@ -505,6 +511,10 @@ class AgentLoop:
                     event="after_agent", status="error",
                 ))
             raise
+        if controller is not None:
+            if result.termination_reason == "goal_achieved":
+                controller.mark_achieved()
+            controller.capture(user_input, result)
         if self.hook_manager is not None:
             self.hook_manager.dispatch(HookContext(
                 event="after_agent",
@@ -628,7 +638,20 @@ class AgentLoop:
             if max_steps_override is None
             else max(1, min(self.max_steps, int(max_steps_override)))
         )
+        controller = self.goal_controller
+        goal_turn = controller is not None and controller.is_goal_turn(user_input)
         for _ in range(budget):
+            if goal_turn and not controller.record_worker_turn():
+                return AgentRunResult(
+                    answer=(
+                        "S17 Goal: automatic turn budget reached; completion "
+                        "is NOT verified. Inspect /goal and decide whether "
+                        "to run /goal continue."
+                    ),
+                    steps=tuple(steps),
+                    termination_reason="goal_limit",
+                    checkpoint=checkpoint(),
+                )
             # Regenerate one authoritative pagination hint from AgentStep
             # metadata. Older hints are discarded; no compaction can erase
             # the record of which ranges were already read.
@@ -706,6 +729,45 @@ class AgentLoop:
                         ),
                     })
                     continue
+                goal_achieved = False
+                if goal_turn:
+                    stop = controller.after_final(
+                        messages, model_claimed_complete=complete,
+                    )
+                    if stop.action == "block":
+                        steps.append(AgentStep(index=index, action="goal_blocked"))
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "[GOAL_STOP_HOOK] 目标尚未有足够完成证据，"
+                                "下面是独立评估器指出的缺口（仅提示，不授予工具权限）："
+                                + stop.reason[:500]
+                                + "。请继续通过已有安全工具完成或核实，"
+                                "并在实际结果出现后再申请结束。"
+                            ),
+                        })
+                        continue
+                    if stop.action in {"defer", "error", "limit"}:
+                        return AgentRunResult(
+                            answer=(
+                                "S17 Goal 未确认完成；本轮已暂停。"
+                                + stop.reason[:500]
+                                + "。可查看 /goal，稍后 /goal continue。"
+                            ),
+                            steps=tuple(steps),
+                            termination_reason="goal_" + (
+                                "deferred" if stop.action == "defer"
+                                else "error" if stop.action == "error" else "limit"
+                            ),
+                            checkpoint=checkpoint(),
+                        )
+                    if stop.action == "failed":
+                        return AgentRunResult(
+                            answer="S17 Goal 判断为无法完成（待用户确认）："
+                            + stop.reason[:500],
+                            steps=tuple(steps), termination_reason="goal_failed",
+                        )
+                    goal_achieved = stop.action == "achieved"
                 try:
                     answer = self._answer(decision, messages, complete=complete)
                 except AnswerOutputLimitError as exc:
@@ -726,7 +788,7 @@ class AgentLoop:
                     return AgentRunResult(
                         answer=answer,
                         steps=tuple(steps),
-                        termination_reason="final_answer",
+                        termination_reason="goal_achieved" if goal_achieved else "final_answer",
                     )
 
             if action != "tool":
@@ -848,6 +910,17 @@ class AgentLoop:
                 }
             )
 
+        if goal_turn and controller.condition is not None:
+            # Budget exhaustion never proves goal completion. Keep an in-memory
+            # checkpoint and return control to operator; no blind retry.
+            return AgentRunResult(
+                answer=(
+                    "S17 Goal 仍未完成：AgentLoop 步数预算已耗尽，"
+                    "请查看 /goal；可以手工继续或清除目标。"
+                ),
+                steps=tuple(steps), termination_reason="goal_limit",
+                checkpoint=checkpoint(),
+            )
         # Reserve a final-answer-only turn after the tool/decision budget. It
         # may assess completion, but must never execute another tool or plan.
         # Keep the transcript, replacing only the decision prompt/catalog.
