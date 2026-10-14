@@ -36,12 +36,14 @@ class TeamRuntime:
         workspace_root: str | Path,
         directory: str = ".team",
         hook_manager: HookManager | None = None,
+        workflow_root: str | Path | None = None,
         max_steps: int = 5,
     ) -> None:
         self.workspace = Path(workspace_root).resolve()
         self.store = store
         self.llm_factory = llm_factory
         self.hook_manager = hook_manager
+        self.workflow_root = Path(workflow_root).resolve() if workflow_root is not None else None
         self.max_steps = max(1, min(10, int(max_steps)))
         self.state = TeamStateStore(workspace_root=self.workspace, directory=directory)
         self.bus: MessageBus = self.state.bus
@@ -352,8 +354,11 @@ class TeamRuntime:
             resolved = (root / raw).resolve()
             restricted = [
                 root / ".team", root / ".tasks", root / ".memory",
-                root / ".schedules", self.state.root, self.store.root,
+                root / ".schedules", root / ".workflows",
+                self.state.root, self.store.root,
             ]
+            if self.workflow_root is not None:
+                restricted.append(self.workflow_root)
             if any(resolved.is_relative_to(path.resolve()) for path in restricted):
                 return HookDecision(False, "S13 private task/memory/team state")
             return HookDecision()

@@ -526,13 +526,18 @@ def main() -> None:
         "/mcp-servers  /mcp-connect <server>  /mcp-tools  "
         "/mcp-call <mcp__server__tool> <JSON>  "
         "/mcp-disconnect <server>  "
-        "/harness-status  /harness-events  /harness-sync  /exit\n"
+        "/harness-status  /harness-events  /harness-sync  "
+        "/workflow-catalog  /workflow-list  "
+        "/workflow-run <name> <JSON-args>  /workflow-resume <run_id>  "
+        "/workflow-show <run_id>  /workflow-events <run_id>  "
+        "/workflow-wait <run_id> [seconds]  "
+        "/workflow-unlock <run_id> CONFIRM  /exit\n"
     )
 
     with SessionLocal() as db:
         runtime = EvoMeRuntime(
             db, enable_scheduler=True, enable_teams=True,
-            enable_mcp=True, enable_harness=True,
+            enable_mcp=True, enable_harness=True, enable_workflows=True,
         )
         while True:
             user_input = input("You > ").strip()
@@ -1029,6 +1034,74 @@ def main() -> None:
                     print(f"S13 {output}")
                 except Exception as exc:
                     print(f"S13 Team Error: {exc}")
+                continue
+            if user_input in {"/workflow-catalog", "/workflow-list"}:
+                try:
+                    rows = (
+                        runtime.workflow_catalog()
+                        if user_input == "/workflow-catalog"
+                        else runtime.workflow_list()
+                    )
+                    print("S16 暂无记录" if not rows else f"S16 {rows}")
+                except Exception as exc:
+                    print(f"S16 Workflow Error: {exc}")
+                continue
+            if user_input.startswith("/workflow-run "):
+                try:
+                    import json
+                    segments = user_input.split(maxsplit=2)
+                    if len(segments) != 3:
+                        raise ValueError('用法：/workflow-run review-files {"paths":["app/agent/schema.py"]}')
+                    args = json.loads(segments[2])
+                    result = runtime.workflow_run(segments[1], args)
+                    if result.status == "approval_required":
+                        print(
+                            f"S16 需要人工审批 {result.approval_id}："
+                            "先 /tool-approvals，确认后 /tool-approve <id>"
+                        )
+                    else:
+                        print(f"S16 {result.status}: {result.output if result.success else result.error}")
+                except Exception as exc:
+                    print(f"S16 Workflow Error: {exc}")
+                continue
+            if user_input.startswith("/workflow-resume "):
+                try:
+                    run_id = user_input.split(maxsplit=1)[1].strip()
+                    prior = runtime.workflow_show(run_id)
+                    result = runtime.workflow_run(
+                        prior["workflow"], resume_from_run_id=run_id,
+                    )
+                    print(
+                        f"S16 resume {result.status} "
+                        f"approval={result.approval_id if result.status == 'approval_required' else '-'}"
+                    )
+                except Exception as exc:
+                    print(f"S16 Workflow Error: {exc}")
+                continue
+            if user_input.startswith((
+                "/workflow-show ", "/workflow-events ",
+                "/workflow-wait ", "/workflow-unlock ",
+            )):
+                try:
+                    parts = user_input.split()
+                    command = parts[0]
+                    if command in {"/workflow-show", "/workflow-events"} and len(parts) == 2:
+                        result = (
+                            runtime.workflow_show(parts[1])
+                            if command == "/workflow-show"
+                            else runtime.workflow_events(parts[1])
+                        )
+                    elif command == "/workflow-wait" and len(parts) in {2, 3}:
+                        result = runtime.workflow_wait(
+                            parts[1], float(parts[2]) if len(parts) == 3 else 30.0,
+                        )
+                    elif command == "/workflow-unlock" and len(parts) == 3 and parts[2] == "CONFIRM":
+                        result = runtime.workflow_unlock(parts[1], confirmed=True)
+                    else:
+                        raise ValueError("S16 命令格式错误，参考 /workflow-show <id> 等帮助")
+                    print(f"S16 {result}")
+                except Exception as exc:
+                    print(f"S16 Workflow Error: {exc}")
                 continue
             if user_input == "/harness-status":
                 try:

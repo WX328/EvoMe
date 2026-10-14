@@ -51,6 +51,7 @@ class IntegratedHarness:
         team_runtime: Any = None,
         mcp_manager: Any = None,
         approval_store: Any = None,
+        workflow_runtime: Any = None,
         on_team_message: Callable[[dict[str, Any]], None] | None = None,
         max_events: int = 32,
         max_context_chars: int = 3600,
@@ -62,6 +63,7 @@ class IntegratedHarness:
         self.team_runtime = team_runtime
         self.mcp_manager = mcp_manager
         self.approval_store = approval_store
+        self.workflow_runtime = workflow_runtime
         self.on_team_message = on_team_message
         self.max_events = max(8, min(80, int(max_events)))
         self.max_context_chars = max(500, min(6000, int(max_context_chars)))
@@ -184,6 +186,22 @@ class IntegratedHarness:
                             produced.append(event)
                 except Exception as exc:
                     self._source_failure("slow_evolution", exc, produced)
+            if self.workflow_runtime is not None:
+                try:
+                    for row in self.workflow_runtime.current_runs():
+                        if row["status"] not in {"completed", "failed"}:
+                            continue
+                        event = self._emit(
+                            f"s16:{row['id']}:{row['status']}",
+                            source="s16_workflow",
+                            kind="task_notification", ref=row["id"],
+                            status=row["status"],
+                            content="Use /workflow-show for validated journal/output",
+                        )
+                        if event is not None:
+                            produced.append(event)
+                except Exception as exc:
+                    self._source_failure("s16_workflow", exc, produced)
             if self.approval_store is not None:
                 try:
                     for approval in self.approval_store.list_pending():
@@ -240,6 +258,7 @@ class IntegratedHarness:
             "background_tasks": self.task_worker is not None,
             "cron_scheduler": self.cron_scheduler is not None,
             "agent_teams": self.team_runtime is not None,
+            "workflow_runtime": self.workflow_runtime is not None,
             "mcp_connected_tools": connected,
             "tool_count": len(tools),
             "tool_names": tools[:60],

@@ -14,6 +14,9 @@ from app.agent.cron_store import ScheduleStore
 from app.agent.cron_scheduler import CronScheduler
 from app.agent.team_runtime import TeamRuntime
 from app.agent.integrated_harness import IntegratedHarness
+from app.agent.workflow_store import WorkflowStore
+from app.agent.workflow_runtime import WorkflowRuntime
+from app.tools.base import ToolDefinition, ToolImplementation
 from app.tools.mcp_plugin import MCPPluginManager
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
@@ -38,6 +41,10 @@ from app.config import (
     EVOME_S15_HARNESS_ENABLED,
     EVOME_S15_MAX_EVENTS,
     EVOME_S15_EVENT_CONTEXT_CHARS,
+    EVOME_S16_WORKFLOW_ENABLED,
+    EVOME_S16_WORKFLOW_DIR,
+    EVOME_S16_MAX_AGENT_CALLS,
+    EVOME_S16_MAX_PARALLEL,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -128,6 +135,7 @@ class EvoMeRuntime:
         enable_teams: bool = False,
         enable_mcp: bool = False,
         enable_harness: bool = False,
+        enable_workflows: bool = False,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
@@ -235,6 +243,14 @@ class EvoMeRuntime:
             )
             if s12_active else None
         )
+        self.workflow_store: WorkflowStore | None = (
+            WorkflowStore(
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                directory=EVOME_S16_WORKFLOW_DIR,
+            )
+            if EVOME_S16_WORKFLOW_ENABLED and enable_workflows
+            and enable_background and self.enable_agent_loop else None
+        )
         self.task_store = (
             TaskStore(
                 workspace_root=EVOME_TOOL_WORKSPACE,
@@ -290,6 +306,34 @@ class EvoMeRuntime:
             hypothesis_retriever=self.hypothesis_retriever,
         )
         self._ensure_strategy_record()
+        self.workflow_runtime: WorkflowRuntime | None = None
+        if self.workflow_store is not None and self.strategy.agent_loop is not None:
+            self.workflow_runtime = WorkflowRuntime(
+                store=self.workflow_store,
+                llm_factory=self._new_background_llm,
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                hook_manager=self.hook_manager,
+                max_calls=EVOME_S16_MAX_AGENT_CALLS,
+                max_parallel=EVOME_S16_MAX_PARALLEL,
+            )
+            self.strategy.tool_registry.register_tool(ToolDefinition(
+                name="Workflow",
+                description=(
+                    "运行已由宿主预先注册的只读、多阶段 Workflow。"
+                    "需要 S03 明确人工批准。name=review-files，args 的 paths "
+                    "只接受工作区相对文件路径数组；续跑需 resume_from_run_id。"
+                    "不能传入代码、动态脚本或 shell 命令。"
+                ),
+                input_schema={
+                    "name": {"type": "string"},
+                    "args": {"type": "object"},
+                    "resume_from_run_id": {"type": "string"},
+                },
+            ))
+            self.strategy.tool_registry.register_implementation(ToolImplementation(
+                name="s16_workflow_v1", tool_name="Workflow",
+                handler=self.workflow_runtime.run_tool,
+            ))
         self.mcp_manager: MCPPluginManager | None = None
         if EVOME_S14_MCP_ENABLED and enable_mcp and self.strategy.agent_loop is not None:
             self.mcp_manager = MCPPluginManager(
@@ -313,6 +357,9 @@ class EvoMeRuntime:
                     self.schedule_store.root if self.schedule_store is not None else None
                 ),
                 team_root=self._team_root,
+                workflow_root=(
+                    self.workflow_store.root if self.workflow_store is not None else None
+                ),
                 max_steps=EVOME_S11_MAX_STEPS,
                 max_output_chars=EVOME_TOOL_MAX_OUTPUT_CHARS,
             )
@@ -327,6 +374,9 @@ class EvoMeRuntime:
                 workspace_root=EVOME_TOOL_WORKSPACE,
                 directory=EVOME_S13_TEAM_DIR,
                 hook_manager=self.hook_manager,
+                workflow_root=(
+                    self.workflow_store.root if self.workflow_store is not None else None
+                ),
                 max_steps=EVOME_S13_MAX_STEPS,
             )
         self.strategy.team_event_provider = self._take_team_event_context
@@ -356,6 +406,7 @@ class EvoMeRuntime:
                 team_runtime=self.team_runtime,
                 mcp_manager=self.mcp_manager,
                 approval_store=self.tool_approval_store,
+                workflow_runtime=self.workflow_runtime,
                 on_team_message=self._remember_team_event,
                 max_events=EVOME_S15_MAX_EVENTS,
                 max_context_chars=EVOME_S15_EVENT_CONTEXT_CHARS,
@@ -437,6 +488,9 @@ class EvoMeRuntime:
             ),
             protected_team_directory=(
                 self._team_root if hasattr(self, "_team_root") else None
+            ),
+            protected_workflow_directory=(
+                self.workflow_store.root if self.workflow_store is not None else None
             ),
         )
 
@@ -1188,6 +1242,44 @@ class EvoMeRuntime:
             return []
         return self.harness.poll()
 
+    def _workflow(self) -> WorkflowRuntime:
+        if self.workflow_runtime is None:
+            raise ValueError(
+                "S16 Workflow 未启用：需要 EVOME_S16_WORKFLOW_ENABLED=1、"
+                "Agent Loop 与后台运行"
+            )
+        return self.workflow_runtime
+
+    def workflow_catalog(self):
+        return self._workflow().registry.list()
+
+    def workflow_list(self):
+        return self._workflow().list()
+
+    def workflow_show(self, run_id: str):
+        return self._workflow().show(run_id)
+
+    def workflow_events(self, run_id: str):
+        return self._workflow().events(run_id)
+
+    def workflow_wait(self, run_id: str, seconds: float = 30.0):
+        return self._workflow().wait(run_id, timeout=seconds)
+
+    def workflow_run(self, name: str, args: dict[str, Any] | None = None,
+                     resume_from_run_id: str = ""):
+        if self.strategy.agent_loop is None:
+            raise ValueError("Agent Loop disabled")
+        kwargs = {"name": name}
+        if args is not None:
+            kwargs["args"] = args
+        if resume_from_run_id:
+            kwargs["resume_from_run_id"] = resume_from_run_id
+        # Identical S03 Policy / ToolExecutor / S04 Hooks as agent calls.
+        return self.strategy.agent_loop.executor.execute("Workflow", kwargs)
+
+    def workflow_unlock(self, run_id: str, *, confirmed: bool):
+        return self._workflow().unlock_orphan(run_id, confirmed=confirmed)
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
@@ -1290,6 +1382,8 @@ class EvoMeRuntime:
         return self.background_queue.wait(target, timeout=timeout)
 
     def shutdown(self, *, wait: bool = True) -> None:
+        if self.workflow_runtime is not None:
+            self.workflow_runtime.shutdown(wait=wait)
         if self.harness is not None:
             self.harness.shutdown()
         if self.mcp_manager is not None:

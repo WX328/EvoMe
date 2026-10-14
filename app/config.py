@@ -144,6 +144,18 @@ EVOME_S15_EVENT_CONTEXT_CHARS = max(
     500, min(6000, int(os.getenv("EVOME_S15_EVENT_CONTEXT_CHARS", "3600")))
 )
 
+# S16 safe, host-registered Workflow tool (manual approval before launch).
+EVOME_S16_WORKFLOW_ENABLED = os.getenv(
+    "EVOME_S16_WORKFLOW_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S16_WORKFLOW_DIR = os.getenv("EVOME_S16_WORKFLOW_DIR", ".workflows")
+EVOME_S16_MAX_AGENT_CALLS = max(
+    1, min(12, int(os.getenv("EVOME_S16_MAX_AGENT_CALLS", "8")))
+)
+EVOME_S16_MAX_PARALLEL = max(
+    1, min(2, int(os.getenv("EVOME_S16_MAX_PARALLEL", "2")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

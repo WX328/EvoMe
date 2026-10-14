@@ -31,6 +31,7 @@ class PermissionPolicy:
         protected_task_directory: str | Path | None = None,
         protected_schedule_directory: str | Path | None = None,
         protected_team_directory: str | Path | None = None,
+        protected_workflow_directory: str | Path | None = None,
     ) -> None:
         self.bash_mode = bash_mode
         self.workspace_root = Path(workspace_root).resolve()
@@ -49,6 +50,10 @@ class PermissionPolicy:
         self.protected_team_directory = (
             Path(protected_team_directory).resolve()
             if protected_team_directory is not None else None
+        )
+        self.protected_workflow_directory = (
+            Path(protected_workflow_directory).resolve()
+            if protected_workflow_directory is not None else None
         )
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PermissionDecision:
@@ -100,6 +105,21 @@ class PermissionPolicy:
                         )
                 except (ValueError, OSError, RuntimeError):
                     return PermissionDecision("deny", "high", "invalid team write target")
+        if self.protected_workflow_directory is not None and tool_name in {"read_file", "write_file", "edit_file"}:
+            target = arguments.get("path")
+            if isinstance(target, str):
+                try:
+                    resolved = (self.workspace_root / target).resolve(strict=False)
+                    if resolved.is_relative_to(self.protected_workflow_directory):
+                        return PermissionDecision(
+                            "deny", "high", "S16 private journal/snapshot files are inaccessible"
+                        )
+                except (ValueError, OSError, RuntimeError):
+                    return PermissionDecision("deny", "high", "invalid workflow write path")
+        if tool_name == "Workflow":
+            return PermissionDecision(
+                "ask", "high", "S16 saved Workflow launch/resume needs explicit approval"
+            )
         # MCP tools are remote capabilities. Never trust server-provided
         # readOnlyHint or descriptions as a substitute for approval.
         if tool_name.startswith("mcp__"):

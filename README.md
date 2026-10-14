@@ -801,3 +801,133 @@ remains unchanged when S15 is disabled.
 - One EvoMe process per workspace. S15 does not add worktree automation,
   distributed task leases, autonomous code writes or workflow journals
   (the last belongs to S16).
+
+## S16 Workflow Runtime — model chooses one trusted script; script orchestrates steps
+
+S16 follows the original "one tool_use, full orchestration" pattern from
+shareAI-lab/learn-claude-code. It does not replace S01 AgentLoop or S03/S04
+permissions/Hooks. A S03-approved Workflow tool call submits a saved script
+and returns a durable run ID immediately.
+
+Capabilities:
+- Host-owned ScriptRegistry (no user/model-provided executable code).
+- ExecutionState.agent / parallel / pipeline / phase / log, plus one-level
+  nested workflow support.
+- Separate S06 read-only ResearchSubagent client per physical agent call.
+  No shell, file writes, MCP tools, memory edits or arbitrary code execution.
+- Agent budget defaults to 8 calls/run; concurrency up to 2; only one
+  active workflow run per EvoMe process.
+- Structured object schema validation with one bounded retry.
+- Durable .workflows/ snapshots, append-only journal.jsonl, output.json and
+  exclusive run lock. .workflows/ is ignored by Git.
+- Each agent call has a stable semantic hash of prompt, schema and label.
+  Failed runs may be resumed manually; matching journal results are reused
+  without another model call. No auto-retry after restart or crash.
+- S15 receives current-process workflow terminal notifications.
+
+### Enabling S16
+
+In your OWN local .env (not .env.example, and never commit the real .env):
+
+    EVOME_S16_WORKFLOW_ENABLED=1
+    EVOME_S16_WORKFLOW_DIR=.workflows
+    EVOME_S16_MAX_AGENT_CALLS=8
+    EVOME_S16_MAX_PARALLEL=2
+
+Requires EVOME_AGENT_LOOP_ENABLED=1, and the interactive runtime must be
+allowed to run background work. Other S01-S15 toggles are independent.
+
+### Manual acceptance
+
+1. python main.py
+2. /workflow-catalog : expect a saved review-files workflow.
+3. /workflow-run review-files {"paths":["app/agent/schema.py","app/background.py"]}
+4. S03 must report approval_required. This must not start the Workflow yet.
+5. /tool-approvals and /tool-approve <actual_approval_id>
+6. Approved invocation returns launched=true, run_id=wf_XXXXXXXXXXXX.
+7. /workflow-list; /workflow-events <run_id>; /workflow-wait <run_id> 30.
+8. /workflow-show <run_id>: expect status=completed, phase=Report and
+   structured output for both files, with agent_calls=4 absent retries.
+9. /workflow-resume <run_id> must request NEW S03 approval.
+   For a complete run this returns cached output with launched=false; for
+   a failed run the journal resumes only missing semantic agent calls.
+10. /harness-events shows s16_workflow task_notification when S15 enabled.
+11. Exit/restart: /workflow-show still reads the completed snapshot and
+    output. Nothing restarts automatically.
+
+### Operator controls and safety
+
+- The only bundled workflow is review-files: read-only per-file audit and
+  independent verification, using up to three explicit workspace-relative
+  paths. No ../, absolute paths, private .env, private task/memory/workflow
+  records, code writes, subprocesses or unsafe shell.
+- The model can supply only name, args and optional resume_from_run_id
+  to the registered Workflow tool. Scripts are trusted host code, not JSON
+  programs invented by the LLM.
+- Every Workflow launch/resume passes through S03 and S04. An approval only
+  starts the script; real completion must be checked via durable status.
+- Output and journal store bounded summaries/path evidence, not full source.
+  Snapshots and outputs use atomic os.replace; journal append flush+fsync;
+  run locks use O_CREAT|O_EXCL to block simultaneous resumes across processes.
+- A crash between child output and journal fsync may cause an unfinished
+  read-only child call to be retried after explicit resume; exactly-once
+  remote side effects are not promised.
+- Locks are never removed automatically after an unclean process death.
+  The operator can use /workflow-unlock <run_id> CONFIRM only once the old
+  owner PID has exited; optional psutil enables safe PID verification.
+- The workflow runtime is a local single-workspace thread pool, not a
+  Windows background service or a distributed orchestrator. CLI shutdown
+  waits for already-started workflows to finish.
+
+
+### S16.1 Review Quality — loss-aware Audit → Verify handoff
+
+Original S16 forwarded only the first 420 characters of an Audit summary.
+Verify sometimes called missing entries in that excerpt "Audit omissions".
+The problem was truncation of the handoff, not necessarily the original
+Audit or its source evidence.
+
+S16.1 changes the existing review-files script, preserving the read-only
+tool permissions, S03 approvals and S16 workflow journal:
+
+- The FULL SAVED Audit summary (up to 1400 characters) reaches Verify via
+  S06's USER-role untrusted teammate_context, not a system prompt or
+  executable/tool policy. Verify still must independently call read_file.
+- Overlong summaries remain bounded but now include summary_truncated=true.
+  S16 requests 1401 characters from S06 to detect a >1400 result safely.
+  summary_observed_chars is a LOWER BOUND if a summary was truncated,
+  never a fabricated original character count.
+- source_read_truncated appears only when all recorded read-file evidence
+  includes a truncated flag. Missing flags remain unknown.
+- New output includes result.files[].quality with status=unverified, audit
+  and Verify summary truncation flags, path-match status and accepted future
+  labels confirmed/unverified/false_positive. LLMs agreeing is NOT an
+  evidence-level verification. S16.1 never auto-confirms or auto-refutes
+  a particular claim without deterministic source anchors or human review.
+- status=reviewed is only a workflow execution state, NOT a factual verdict.
+- Existing Audit journal semantic keys are preserved despite optional
+  metadata fields, and their cached outputs remain usable. Verify prompts
+  changed and correctly trigger re-execution on explicit resume.
+  Older journal entries with unknown truncation metadata remain UNKNOWN.
+- Already COMPLETED old workflows stay immutable and are NOT rewritten or
+  replayed automatically. Create a fresh run for the enhanced metadata.
+- No new network accesses, model providers, worktree permissions, shell
+  commands, or arbitrary execution capabilities.
+
+After applying the incremental patch, please run:
+
+    python -m pytest -q tests/test_s16_1_review_quality.py
+    python -m pytest -q tests/test_s16_workflow_runtime.py
+    python -m pytest -q
+
+Manual acceptance:
+
+    /workflow-run review-files {"paths":["app/agent/schema.py"]}
+    /tool-approvals
+    /tool-approve <actual_id>
+    /workflow-wait <actual_run_id> 60
+    /workflow-show <actual_run_id>
+
+Look at result.files[0].quality.status=unverified and the truncation flags.
+Verify should no longer treat an item missing from an old 420-char excerpt
+as evidence it was absent in the original full Audit report.

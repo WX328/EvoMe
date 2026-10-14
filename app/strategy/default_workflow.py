@@ -75,6 +75,7 @@ class DefaultConversationStrategy:
         task_store: TaskStore | None = None,
         protected_schedule_directory: str | None = None,
         protected_team_directory: str | None = None,
+        protected_workflow_directory: str | None = None,
     ) -> None:
         self.llm = llm
         self.audit_service = audit_service
@@ -113,6 +114,7 @@ class DefaultConversationStrategy:
                     ),
                     protected_schedule_directory=protected_schedule_directory,
                     protected_team_directory=protected_team_directory,
+                    protected_workflow_directory=protected_workflow_directory,
                 ),
                 approval_store=self.approval_store,
                 hook_manager=hook_manager,
