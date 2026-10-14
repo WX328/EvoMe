@@ -610,3 +610,100 @@ The team never creates Git branches/worktrees or automatically edits code.
   shutdown wait may leave a task in_progress for operator review/recovery.
 - S13 consumes additional model tokens when 2 or 3 worker threads run.
   Keep a small team and bound the number of research tasks.
+
+## S14 MCP Plugin — external tools in the S02 pool
+
+S14 enables the **standard MCP stdio JSON-RPC protocol**: initialize,
+notifications/initialized, tools/list (with bounded cursor pagination), and
+tools/call. Names are prefixed \`mcp__<server>__<tool>\`, so builtin and external
+tools share the existing AgentLoop ToolRegistry, ToolExecutor, S03 Permission
+Policy and S04 lifecycle Hooks.
+
+**This is intentionally a safe, minimal S14 profile**, not the whole MCP spec:
+- No Streamable HTTP, OAuth, server resources, prompts, subscriptions,
+  image/audio content or rich structuredContent dispatch yet.
+- No auto-connect at startup. Only the operator can run /mcp-connect.
+- No model-exposed spawn/connect tools, no shell and no extension install.
+- All external MCP tools require **S03 operator approval per invocation**;
+  server readOnlyHint/annotations do NOT grant permission.
+- Only UTF-8 text result blocks are returned, size- and count-bounded.
+- Unexpected server-initiated sampling, elicitation or roots requests receive
+  JSON-RPC Method not found, never an agent model/data access path.
+- MCP subprocesses start with a restricted inherited environment, excluding
+  DEEPSEEK_API_KEY, OPENAI_API_KEY and unrelated app credentials.
+  Server specs cannot include \`env\` fields. External services that require
+  secrets need a separately designed, explicit credential grant in a future
+  stage, not broad environment inheritance.
+- Tool discovery is bounded to 4 servers / 24 tools per server. Tool names
+  and basic JSON Schema shape are validated before registry insertion.
+- Disconnect removes only the tools installed by that server and invalidates
+  outstanding pending approvals for its names. Old callable references cannot
+  silently dispatch after a reconnect.
+- MCP server subprocesses are stopped on disconnect and program shutdown.
+  A timed-out or invalid transport fails closed without restarting itself.
+- Server descriptions and tool outputs are *untrusted*; never interpret them
+  as instructions to override S03 or S04.
+- The S06 ResearchSubagent and S13 teammates retain their restricted,
+  separate read_file/glob registries; they do not inherit MCP capabilities.
+
+### Enable S14
+
+Add the following to your own local .env (do not commit it):
+
+\`\`\`env
+EVOME_S14_MCP_ENABLED=1
+EVOME_S14_MCP_CONFIG=.mcp_servers.json
+EVOME_S14_MCP_TIMEOUT=6.0
+\`\`\`
+
+Ensure EVOME_AGENT_LOOP_ENABLED=1. The config path is workspace-relative;
+the file is ignored by Git because it contains trusted executable selection.
+
+Create \`.mcp_servers.json\` in the EvoMe project root (example with a bundled
+offline demo that NEVER reads .env, performs writes or requests network):
+
+\`\`\`json
+{
+  "servers": {
+    "demo": {
+      "command": "python",
+      "args": ["-u", "examples/mcp_stdio_demo.py"]
+    }
+  }
+}
+\`\`\`
+
+The \`command\` launches an executable directly with \`shell=False\` and
+\`cwd\` set to EVOME_TOOL_WORKSPACE. Only configure programs you trust.
+
+Run \`python main.py\`, then:
+
+\`\`\`text
+/mcp-servers
+/mcp-connect demo
+/mcp-tools
+/mcp-call mcp__demo__echo {"text":"Hello EvoMe MCP"}
+/tool-approvals
+/tool-approve <actual_approval_id>
+/mcp-disconnect demo
+\`\`\`
+
+Expected behavior:
+- /mcp-servers lists demo as disconnected (without starting a process).
+- /mcp-connect demo initializes stdio, discovers echo/uppercase, adds both
+  to the same tool pool as S01-S13 tools.
+- /mcp-call only creates an S03 pending approval; the demo process cannot
+  execute echo before approval. Use its actual approval ID (no brackets).
+- /tool-approve runs the MCP call via ToolExecutor and S04 Hooks, returning
+  Hello EvoMe MCP.
+- /mcp-disconnect removes the demo tools. Any old approval IDs are invalid.
+- /mcp-tools lists only connected namespaced external tools; without connect
+  it is empty.
+- After explicit /mcp-connect, foreground AgentLoop may *propose* an MCP
+  tool call, but still cannot execute it without the same S03 approval.
+- S11/S12/S13 remain unaffected and cannot call the new remote tools.
+
+Limitations: This profile is **one-process**; it does not share a connection
+with worker threads/other EvoMe instances. Some MCP servers require richer
+capabilities than S14's tool-only stdio subset; their unsupported outputs are
+not forwarded to the model. The lack of credentials by default is deliberate.

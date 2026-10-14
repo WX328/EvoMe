@@ -100,6 +100,12 @@ class PermissionPolicy:
                         )
                 except (ValueError, OSError, RuntimeError):
                     return PermissionDecision("deny", "high", "invalid team write target")
+        # MCP tools are remote capabilities. Never trust server-provided
+        # readOnlyHint or descriptions as a substitute for approval.
+        if tool_name.startswith("mcp__"):
+            return PermissionDecision(
+                "ask", "high", "external MCP tool invocation requires operator approval"
+            )
         if tool_name in {"task_list", "task_get", "task_ready"}:
             return PermissionDecision("allow", "low", "read-only durable task lookup")
         if tool_name in {

@@ -23,3 +23,6 @@ scripts/__pycache__/
 
 # Local S13 team mailboxes, plans and task assignments
 .team/
+
+# S14 local MCP server allowlist. Treat as sensitive executable configuration.
+.mcp_servers.json

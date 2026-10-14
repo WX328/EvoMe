@@ -522,11 +522,16 @@ def main() -> None:
         "/team-send <member> | <message>  /team-inbox  "
         "/team-plan-request <member> | <plan>  "
         "/team-plan-approve <member>  /team-plan-reject <member>  "
-        "/team-stop <member>  /team-recover <task_id>  /team-shutdown  /exit\n"
+        "/team-stop <member>  /team-recover <task_id>  /team-shutdown  "
+        "/mcp-servers  /mcp-connect <server>  /mcp-tools  "
+        "/mcp-call <mcp__server__tool> <JSON>  "
+        "/mcp-disconnect <server>  /exit\n"
     )
 
     with SessionLocal() as db:
-        runtime = EvoMeRuntime(db, enable_scheduler=True, enable_teams=True)
+        runtime = EvoMeRuntime(
+            db, enable_scheduler=True, enable_teams=True, enable_mcp=True,
+        )
         while True:
             user_input = input("You > ").strip()
             # Deliver completed team messages on the next foreground turn.
@@ -1014,6 +1019,62 @@ def main() -> None:
                     print(f"S13 {output}")
                 except Exception as exc:
                     print(f"S13 Team Error: {exc}")
+                continue
+            if user_input == "/mcp-servers":
+                try:
+                    print("S14 configured servers:")
+                    for entry in runtime.list_mcp_servers():
+                        print(" ", entry)
+                except Exception as exc:
+                    print(f"S14 MCP Error: {exc}")
+                continue
+            if user_input == "/mcp-tools":
+                try:
+                    for item in runtime.list_mcp_tools():
+                        print(f"  {item['tool']} : {item['description'][:120]}")
+                except Exception as exc:
+                    print(f"S14 MCP Error: {exc}")
+                continue
+            if user_input.startswith("/mcp-connect "):
+                try:
+                    server = user_input.split(maxsplit=1)[1].strip()
+                    result = runtime.connect_mcp_server(server)
+                    print(f"S14 MCP connected {server}: {result}")
+                    print("External calls require /tool-approve for each invocation.")
+                except Exception as exc:
+                    print(f"S14 MCP Error: {exc}")
+                continue
+            if user_input.startswith("/mcp-disconnect "):
+                try:
+                    server = user_input.split(maxsplit=1)[1].strip()
+                    runtime.disconnect_mcp_server(server)
+                    print(f"S14 MCP disconnected: {server}")
+                except Exception as exc:
+                    print(f"S14 MCP Error: {exc}")
+                continue
+            if user_input.startswith("/mcp-call "):
+                try:
+                    import json
+                    parts = user_input.split(maxsplit=2)
+                    if len(parts) != 3:
+                        raise ValueError(
+                            'usage: /mcp-call mcp__server__tool {"key":"value"}'
+                        )
+                    arguments = json.loads(parts[2])
+                    if not isinstance(arguments, dict):
+                        raise ValueError("MCP tool parameters must be a JSON object")
+                    result = runtime.invoke_mcp_tool(parts[1], arguments)
+                    if result.status == "approval_required":
+                        print(
+                            f"S14 MCP approval required: {result.approval_id}; "
+                            f"inspect /tool-approvals then /tool-approve {result.approval_id}"
+                        )
+                    elif result.success:
+                        print(f"S14 MCP result: {result.output}")
+                    else:
+                        print(f"S14 MCP error: {result.error}")
+                except Exception as exc:
+                    print(f"S14 MCP Error: {exc}")
                 continue
             if user_input == "/task-bg-list":
                 try:

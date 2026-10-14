@@ -17,6 +17,13 @@ class ToolRegistry:
             raise KeyError(f"Tool 未注册: {implementation.tool_name}")
         self._implementations[implementation.tool_name].append(implementation)
 
+    def unregister_tool(self, name: str) -> None:
+        """Remove a dynamic plugin tool without touching other tool entries."""
+        if name not in self._tools:
+            raise KeyError(f"unknown registered tool: {name}")
+        self._tools.pop(name)
+        self._implementations.pop(name, None)
+
     def get_tool(self, name: str) -> ToolDefinition:
         return self._tools[name]
 

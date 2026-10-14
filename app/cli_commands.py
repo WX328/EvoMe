@@ -41,6 +41,7 @@ PARAM_COMMAND_NAMES = frozenset({
     "team-bind", "team-send", "team-plan-request",
     "team-plan-approve", "team-plan-reject", "team-stop",
     "team-recover",
+    "mcp-connect", "mcp-disconnect", "mcp-call",
 })
 
 COMMAND_NAMES = frozenset(
@@ -108,6 +109,8 @@ COMMAND_NAMES = frozenset(
         "team-status", "team-bind", "team-send", "team-inbox",
         "team-plan-request", "team-plan-approve", "team-plan-reject",
         "team-stop", "team-shutdown", "team-recover",
+        "mcp-servers", "mcp-connect", "mcp-disconnect",
+        "mcp-tools", "mcp-call",
         "hooks",
         "plans",
         "plan",

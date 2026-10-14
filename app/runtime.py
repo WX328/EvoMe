@@ -13,6 +13,7 @@ from app.agent.background_tasks import BackgroundTaskService
 from app.agent.cron_store import ScheduleStore
 from app.agent.cron_scheduler import CronScheduler
 from app.agent.team_runtime import TeamRuntime
+from app.tools.mcp_plugin import MCPPluginManager
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
 from app.audit.service import AuditService
@@ -30,6 +31,9 @@ from app.config import (
     EVOME_S13_TEAMS_ENABLED,
     EVOME_S13_TEAM_DIR,
     EVOME_S13_MAX_STEPS,
+    EVOME_S14_MCP_ENABLED,
+    EVOME_S14_MCP_CONFIG,
+    EVOME_S14_MCP_TIMEOUT,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -118,6 +122,7 @@ class EvoMeRuntime:
         enable_agent_loop: bool | None = None,
         enable_scheduler: bool = False,
         enable_teams: bool = False,
+        enable_mcp: bool = False,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
@@ -280,6 +285,15 @@ class EvoMeRuntime:
             hypothesis_retriever=self.hypothesis_retriever,
         )
         self._ensure_strategy_record()
+        self.mcp_manager: MCPPluginManager | None = None
+        if EVOME_S14_MCP_ENABLED and enable_mcp and self.strategy.agent_loop is not None:
+            self.mcp_manager = MCPPluginManager(
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                registry=self.strategy.tool_registry,
+                config_file=EVOME_S14_MCP_CONFIG,
+                approval_revoke=self._revoke_mcp_approvals,
+                timeout=EVOME_S14_MCP_TIMEOUT,
+            )
         self.task_background_service = (
             BackgroundTaskService(
                 store=self.task_store,
@@ -1089,6 +1103,39 @@ class EvoMeRuntime:
             )
         return "\n".join(lines)[:5000]
 
+    def _revoke_mcp_approvals(self, names: set[str]) -> None:
+        for pending in list(self.tool_approval_store.list_pending()):
+            if pending.tool_name in names:
+                self.tool_approval_store.pop(pending.id)
+
+    def _mcp(self) -> MCPPluginManager:
+        if self.mcp_manager is None:
+            raise ValueError(
+                "S14 MCP Plugin 未启用；检查 EVOME_S14_MCP_ENABLED=1 "
+                "及 EVOME_AGENT_LOOP_ENABLED=1"
+            )
+        return self.mcp_manager
+
+    def list_mcp_servers(self):
+        return self._mcp().servers()
+
+    def list_mcp_tools(self):
+        return self._mcp().connected_tools()
+
+    def connect_mcp_server(self, server: str):
+        return self._mcp().connect(server)
+
+    def disconnect_mcp_server(self, server: str):
+        return self._mcp().disconnect(server)
+
+    def invoke_mcp_tool(self, fullname: str, arguments: dict[str, Any]):
+        if fullname not in {item["tool"] for item in self._mcp().connected_tools()}:
+            raise ValueError("MCP tool is not currently connected")
+        agent = self.strategy.agent_loop
+        if agent is None:
+            raise ValueError("Agent Loop disabled")
+        return agent.executor.execute(fullname, arguments)
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
@@ -1191,6 +1238,8 @@ class EvoMeRuntime:
         return self.background_queue.wait(target, timeout=timeout)
 
     def shutdown(self, *, wait: bool = True) -> None:
+        if self.mcp_manager is not None:
+            self.mcp_manager.close()
         if self.team_runtime is not None:
             self.team_runtime.shutdown(wait=wait)
         # Stop new triggers before waiting for existing S11 worker jobs.

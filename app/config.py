@@ -124,6 +124,15 @@ EVOME_S13_MAX_STEPS = max(
     2, min(10, int(os.getenv("EVOME_S13_MAX_STEPS", "5")))
 )
 
+# S14 MCP Plugin. Explicit operator-connect only; no startup process spawn.
+EVOME_S14_MCP_ENABLED = os.getenv(
+    "EVOME_S14_MCP_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S14_MCP_CONFIG = os.getenv("EVOME_S14_MCP_CONFIG", ".mcp_servers.json")
+EVOME_S14_MCP_TIMEOUT = max(
+    0.25, min(20.0, float(os.getenv("EVOME_S14_MCP_TIMEOUT", "6.0")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.
