@@ -29,3 +29,6 @@ scripts/__pycache__/
 
 # S16 run snapshots, agent journals and execution locks (private)
 .workflows/
+
+# Private metadata-only runtime traces
+.traces/

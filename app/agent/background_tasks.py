@@ -150,6 +150,7 @@ class BackgroundTaskService:
                 workspace_root=self.workspace_root,
                 enable_bash=False,
                 max_output_chars=self.max_output_chars,
+                listing_excludes=tuple(path for path in (self.store.root, self.team_root) if path is not None),
             )
             research = ResearchSubagent(
                 llm=client,

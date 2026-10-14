@@ -21,6 +21,7 @@ from app.config import (
 )
 from app.telemetry import GLOBAL_TOKEN_USAGE
 from app.llm_errors import AnswerOutputLimitError
+from app.telemetry.tracing import traced
 
 
 class DeepSeekClient:
@@ -111,6 +112,7 @@ class DeepSeekClient:
             finish_reason=finish_reason,
         )
 
+    @traced("llm", "chat")
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -178,6 +180,7 @@ class DeepSeekClient:
             finish_reason=finish_reason,
         )
 
+    @traced("llm", "json_chat")
     def json_chat(
         self,
         messages: list[dict[str, str]],

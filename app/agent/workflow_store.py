@@ -245,11 +245,8 @@ class WorkflowStore:
                 raise ValueError("invalid S16 lock owner")
             if owner == os.getpid():
                 raise PermissionError("S16 lock is owned by the current process")
-            try:
-                import psutil  # optional, installed only if available
-            except ImportError:
-                raise RuntimeError("cannot safely verify stale PID; install psutil to unlock")
-            if psutil.pid_exists(owner):
+            from app.process_state import process_exists
+            if process_exists(owner):
                 raise PermissionError("S16 lock holder PID still exists; do not force unlock")
             path.unlink()
 

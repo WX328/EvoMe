@@ -8,6 +8,10 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-flash")
 EVOME_DB_URL = os.getenv("EVOME_DB_URL", "sqlite:///./evome.db")
 
+# Local metadata only: prompts, outputs and API keys are never recorded.
+EVOME_TRACE_ENABLED = os.getenv("EVOME_TRACE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+EVOME_TOKEN_PRICES_JSON = os.getenv("EVOME_TOKEN_PRICES_JSON", "{}")
+
 # S1 Agent Loop. Disabled by default for migration safety; enable with
 # EVOME_AGENT_LOOP_ENABLED=1 after applying the patch.
 EVOME_AGENT_LOOP_ENABLED = os.getenv(

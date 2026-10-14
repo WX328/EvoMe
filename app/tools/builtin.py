@@ -16,12 +16,15 @@ def build_default_tool_registry(
     enable_bash: bool = False,
     bash_timeout_seconds: int = 20,
     max_output_chars: int = 12000,
+    listing_excludes: tuple[str | Path, ...] = (),
 ) -> ToolRegistry:
     registry = build_tool_registry_from_skills(skill_registry)
     fs = FileSystemTools(
         workspace_root=workspace_root,
         max_output_chars=max_output_chars,
+        listing_excludes=listing_excludes,
     )
+    registry.workspace_root = fs.guard.root
 
     definitions = [
         ToolDefinition(

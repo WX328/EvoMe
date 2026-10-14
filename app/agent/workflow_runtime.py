@@ -6,6 +6,8 @@ Each child call uses an isolated S06 ResearchSubagent client/registry. Parallel
 and pipeline stages share a bounded resource budget and durable semantic journal.
 """
 from __future__ import annotations
+from contextvars import copy_context
+from app.telemetry.tracing import traced, traced_async
 
 import asyncio
 import hashlib
@@ -176,6 +178,7 @@ class ReadOnlyAgentRunner:
             skill_registry=SkillRegistry(),
             workspace_root=self.workspace, enable_bash=False,
             max_output_chars=10000,
+            listing_excludes=self.private_roots,
         )
         child = ResearchSubagent(
             llm=self.llm_factory(),
@@ -301,6 +304,7 @@ class ExecutionState:
         }, limit=12000)
         return "agent-" + hashlib.sha256(basis).hexdigest()[:32]
 
+    @traced_async("agent", "workflow_agent")
     async def agent(self, prompt: str, *, label: str, schema: dict[str, Any] | None = OUTPUT_SCHEMA) -> dict[str, Any]:
         # A host-built S16.1 verification envelope may carry the entire
         # saved Audit summary. Its embedded S06 task remains <=1200 chars.
@@ -496,8 +500,9 @@ class WorkflowRuntime:
             private_roots=(self.store.root,),
         )
 
+    @traced("workflow", "run")
     def _execute(self, run_id: str, meta: WorkflowMeta, script: Callable[..., Awaitable[dict]],
-                 args: dict[str, Any]) -> None:
+                 args: dict[str, Any]) -> dict[str, str]:
         try:
             row = self.store.load(run_id)
             row["status"] = "running"
@@ -522,6 +527,7 @@ class WorkflowRuntime:
                 {"kind": "task_notification", "message": "completed", "at": utc_now()},
             ]
             self.store.save(row)
+            return {"status": "completed"}
         except BaseException as exc:
             # Keep journal and prior success entries unchanged, never retry
             # or forward arbitrary private file content in the error.
@@ -538,9 +544,11 @@ class WorkflowRuntime:
                 self.store.save(row)
             except Exception:
                 pass
+            return {"status": "failed"}
         finally:
             self.store.unlock(run_id)
 
+    @traced("workflow", "launch")
     def launch(self, name: str, args: dict[str, Any] | None = None,
                resume_from_run_id: str = "") -> dict[str, Any]:
         with self._lock:
@@ -572,7 +580,8 @@ class WorkflowRuntime:
                 args = self._validate_args(name, args)
                 run_id = self.store.reserve(name, args)["id"]
             try:
-                future = self._pool.submit(self._execute, run_id, meta, script, args)
+                context = copy_context()
+                future = self._pool.submit(context.run, self._execute, run_id, meta, script, args)
                 self._active[run_id] = future
             except Exception:
                 self.store.unlock(run_id)
@@ -597,6 +606,69 @@ class WorkflowRuntime:
             "status": row["status"], "phase": row["phase"],
             "agent_calls": row["agent_calls"],
         } for row in self.store.list()]
+
+    def inspect_for_agent(self, run_id: str) -> dict[str, Any]:
+        """Read-only S16 result view for S17 goal evidence verification.
+
+        Unlike show(), this never returns raw journal/progress entries or
+        unbounded model prose. It preserves the distinction between script
+        completion and claim-level factual verification.
+        """
+        row = self.show(run_id)
+        status = row["status"]
+        report: dict[str, Any] = {
+            "run_id": row["id"], "workflow": row["workflow"],
+            "status": status, "phase": row["phase"],
+            "agent_calls": row["agent_calls"],
+            "journal_entries": row["journal_entries"],
+            "completed": status == "completed" and isinstance(row.get("result"), dict),
+            "evidence_limit": "Model summaries are untrusted; use source anchors for claim verification",
+        }
+        if status == "failed":
+            report["error_type"] = row["error"][:90]
+        if status != "completed":
+            return report
+
+        output = row.get("result")
+        if not isinstance(output, dict):
+            report["completed"] = False
+            report["error_type"] = "missing_structured_output"
+            return report
+        report["result_status"] = str(output.get("status", ""))[:40]
+        report["result_count"] = output.get("count") if type(output.get("count")) is int else None
+        safe_files = []
+        for item in output.get("files", [])[:3] if isinstance(output.get("files"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            quality = item.get("quality", {})
+            if not isinstance(quality, dict):
+                quality = {}
+            safe_files.append({
+                "path": str(item.get("path", ""))[:180],
+                "audit_excerpt": str(item.get("audit", ""))[:700],
+                "verification_excerpt": str(item.get("verification", ""))[:700],
+                "evidence_paths": [
+                    str(path)[:180]
+                    for path in item.get("evidence", [])[:8]
+                    if isinstance(path, str)
+                ] if isinstance(item.get("evidence"), list) else [],
+                "quality_status": (
+                    quality.get("status")
+                    if isinstance(quality.get("status"), str)
+                    and quality.get("status") in {"confirmed", "unverified", "false_positive"}
+                    else "unknown"
+                ),
+                "audit_summary_truncated": (
+                    quality.get("audit_summary_truncated")
+                    if type(quality.get("audit_summary_truncated")) is bool else None
+                ),
+                "verification_summary_truncated": (
+                    quality.get("verification_summary_truncated")
+                    if type(quality.get("verification_summary_truncated")) is bool else None
+                ),
+            })
+        report["files"] = safe_files
+        return report
 
     def events(self, run_id: str) -> list[dict[str, Any]]:
         return self.store.load(run_id)["progress"]

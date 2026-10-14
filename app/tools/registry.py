@@ -7,6 +7,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolDefinition] = {}
         self._implementations: dict[str, list[ToolImplementation]] = {}
+        self.workspace_root = None
 
     def register_tool(self, tool: ToolDefinition) -> None:
         self._tools[tool.name] = tool

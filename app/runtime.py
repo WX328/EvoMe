@@ -1,4 +1,7 @@
 from __future__ import annotations
+import json
+import sqlite3
+from app.telemetry.tracing import TraceRecorder, runtime_traced
 
 from typing import Any, Callable
 from pathlib import Path
@@ -27,6 +30,8 @@ from app.audit.service import AuditService
 from app.background import BackgroundEvolutionQueue
 from app.config import (
     DEEPSEEK_MODEL,
+    EVOME_TRACE_ENABLED,
+    EVOME_TOKEN_PRICES_JSON,
     EVOME_AGENT_LOOP_ENABLED,
     EVOME_TASK_SYSTEM_ENABLED,
     EVOME_TASK_DIRECTORY,
@@ -144,9 +149,18 @@ class EvoMeRuntime:
         enable_harness: bool = False,
         enable_workflows: bool = False,
         enable_goals: bool = False,
+        enable_tracing: bool | None = None,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
+        self.trace_recorder = None
+        self.trace_error = ""
+        if enable_tracing if enable_tracing is not None else (EVOME_TRACE_ENABLED and not injected_llm):
+            try:
+                self.trace_recorder = TraceRecorder(EVOME_TOOL_WORKSPACE,
+                    prices=json.loads(EVOME_TOKEN_PRICES_JSON))
+            except (ValueError, TypeError, AttributeError):
+                self.trace_error = "Invalid trace pricing configuration"
         self.llm = llm or DeepSeekClient()
         self.session_id = session_id or uuid4().hex
         self.enable_background = enable_background
@@ -355,6 +369,22 @@ class EvoMeRuntime:
             self.strategy.tool_registry.register_implementation(ToolImplementation(
                 name="s16_workflow_v1", tool_name="Workflow",
                 handler=self.workflow_runtime.run_tool,
+            ))
+            # Read-only, bounded durable evidence lookup for S17 after a
+            # Workflow was approved/launched. Never exposes raw journal.
+            self.strategy.tool_registry.register_tool(ToolDefinition(
+                name="workflow_get",
+                description=(
+                    "只读查询 S16 Workflow 运行状态及有界结构化结果。"
+                    "参数 run_id 为 wf_ 开头的运行 ID。"
+                    "queued/running 不代表完成；quality=unverified"
+                    " 不代表已证实代码缺陷。"
+                ),
+                input_schema={"run_id": {"type": "string"}},
+            ))
+            self.strategy.tool_registry.register_implementation(ToolImplementation(
+                name="s17_workflow_get_v1", tool_name="workflow_get",
+                handler=self.workflow_runtime.inspect_for_agent,
             ))
         self.mcp_manager: MCPPluginManager | None = None
         if EVOME_S14_MCP_ENABLED and enable_mcp and self.strategy.agent_loop is not None:
@@ -621,6 +651,7 @@ class EvoMeRuntime:
             "tool_error_count": int(state.get("tool_error_count", 0)),
         }
 
+    @runtime_traced("conversation")
     def run(self, user_input: str) -> dict:
         """Legacy synchronous path retained for tests and batch callers.
 
@@ -810,6 +841,7 @@ class EvoMeRuntime:
                 ],
             }
 
+    @runtime_traced("learning")
     def _process_slow_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         run_evolution = bool(payload.pop("_run_evolution", True))
         with self._background_session_factory() as db:
@@ -855,6 +887,7 @@ class EvoMeRuntime:
                 strategy_name=f"{strategy.name}_v{strategy.version}",
             )
 
+    @runtime_traced("conversation")
     def stream_run(
         self,
         user_input: str,
@@ -1311,6 +1344,7 @@ class EvoMeRuntime:
     def workflow_wait(self, run_id: str, seconds: float = 30.0):
         return self._workflow().wait(run_id, timeout=seconds)
 
+    @runtime_traced("workflow_request")
     def workflow_run(self, name: str, args: dict[str, Any] | None = None,
                      resume_from_run_id: str = ""):
         if self.strategy.agent_loop is None:
@@ -1364,12 +1398,14 @@ class EvoMeRuntime:
             self.deny_tool_call(goal.waiting_approval_id)
         return goal.set(condition)
 
+    @runtime_traced("goal_clear")
     def goal_clear(self) -> dict[str, Any]:
         goal = self._goal()
         if goal.waiting_approval_id:
             self.deny_tool_call(goal.waiting_approval_id)
         return goal.clear()
 
+    @runtime_traced("goal_continue")
     def goal_continue(
         self, *, on_token: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
@@ -1378,7 +1414,13 @@ class EvoMeRuntime:
         if condition is None:
             raise GoalError("没有活跃 Goal；先使用 /goal <完成条件>")
         if controller.waiting_approval_id:
-            raise GoalError("Goal 等待 S03 审批；先 /tool-approve 或 /tool-deny")
+            pending = self.tool_approval_store.get(controller.waiting_approval_id)
+            if pending is None or self.tool_approval_store.expired(pending):
+                approval_id = controller.waiting_approval_id
+                self.tool_approval_store.pop(approval_id)
+                controller.note_approval(approval_id, success=False, status="expired_or_missing")
+            else:
+                raise GoalError("Goal 等待 S03 审批；先 /tool-approve 或 /tool-deny")
         if controller.defer_background and self._goal_background_running():
             raise GoalError("后台任务仍在执行；请等待完成通知后再继续 Goal")
         if controller.defer_background and self.harness is not None:
@@ -1392,6 +1434,14 @@ class EvoMeRuntime:
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
+    def _trace_goal_approval(self, status):
+        recorder = getattr(self, "trace_recorder", None)
+        goal = self.goal_controller
+        if recorder is not None and goal is not None and goal.condition is not None:
+            with recorder.span("runtime", "goal_approval", trace_id=goal.trace_id) as outcome:
+                recorder.goal_state(goal.last_status)
+                outcome["status"] = status
+
     def approve_tool_call(self, approval_id: str):
         agent = self.strategy.agent_loop
         if agent is None:
@@ -1400,7 +1450,9 @@ class EvoMeRuntime:
         if self.goal_controller is not None:
             self.goal_controller.note_approval(
                 approval_id, success=result.success, status=result.status,
+                tool_name=result.tool_name, output=result.output,
             )
+            self._trace_goal_approval(result.status)
         if agent.planner is not None:
             agent.planner.on_approval(approval_id, result)
         return result
@@ -1414,12 +1466,26 @@ class EvoMeRuntime:
             self.goal_controller.note_approval(
                 approval_id, success=False, status="denied",
             )
+            self._trace_goal_approval("denied")
         if was_denied and agent.planner is not None:
             agent.planner.on_approval(approval_id, None, denied=True)
         return was_denied
 
     def token_usage_summary(self) -> dict[str, Any]:
         return GLOBAL_TOKEN_USAGE.summary()
+
+    def diagnostics(self):
+        from app.operations import diagnose
+        return diagnose(self)
+
+    def trace_status(self, trace_id=""):
+        if self.trace_recorder is None:
+            return {"status": "disabled", "error": self.trace_error}
+        try:
+            return (self.trace_recorder.events(trace_id) if trace_id
+                    else self.trace_recorder.traces())
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            return {"status": "unavailable", "error_type": type(exc).__name__}
 
     def enqueue_revision_analysis(self) -> str | None:
         """Queue Phase 4 analysis explicitly; useful for operator/testing workflows."""
@@ -1514,6 +1580,8 @@ class EvoMeRuntime:
             self.task_background_service.shutdown(wait=wait)
         if self.background_queue is not None:
             self.background_queue.shutdown(wait=wait)
+        if self.trace_recorder is not None:
+            self.trace_recorder.close()
 
     def list_personal_memories(self):
         # Expire foreground ORM cache so background commits are visible promptly.

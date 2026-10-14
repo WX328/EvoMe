@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.telemetry.tracing import traced
 
 import json
 from collections import defaultdict
@@ -469,6 +470,7 @@ class AgentLoop:
             default=str,
         )
 
+    @traced("agent", "run")
     def run(
         self,
         *,
@@ -821,11 +823,22 @@ class AgentLoop:
                 sort_keys=True,
                 default=str,
             )
-            if call_key in seen_calls:
-                # Preserve the S01/S05 safety contract: a repeated call is
-                # blocked and remains a visible error. Never silently replay
-                # a write, and never claim a duplicate read is new progress.
-                error = "duplicate tool call blocked"
+            # S17 can re-check a *read-only* Workflow status after a
+            # background job changes running -> completed. Bound this to
+            # three polls per explicit Goal continuation. Every other
+            # repeated tool call remains blocked exactly as before.
+            goal_status_lookup = goal_turn and tool_name == "workflow_get"
+            status_poll_allowed = (
+                controller.allow_workflow_status_poll()
+                if goal_status_lookup else False
+            )
+            if ((call_key in seen_calls and not status_poll_allowed)
+                    or (goal_status_lookup and not status_poll_allowed)):
+                error = (
+                    "S17 workflow status poll budget exceeded"
+                    if goal_status_lookup and not status_poll_allowed
+                    else "duplicate tool call blocked"
+                )
                 steps.append(
                     AgentStep(
                         index=index,

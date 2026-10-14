@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, Callable
+from uuid import uuid4
+from app.telemetry.tracing import traced
 
 from app.agent.schema import AgentCheckpoint
 
@@ -152,6 +154,7 @@ class GoalController:
         self.total_worker_turns = 0
         self.blocks_this_query = 0
         self.turns_this_query = 0
+        self.workflow_status_polls_this_query = 0
         self.last_reason = ""
         self.last_status = "idle"
         self.defer_background = False
@@ -159,6 +162,7 @@ class GoalController:
         self._checkpoint: AgentCheckpoint | None = None
         self._approval_events: list[str] = []
         self._background_seen: set[str] = set()
+        self.trace_id = uuid4().hex
 
     def set(self, condition: str) -> dict[str, Any]:
         if not isinstance(condition, str):
@@ -168,6 +172,7 @@ class GoalController:
             raise GoalError(f"goal length must be 1..{MAX_CONDITION_CHARS}")
         with self._lock:
             self.condition = condition
+            self.trace_id = uuid4().hex
             self.created_at = time.monotonic()
             self.iterations = 0
             self.total_worker_turns = 0
@@ -185,6 +190,15 @@ class GoalController:
         with self._lock:
             self.blocks_this_query = 0
             self.turns_this_query = 0
+            self.workflow_status_polls_this_query = 0
+
+    def allow_workflow_status_poll(self) -> bool:
+        """Permit a few idempotent S16 status checks within one Goal turn."""
+        with self._lock:
+            if self.condition is None or self.workflow_status_polls_this_query >= 3:
+                return False
+            self.workflow_status_polls_this_query += 1
+            return True
 
     def clear(self, reason: str = "cleared") -> dict[str, Any]:
         with self._lock:
@@ -202,6 +216,7 @@ class GoalController:
         with self._lock:
             return {
                 "active": self.condition is not None,
+                "trace_id": self.trace_id,
                 "condition": self.condition or "",
                 "status": self.last_status,
                 "evaluations": self.iterations,
@@ -282,15 +297,47 @@ class GoalController:
             self.defer_background = False
             self.last_status = "achieved"
 
-    def note_approval(self, approval_id: str, *, success: bool, status: str) -> None:
-        """Carry an operator-confirmed execution result into paused transcript."""
+    def note_approval(
+        self, approval_id: str, *, success: bool, status: str,
+        tool_name: str = "", output: Any = None,
+    ) -> None:
+        """Carry a bounded approved Workflow run ID across S03 pause.
+
+        Approval proves only that the *launch* was accepted; it does not
+        prove S16's background script has finished or findings are valid.
+        """
         with self._lock:
             if approval_id != self.waiting_approval_id or self.condition is None:
                 return
             self.waiting_approval_id = ""
+            if status in {"expired", "invalidated", "expired_or_missing"} and self._checkpoint is not None:
+                # This operation never executed. A later explicit continuation
+                # may request a NEW grant; old executed calls remain blocked.
+                steps = self._checkpoint.steps
+                call = steps[-1].tool_call if steps else None
+                if call is not None:
+                    key = json.dumps({"name": call.name, "arguments": dict(call.arguments)},
+                        ensure_ascii=False, sort_keys=True, default=str)
+                    self._checkpoint = replace(self._checkpoint,
+                        seen_calls=frozenset(row for row in self._checkpoint.seen_calls if row != key))
+            workflow_note = ""
+            if (success and tool_name == "Workflow"
+                    and isinstance(output, dict)):
+                run_id = output.get("run_id")
+                # Never forward raw approval arguments or arbitrary output.
+                if (isinstance(run_id, str)
+                        and len(run_id) == 15
+                        and run_id.startswith("wf_")
+                        and all(char in "0123456789abcdef" for char in run_id[3:])):
+                    workflow_note = (
+                        f" S16 Workflow run_id={run_id};"
+                        " query workflow_get(run_id) for authoritative status."
+                        " Launch/queue success is NOT completion."
+                    )
             self._approval_events.append(
                 f"[GOAL_APPROVAL_OUTCOME] id={approval_id[:64]} "
-                f"success={bool(success)} status={str(status)[:50]}. "
+                f"success={bool(success)} status={str(status)[:50]}."
+                + workflow_note + " "
                 "Operator explicitly processed the tool request. "
                 "Do not claim completion without verifying actual results."
             )
@@ -330,6 +377,7 @@ class GoalController:
                     "query authoritative status/evidence before judging."
                 )
 
+    @traced("goal", "evaluate")
     def after_final(
         self,
         messages: list[dict[str, str]],

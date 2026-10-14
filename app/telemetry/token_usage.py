@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any
+from app.telemetry.tracing import current_trace
 
 
 class TokenUsageTracker:
@@ -44,6 +45,11 @@ class TokenUsageTracker:
         }
         with self._lock:
             self._records.append(row)
+        active = current_trace()
+        if active is not None:
+            active.recorder.usage(purpose=row["purpose"], model=row["model"],
+                prompt_tokens=row["prompt_tokens"], completion_tokens=row["completion_tokens"],
+                cached_tokens=row["cached_tokens"])
 
     def record_usage(
         self,

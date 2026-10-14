@@ -388,6 +388,7 @@ class TeamRuntime:
         registry = build_default_tool_registry(
             skill_registry=SkillRegistry(), workspace_root=root,
             enable_bash=False, max_output_chars=10000,
+            listing_excludes=(self.state.root, self.store.root),
         )
         worker = ResearchSubagent(
             llm=llm, source_registry=registry, hook_manager=self._teammate_hooks(root),

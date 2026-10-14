@@ -1,4 +1,5 @@
 from __future__ import annotations
+from contextvars import copy_context
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -67,7 +68,8 @@ class BackgroundEvolutionQueue:
                     job.completed_at = datetime.now()
                 return result
 
-        future = self._executor.submit(runner)
+        context = copy_context()
+        future = self._executor.submit(context.run, runner)
         with self._lock:
             self._futures[job_id] = future
         return job_id

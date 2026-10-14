@@ -5,6 +5,7 @@ from __future__ import annotations
 # Keeping this in one place prevents an operational command typo from becoming a
 # learning sample simply because the slash was omitted.
 PARAM_COMMAND_NAMES = frozenset({
+    "help", "trace",
     "candidate-approve",
     "candidate-reject",
     "candidate-rebase",
@@ -49,6 +50,7 @@ PARAM_COMMAND_NAMES = frozenset({
 
 COMMAND_NAMES = frozenset(
     {
+        "help", "doctor", "trace",
         "memory",
         "experience",
         "reflection",
@@ -144,6 +146,11 @@ def normalize_cli_input(text: str) -> str:
     """
 
     stripped = str(text or "").strip()
+    if stripped.startswith("/") and stripped[1:].strip():
+        head, *tail = stripped[1:].split(maxsplit=1)
+        aliases = {"run": "goal", "continue": "goal continue", "approve": "tool-approve", "deny": "tool-deny"}
+        if head in aliases:
+            return "/" + aliases[head] + (" " + tail[0] if tail else "")
     if not stripped or stripped.startswith("/"):
         return stripped
 

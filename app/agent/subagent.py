@@ -69,6 +69,7 @@ class ResearchSubagent:
         self.max_steps = max(1, min(10, int(max_steps)))
         self.max_summary_chars = max(200, min(4000, int(max_summary_chars)))
         self.registry = self._restricted_registry(source_registry)
+        self.workspace_root = getattr(source_registry, "workspace_root", None) or "."
         self.context_compact_enabled = bool(context_compact_enabled)
         self.context_max_chars = int(context_max_chars)
         self.context_keep_recent_messages = int(context_keep_recent_messages)
@@ -140,7 +141,7 @@ class ResearchSubagent:
             llm=self.llm,
             tool_registry=self.registry,
             max_steps=self.max_steps,
-            permission_policy=ResearchOnlyPermissionPolicy(bash_mode="deny"),
+            permission_policy=ResearchOnlyPermissionPolicy(bash_mode="deny", workspace_root=self.workspace_root),
             hook_manager=self.hook_manager,
             planning_enabled=False,
             subagent_enabled=False,

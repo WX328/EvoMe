@@ -4,19 +4,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.hooks.manager import HookContext, HookDecision
-from app.tools.workspace import WorkspaceGuard
+from app.tools.workspace import WorkspaceGuard, safe_glob_pattern, sensitive_path_reason
 
 
 def _sensitive_parts(parts: tuple[str, ...]) -> HookDecision:
-    if any(part in {".git", ".venv", "evome_qdrant"} for part in parts):
-        return HookDecision(False, "protected workspace directory")
-    if parts:
-        filename = parts[-1]
-        if filename == ".env" or (filename.startswith(".env.") and filename != ".env.example"):
-            return HookDecision(False, "protected environment configuration")
-        if filename.endswith((".pem", ".key")) or filename == "evome.db":
-            return HookDecision(False, "protected local secret or database")
-    return HookDecision()
+    reason = sensitive_path_reason(parts)
+    return HookDecision(False, reason) if reason else HookDecision()
 
 
 def protect_sensitive_paths(context: HookContext) -> HookDecision:
@@ -35,6 +28,12 @@ def build_sensitive_path_guard(workspace_root: str | Path):
     workspace = WorkspaceGuard(workspace_root)
 
     def guard(context: HookContext) -> HookDecision:
+        if context.tool_name == "glob":
+            try:
+                safe_glob_pattern(context.arguments.get("pattern", ""))
+            except (ValueError, PermissionError):
+                return HookDecision(False, "protected or invalid glob target")
+            return HookDecision()
         if context.tool_name not in {"read_file", "write_file", "edit_file"}:
             return HookDecision()
         raw = context.arguments.get("path")

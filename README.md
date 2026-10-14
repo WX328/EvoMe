@@ -4,7 +4,71 @@
 
 EvoMe 是一个实验性的 Personal AI 核心系统。它探索 AI 如何从长期交互中形成关于用户的记忆与关于自身行为的经验，同时避免因为一次模型判断就随意改变策略。
 
-当前开发版本：`v0.3.0-dev`（S1–S4 Agent Runtime）。项目仍处于研究原型阶段，不建议直接用于生产环境。
+当前开发版本：`v0.3.17-dev`（S1–S17.1 Agent Runtime 与工程化改进）。项目仍处于研究原型阶段。
+
+## 日常入口与运行面板
+
+```powershell
+python main.py
+# 在 EvoMe 提示符中：
+/run 审查 app/agent/schema.py 并核实结果
+/approve <审批ID>
+/continue
+/doctor
+/trace
+/help
+```
+
+`/run`、`/continue`、`/approve`、`/deny` 分别是现有 Goal 和审批命令的简写。
+`/help` 提供分类帮助，`/help all` 列出全部命令。`/doctor` 只读检查当前审批、
+Goal、Workflow 存储和追踪写入异常，并给出后续命令；不会自动解锁、重放或调用模型。
+原有功能开关仍需在自己的 `.env` 中启用。
+
+另开一个 **PowerShell 窗口** 查看本地桌面运行面板：
+
+```powershell
+.\.venv\Scripts\python.exe desktop.py
+# 如果 EVOME_TOOL_WORKSPACE 指向其他目录：
+.\.venv\Scripts\python.exe desktop.py --workspace D:\你的工作区
+# 使用临时演示数据，不访问真实会话，不调用模型：
+.\.venv\Scripts\python.exe desktop.py --demo
+```
+
+桌面面板每两秒读取本地调用链，分别展示 Goal 状态、入口结果、执行情况与子任务异常，
+以及耗时、Token 和可选费用估算。Workflow 完成或审批通过不会把 Goal 自动标成达成。
+本轮桌面界面提供只读观察；任务发起与审批仍在 CLI 中完成。
+
+## 工程化约定
+
+- 待审批参数使用独立深拷贝；审批十分钟内有效且只能消费一次。并发批准、过期、
+  拒绝、工具实现变化均不会复用旧授权。批准时重新执行权限与 Hook 检查。
+- 文件工具的敏感路径检查属于 PermissionPolicy 硬边界，即使关闭可选 Hooks 仍生效。
+  `.env`、密钥、数据库侧文件、MCP 配置和 `.traces` 都不可通过文件工具访问。
+  `glob` 在遍历前剪除敏感目录与私有运行时目录（含已配置的自定义目录名），过滤敏感文件名，
+  并跳过符号链接和 junction。
+  Windows 盘符、越界路径、ADS 与含尾随空格/点的模式会被拒绝；`.env.example` 可正常列出。
+- 工具输出、文件内容与团队摘要仍按不可信数据处理。测试覆盖恶意文件诱导读取秘密的场景；
+  这不是通用提示注入防护的证明。任意 Shell 和外部 MCP 仍依赖操作员判断与宿主隔离。
+- Workflow 崩溃后不会自动续跑。先用 `/doctor` 和 `/workflow-show` 检查，确认原进程退出后，
+  才能 `/workflow-unlock <id> CONFIRM`；`/workflow-resume <id>` 重新申请审批，复用已保存的成功 journal。
+- CLI 在 EOF、Ctrl+C 和异常退出时清理运行时资源；无法捕获的强制终止仍需上述恢复流程。
+
+`EVOME_TRACE_ENABLED=1` 启用 `.traces/events.sqlite3` 元数据账本（Git 忽略）。
+上下文跨前台、审批、Workflow 线程及其 Agent 传播，使用统一 trace/span/parent ID；
+普通后台学习也继承触发交互的链路。追踪不保存用户问题、文件内容、工具参数、输出或异常正文。
+写入连接延迟初始化并复用，使用 WAL 和逐事件事务；每 256 次写入及正常关闭时批量清理。
+查询只返回最近 20,000 个事件，磁盘记录在清理间隔内最多暂多 255 条（单写入实例）。
+桌面查询不建表、不执行清理；运行时在后台服务停止后关闭写入连接。
+汇总的 `goal_status`、`root_status`、`execution_status`、`subtask_failures` 分别表示目标结果、
+最新入口结果、链路是否结束与子任务异常数。裁剪导致缺失起点/父节点时标记 `partial`，
+未闭合跨度标记 `unfinished`，均不能据此断言成功；所有统计仅覆盖保留窗口。
+它不是不可篡改的合规审计日志。
+追踪写入失败不会重试业务操作，`/doctor` 会报告丢失事件。
+独立的 `EvoMe Token Monitor` 不受此改动影响。
+
+Token 来自模型返回的 usage；Fake LLM 不会凭空产生用量。金额默认未知，按实际使用模型在
+`EVOME_TOKEN_PRICES_JSON` 配置 USD/百万 Token 的 `[未缓存输入, 缓存输入, 输出]` 单价后才估算。
+它不代表供应商最终账单。多进程写入使用 SQLite 事务，但同一工作区仍应只运行一个 EvoMe 实例。
 
 ## 核心设计
 
@@ -1058,3 +1122,61 @@ Those notifications are NOT a claim-level proof. S03 controls still apply.
 
     python -m pytest -q tests/test_s17_goal_loop.py
     python -m pytest -q
+
+## S17.1 Goal -> Workflow -> Approval -> Background -> Verify integration
+
+S17 read_file Goal already passed manual acceptance, but Workflow-based goals
+had a real observability gap: after S03 operator approval, the Goal checkpoint
+did not retain the new run ID, and the S01 tool pool had no safe read-only way
+to query S16's durable result. S01 also forbade calling the same status tool
+twice when a run changed from queued to completed.
+
+This incremental patch fixes all three issues:
+
+- workflow_get(run_id) is registered only while S16 WorkflowRuntime is active.
+- S03 treats workflow_get as read-only LOW risk, but every Workflow launch/
+  resume still requires HIGH risk operator approval, with existing S04 hooks.
+- The tool returns bounded authoritative status, phase, journal count,
+  selected source-backed audit/verification excerpts and quality labels,
+  never raw S16 journal contents or unbounded output. A status of completed
+  proves script execution, NOT correctness of individual findings.
+- On a successful approved Workflow launch, S17 saves only the validated
+  wf_XXXXXXXXXXXX run ID and a short note in the paused Goal checkpoint.
+  Approval arguments and arbitrary tool output are never copied.
+- For active Goal turns only, workflow_get can be re-polled up to three
+  times per explicit /goal continue cycle. All other tool calls keep S01's
+  original duplicate call protection.
+- Offline integration tests cover goal -> S03 -> Workflow -> status lookup ->
+  Goal completion, pending/failed status handling and safety boundaries.
+
+### Apply + test
+
+    git apply patches\evome_s17_1_goal_workflow_bridge.patch
+    python -m pytest -q tests/test_s17_1_goal_workflow_integration.py
+    python -m pytest -q tests/test_s17_goal_loop.py tests/test_s16_workflow_runtime.py
+    python -m pytest -q
+
+### Manual acceptance
+
+Keep existing S01/S03/S15/S16/S17 flags enabled (no new .env config keys).
+Restart python main.py after applying the patch.
+
+    /goal 必须调用 Workflow 启动 review-files，仅审查 app/agent/schema.py；然后使用 workflow_get(run_id) 核实 status=completed、有持久化审查结果和证据路径，才能报告完成。不得把 queued 或审批通过当成完成。
+
+1. Inspect /tool-approvals, then /tool-approve <actual approval id> ONCE.
+   This should submit the script and return wf_<12 hex digits>.
+2. It is fine to wait for the real background result before continuing:
+
+    /workflow-wait <actual run id> 60
+    /workflow-show <actual run id>
+
+3. /goal continue resumes the SAME in-process Goal checkpoint. The agent
+   should use workflow_get to confirm the durable output. If it queried
+   while the Workflow was still running, Goal should defer; continue only
+   once /workflow-show indicates a terminal state.
+4. Check /goal. Only a positive independent evidence-based evaluator
+   verdict may move status to achieved. Quality=unverified is an expected
+   honest label for model-generated review findings.
+
+Goal remains session-scoped, with no automatic approval, no autonomous
+shell access and no persistent personal memory writes from Goal control.

@@ -96,6 +96,11 @@ class DefaultConversationStrategy:
             enable_bash=enable_bash_tool,
             bash_timeout_seconds=bash_timeout_seconds,
             max_output_chars=tool_max_output_chars,
+            listing_excludes=tuple(path for path in (
+                agent_memory_store.root if agent_memory_store is not None else None,
+                task_store.root if task_store is not None else None,
+                protected_schedule_directory, protected_team_directory, protected_workflow_directory,
+            ) if path is not None),
         )
         self.approval_store = approval_store or ApprovalStore()
         self.agent_loop = (

@@ -1,4 +1,6 @@
 import json
+from contextlib import ExitStack
+from app.operations import command_help
 
 from app.database import Base, engine, SessionLocal
 from app.migrations import migrate_v0_2, migrate_v0_2_1
@@ -489,61 +491,21 @@ def show_background_status(runtime: EvoMeRuntime) -> None:
 def main() -> None:
     init_db()
     print(f"🌱 EvoMe {APP_VERSION} Core")
-    print(
-        "命令：/memory  /experience  /reflection  /hypothesis  /revision  "
-        "/revision-signals  /revision-pressure  /revision-groups  /ancestor-revalidate  "
-        "/signal-revalidations  /evidence-summary  /revision-analyze  "
-        "/revision-analyses  /revision-proposals  /candidate-evaluate  /candidates  "
-        "/proposal-normalize <id>  /proposal-normalizations  /response-policy <candidate_id>  "
-        "/candidate-rebase <id>  /candidate-rebases  "
-        "/revision-apply-auto  /candidate-approve <id>  /candidate-reject <id>  "
-        "/revision-events  /revision-rollback <hypothesis_id> <revision>  "
-        "/learning-invalidate <interaction_id> [reason]  /learning-invalidations  "
-        "/status  /token-usage  /audit  /skills  /hooks  /tool-approvals  "
-        "/tool-approve <id>  /tool-deny <id>  /plans  /plan <goal>  "
-        "/plan-show <id>  /plan-run <id>  /plan-replan <id>  "
-        "/plan-cancel <id>  /subagent <read-only task>  "
-        "/skill-docs  /skill-load <name>  /context-stats  "
-        "/agent-memory-list  /agent-memory-find <query>  "
-        "/agent-memory-propose <user statement>  /agent-memory-pending  "
-        "/agent-memory-approve <id>  /agent-memory-deny <id>  "
-        "/agent-memory-preview  /agent-memory-consolidate  "
-        "/task-list  /task-ready  /task-show <id>  /task-create <title>  "
-        "/task-depend <id> <dependency>  /task-start <id> [owner]  "
-        "/task-done <id> [owner]  /task-release <id> [owner]  "
-        "/task-bg-run <id>  /task-bg-list  /task-bg-show <id>  "
-        "/task-bg-wait <id> [seconds]  /task-bg-recover <id>  "
-        "/cron-at <ISO> | <只读任务>  /cron-add <expr> <offset> <runs> | <只读任务>  "
-        "/cron-after <seconds> | <只读任务>  /cron-list  /cron-show <id>  "
-        "/cron-pause <id>  /cron-resume <id>  /cron-cancel <id>  "
-        "/cron-events  /cron-tick  "
-        "/team-propose alice:role bob:role  /team-approve <proposal_id>  "
-        "/team-reject <proposal_id>  /team-resume <team_id>  /team-status  "
-        "/team-bind <task_id> <member|any> [worktree]  "
-        "/team-send <member> | <message>  /team-inbox  "
-        "/team-plan-request <member> | <plan>  "
-        "/team-plan-approve <member>  /team-plan-reject <member>  "
-        "/team-stop <member>  /team-recover <task_id>  /team-shutdown  "
-        "/mcp-servers  /mcp-connect <server>  /mcp-tools  "
-        "/mcp-call <mcp__server__tool> <JSON>  "
-        "/mcp-disconnect <server>  "
-        "/harness-status  /harness-events  /harness-sync  "
-        "/workflow-catalog  /workflow-list  "
-        "/workflow-run <name> <JSON-args>  /workflow-resume <run_id>  "
-        "/workflow-show <run_id>  /workflow-events <run_id>  "
-        "/workflow-wait <run_id> [seconds]  "
-        "/workflow-unlock <run_id> CONFIRM  "
-        "/goal <完成条件>  /goal  /goal continue  /goal clear  /exit\n"
-    )
+    print("常用：/run <目标>  /approve <id>  /continue  /doctor  /trace  /help  /exit\n")
 
-    with SessionLocal() as db:
+    with SessionLocal() as db, ExitStack() as cleanup:
         runtime = EvoMeRuntime(
             db, enable_scheduler=True, enable_teams=True,
             enable_mcp=True, enable_harness=True,
             enable_workflows=True, enable_goals=True,
         )
+        cleanup.callback(runtime.shutdown, wait=True)
         while True:
-            user_input = input("You > ").strip()
+            try:
+                user_input = input("You > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n正在安全结束后台任务...")
+                break
             # Deliver completed team messages on the next foreground turn.
             # Operator commands never forward them into the learning path.
             try:
@@ -570,15 +532,28 @@ def main() -> None:
             # Unknown slash-prefixed inputs are operational mistakes, not user
             # conversation. Keep them out of the LLM and all learning paths.
             if user_input.startswith("/"):
-                command_name = user_input[1:].split(maxsplit=1)[0].lower()
+                command_name = (user_input[1:].split(maxsplit=1) or ["help"])[0].lower()
                 if command_name not in COMMAND_NAMES:
                     print(f"未知命令：/{command_name}。输入已忽略，不会进入学习系统。")
                     continue
             if user_input == "/exit":
                 print("EvoMe > 正在等待已提交的后台学习任务安全结束...")
                 runtime.shutdown(wait=True)
+                cleanup.pop_all()
                 print("EvoMe > 下次见。")
                 break
+            if user_input in {"/", "/help"} or user_input.startswith("/help "):
+                print(command_help(user_input[len("/help"):].strip()))
+                continue
+            if user_input == "/doctor":
+                print(json.dumps(runtime.diagnostics(), ensure_ascii=False, indent=2))
+                continue
+            if user_input == "/trace" or user_input.startswith("/trace "):
+                try:
+                    print(json.dumps(runtime.trace_status(user_input[len("/trace"):].strip()), ensure_ascii=False, indent=2))
+                except (ValueError, OSError) as exc:
+                    print(f"Trace Error: {type(exc).__name__}")
+                continue
             if user_input == "/goal":
                 try:
                     print(f"S17 Goal: {runtime.goal_status()}")
@@ -1079,7 +1054,6 @@ def main() -> None:
                 continue
             if user_input.startswith("/workflow-run "):
                 try:
-                    import json
                     segments = user_input.split(maxsplit=2)
                     if len(segments) != 3:
                         raise ValueError('用法：/workflow-run review-files {"paths":["app/agent/schema.py"]}')
@@ -1196,7 +1170,6 @@ def main() -> None:
                 continue
             if user_input.startswith("/mcp-call "):
                 try:
-                    import json
                     parts = user_input.split(maxsplit=2)
                     if len(parts) != 3:
                         raise ValueError(
