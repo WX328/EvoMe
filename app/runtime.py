@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -11,6 +12,7 @@ from app.agent.task_system import TaskStore
 from app.agent.background_tasks import BackgroundTaskService
 from app.agent.cron_store import ScheduleStore
 from app.agent.cron_scheduler import CronScheduler
+from app.agent.team_runtime import TeamRuntime
 from app.agent.memory import AgentMemoryStore
 from app.agent.memory_pipeline import AgentMemoryPipeline
 from app.audit.service import AuditService
@@ -25,6 +27,9 @@ from app.config import (
     EVOME_S12_CRON_ENABLED,
     EVOME_S12_CRON_DIR,
     EVOME_S12_POLL_SECONDS,
+    EVOME_S13_TEAMS_ENABLED,
+    EVOME_S13_TEAM_DIR,
+    EVOME_S13_MAX_STEPS,
     EVOME_AGENT_MEMORY_ENABLED,
     EVOME_AGENT_MEMORY_DIR,
     EVOME_AGENT_MEMORY_AUTO_STAGE,
@@ -112,6 +117,7 @@ class EvoMeRuntime:
         enable_background: bool = True,
         enable_agent_loop: bool | None = None,
         enable_scheduler: bool = False,
+        enable_teams: bool = False,
     ) -> None:
         self.db = db
         injected_llm = llm is not None
@@ -192,6 +198,17 @@ class EvoMeRuntime:
         self.skill_registry = build_default_skill_registry(self.personal_memory_service)
         self.tool_approval_store = ApprovalStore()
         self.plan_store = PlanStore()
+        # Tests / embedded clients never auto-start a team from .env alone.
+        self.team_runtime = None
+        self._pending_team_events: list[dict[str, Any]] = []
+        team_enabled = (
+            EVOME_S13_TEAMS_ENABLED and enable_teams and enable_background
+            and self.enable_agent_loop and EVOME_TASK_SYSTEM_ENABLED
+        )
+        self._team_root = (
+            (Path(EVOME_TOOL_WORKSPACE).resolve() / EVOME_S13_TEAM_DIR).resolve()
+            if team_enabled else None
+        )
         # Runtime tests and explicit offline/injected-LLM configurations can
         # disable the Agent Loop or background worker independently of .env.
         # Never start a scheduler in those modes merely because the env flag
@@ -276,6 +293,7 @@ class EvoMeRuntime:
                 schedule_root=(
                     self.schedule_store.root if self.schedule_store is not None else None
                 ),
+                team_root=self._team_root,
                 max_steps=EVOME_S11_MAX_STEPS,
                 max_output_chars=EVOME_TOOL_MAX_OUTPUT_CHARS,
             )
@@ -283,6 +301,16 @@ class EvoMeRuntime:
                 and self.task_store is not None)
             else None
         )
+        if team_enabled and self.task_store is not None:
+            self.team_runtime = TeamRuntime(
+                store=self.task_store,
+                llm_factory=self._new_background_llm,
+                workspace_root=EVOME_TOOL_WORKSPACE,
+                directory=EVOME_S13_TEAM_DIR,
+                hook_manager=self.hook_manager,
+                max_steps=EVOME_S13_MAX_STEPS,
+            )
+        self.strategy.team_event_provider = self._take_team_event_context
         self.cron_scheduler = (
             CronScheduler(
                 store=self.schedule_store,
@@ -366,6 +394,9 @@ class EvoMeRuntime:
             task_store=self.task_store,
             protected_schedule_directory=(
                 self.schedule_store.root if self.schedule_store is not None else None
+            ),
+            protected_team_directory=(
+                self._team_root if hasattr(self, "_team_root") else None
             ),
         )
 
@@ -987,6 +1018,77 @@ class EvoMeRuntime:
     def cron_events(self):
         return self._cron().events()
 
+    def _team(self) -> TeamRuntime:
+        if self.team_runtime is None:
+            raise ValueError(
+                "S13 Agent Teams 未启用；检查 EVOME_S13_TEAMS_ENABLED=1 "
+                "及 Agent Loop / S10 配置"
+            )
+        return self.team_runtime
+
+    def team_propose(self, members: list[tuple[str, str]]):
+        return self._team().propose(members)
+
+    def team_approve(self, proposal_id: str):
+        return self._team().approve(proposal_id)
+
+    def team_reject(self, proposal_id: str):
+        return self._team().reject(proposal_id)
+
+    def team_resume(self, team_id: str):
+        return self._team().resume(team_id)
+
+    def team_status(self):
+        return self._team().status()
+
+    def team_bind(self, task_id: str, member: str, worktree: str = ""):
+        return self._team().bind(task_id, member, worktree=worktree)
+
+    def team_message(self, member: str, content: str):
+        return self._team().send(member, content)
+
+    def team_plan_request(self, member: str, content: str):
+        return self._team().request_plan(member, content)
+
+    def team_plan_respond(self, member: str, approved: bool):
+        return self._team().respond_plan(member, approved)
+
+    def team_stop_member(self, member: str):
+        return self._team().request_shutdown(member)
+
+    def team_recover(self, task_id: str):
+        return self._team().recover(task_id)
+
+    def team_shutdown(self):
+        return self._team().shutdown()
+
+    def poll_team_events(self):
+        if self.team_runtime is None:
+            return []
+        events = self.team_runtime.consume_lead_inbox()
+        self._pending_team_events.extend(events)
+        self._pending_team_events = self._pending_team_events[-25:]
+        return events
+
+    def team_inbox(self):
+        self.poll_team_events()
+        return list(self._pending_team_events)
+
+    def _take_team_event_context(self) -> str:
+        if not self._pending_team_events:
+            return ""
+        events = self._pending_team_events[:12]
+        self._pending_team_events = self._pending_team_events[12:]
+        lines = []
+        for event in events:
+            meta = event.get("metadata", {})
+            lines.append(
+                f"{event.get('from', '')}: {event.get('type', '')} "
+                f"task={meta.get('task_id', '-')} status={meta.get('status', '-')} "
+                f"{str(event.get('content', ''))[:500]}"
+            )
+        return "\n".join(lines)[:5000]
+
     def list_pending_tool_approvals(self):
         return self.tool_approval_store.list_pending()
 
@@ -1089,6 +1191,8 @@ class EvoMeRuntime:
         return self.background_queue.wait(target, timeout=timeout)
 
     def shutdown(self, *, wait: bool = True) -> None:
+        if self.team_runtime is not None:
+            self.team_runtime.shutdown(wait=wait)
         # Stop new triggers before waiting for existing S11 worker jobs.
         if self.cron_scheduler is not None:
             self.cron_scheduler.shutdown(wait=wait)

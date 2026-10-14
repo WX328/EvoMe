@@ -30,6 +30,7 @@ class PermissionPolicy:
         protected_memory_directory: str | Path | None = None,
         protected_task_directory: str | Path | None = None,
         protected_schedule_directory: str | Path | None = None,
+        protected_team_directory: str | Path | None = None,
     ) -> None:
         self.bash_mode = bash_mode
         self.workspace_root = Path(workspace_root).resolve()
@@ -44,6 +45,10 @@ class PermissionPolicy:
         self.protected_schedule_directory = (
             Path(protected_schedule_directory).resolve()
             if protected_schedule_directory is not None else None
+        )
+        self.protected_team_directory = (
+            Path(protected_team_directory).resolve()
+            if protected_team_directory is not None else None
         )
 
     def evaluate(self, tool_name: str, arguments: dict[str, Any]) -> PermissionDecision:
@@ -84,6 +89,17 @@ class PermissionPolicy:
                         )
                 except (ValueError, OSError, RuntimeError):
                     return PermissionDecision("deny", "high", "unresolvable schedule write target")
+        if self.protected_team_directory is not None and tool_name in {"write_file", "edit_file"}:
+            path = arguments.get("path")
+            if isinstance(path, str):
+                try:
+                    requested = (self.workspace_root / path).resolve(strict=False)
+                    if requested.is_relative_to(self.protected_team_directory):
+                        return PermissionDecision(
+                            "deny", "high", "S13 team inbox/roster is managed only by TeamRuntime"
+                        )
+                except (ValueError, OSError, RuntimeError):
+                    return PermissionDecision("deny", "high", "invalid team write target")
         if tool_name in {"task_list", "task_get", "task_ready"}:
             return PermissionDecision("allow", "low", "read-only durable task lookup")
         if tool_name in {

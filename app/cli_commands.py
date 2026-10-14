@@ -37,6 +37,10 @@ PARAM_COMMAND_NAMES = frozenset({
     "task-bg-recover",
     "cron-at", "cron-add", "cron-after",
     "cron-show", "cron-pause", "cron-resume", "cron-cancel",
+    "team-propose", "team-approve", "team-reject", "team-resume",
+    "team-bind", "team-send", "team-plan-request",
+    "team-plan-approve", "team-plan-reject", "team-stop",
+    "team-recover",
 })
 
 COMMAND_NAMES = frozenset(
@@ -100,6 +104,10 @@ COMMAND_NAMES = frozenset(
         "cron-at", "cron-add", "cron-after", "cron-list",
         "cron-show", "cron-pause", "cron-resume", "cron-cancel",
         "cron-events", "cron-tick",
+        "team-propose", "team-approve", "team-reject", "team-resume",
+        "team-status", "team-bind", "team-send", "team-inbox",
+        "team-plan-request", "team-plan-approve", "team-plan-reject",
+        "team-stop", "team-shutdown", "team-recover",
         "hooks",
         "plans",
         "plan",

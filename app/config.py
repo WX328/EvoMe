@@ -115,6 +115,15 @@ EVOME_S12_POLL_SECONDS = max(
     0.2, min(60.0, float(os.getenv("EVOME_S12_POLL_SECONDS", "1.0")))
 )
 
+# S13 team runtime is off by default. Only the interactive CLI opts in.
+EVOME_S13_TEAMS_ENABLED = os.getenv(
+    "EVOME_S13_TEAMS_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+EVOME_S13_TEAM_DIR = os.getenv("EVOME_S13_TEAM_DIR", ".team")
+EVOME_S13_MAX_STEPS = max(
+    2, min(10, int(os.getenv("EVOME_S13_MAX_STEPS", "5")))
+)
+
 # Phase 5.7A: hard output caps for each LLM workload. These protect JSON
 # helpers from accidentally generating long responses while leaving the
 # user-facing stream comparatively generous.

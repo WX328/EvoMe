@@ -515,13 +515,31 @@ def main() -> None:
         "/cron-at <ISO> | <只读任务>  /cron-add <expr> <offset> <runs> | <只读任务>  "
         "/cron-after <seconds> | <只读任务>  /cron-list  /cron-show <id>  "
         "/cron-pause <id>  /cron-resume <id>  /cron-cancel <id>  "
-        "/cron-events  /cron-tick  /exit\n"
+        "/cron-events  /cron-tick  "
+        "/team-propose alice:role bob:role  /team-approve <proposal_id>  "
+        "/team-reject <proposal_id>  /team-resume <team_id>  /team-status  "
+        "/team-bind <task_id> <member|any> [worktree]  "
+        "/team-send <member> | <message>  /team-inbox  "
+        "/team-plan-request <member> | <plan>  "
+        "/team-plan-approve <member>  /team-plan-reject <member>  "
+        "/team-stop <member>  /team-recover <task_id>  /team-shutdown  /exit\n"
     )
 
     with SessionLocal() as db:
-        runtime = EvoMeRuntime(db, enable_scheduler=True)
+        runtime = EvoMeRuntime(db, enable_scheduler=True, enable_teams=True)
         while True:
             user_input = input("You > ").strip()
+            # Deliver completed team messages on the next foreground turn.
+            # Operator commands never forward them into the learning path.
+            try:
+                team_events = runtime.poll_team_events()
+                for item in team_events:
+                    print(
+                        f"[TEAM {item['from']}:{item['type']}] "
+                        f"{str(item['content'])[:500]}"
+                    )
+            except Exception as exc:
+                print(f"S13 inbox warning: {exc}")
             if not user_input:
                 continue
             user_input = normalize_cli_input(user_input)
@@ -907,6 +925,95 @@ def main() -> None:
                     print(f"S12 {row}")
                 except Exception as exc:
                     print(f"S12 Cron Error: {exc}")
+                continue
+            if user_input == "/team-status":
+                try:
+                    print(runtime.team_status())
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
+                continue
+            if user_input == "/team-inbox":
+                try:
+                    for item in runtime.team_inbox():
+                        print(
+                            f"  {item['from']} -> {item['to']} [{item['type']}] "
+                            f"{str(item['content'])[:1200]}"
+                        )
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
+                continue
+            if user_input == "/team-shutdown":
+                try:
+                    runtime.team_shutdown()
+                    print("S13 team shutdown requested; roster remains on disk")
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
+                continue
+            if user_input.startswith("/team-propose "):
+                try:
+                    pairs = []
+                    for token in user_input.split()[1:]:
+                        name, sep, role = token.partition(":")
+                        if not sep:
+                            raise ValueError("format: /team-propose alice:config bob:tests")
+                        pairs.append((name, role))
+                    print("S13 proposal:", runtime.team_propose(pairs))
+                    print("Review roles, then explicitly /team-approve <proposal_id>")
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
+                continue
+            if user_input.startswith((
+                "/team-approve ", "/team-reject ", "/team-resume ",
+                "/team-stop ", "/team-recover ",
+                "/team-plan-approve ", "/team-plan-reject ",
+            )):
+                try:
+                    command, argument = user_input.split(maxsplit=1)
+                    key = argument.strip()
+                    if command == "/team-approve":
+                        output = runtime.team_approve(key)
+                    elif command == "/team-reject":
+                        output = runtime.team_reject(key)
+                    elif command == "/team-resume":
+                        output = runtime.team_resume(key)
+                    elif command == "/team-stop":
+                        output = runtime.team_stop_member(key)
+                    elif command == "/team-recover":
+                        output = runtime.team_recover(key)
+                    else:
+                        output = runtime.team_plan_respond(
+                            key, approved=command == "/team-plan-approve"
+                        )
+                    print(f"S13 {output}")
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
+                continue
+            if user_input.startswith("/team-bind "):
+                try:
+                    fields = user_input.split()
+                    if len(fields) not in {3, 4}:
+                        raise ValueError("usage: /team-bind <task_id> <member|any> [worktree_slug]")
+                    print(runtime.team_bind(
+                        fields[1], fields[2],
+                        fields[3] if len(fields) == 4 else "",
+                    ))
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
+                continue
+            if user_input.startswith(("/team-send ", "/team-plan-request ")):
+                try:
+                    head, separator, text = user_input.partition("|")
+                    if not separator or not text.strip():
+                        raise ValueError("use | to separate teammate and text")
+                    command, member = head.strip().split()
+                    output = (
+                        runtime.team_message(member, text.strip())
+                        if command == "/team-send"
+                        else runtime.team_plan_request(member, text.strip())
+                    )
+                    print(f"S13 {output}")
+                except Exception as exc:
+                    print(f"S13 Team Error: {exc}")
                 continue
             if user_input == "/task-bg-list":
                 try:

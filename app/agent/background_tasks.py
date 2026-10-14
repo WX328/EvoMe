@@ -47,6 +47,7 @@ class BackgroundTaskService:
         hook_manager: HookManager | None = None,
         memory_root: str | Path | None = None,
         schedule_root: str | Path | None = None,
+        team_root: str | Path | None = None,
         max_steps: int = 6,
         max_output_chars: int = 10000,
     ) -> None:
@@ -55,6 +56,7 @@ class BackgroundTaskService:
         self.workspace_root = workspace_root
         self.memory_root = Path(memory_root).resolve() if memory_root is not None else None
         self.schedule_root = Path(schedule_root).resolve() if schedule_root is not None else None
+        self.team_root = Path(team_root).resolve() if team_root is not None else None
         self.external_hooks = hook_manager
         self.max_steps = max(2, min(10, int(max_steps)))
         self.max_output_chars = max(2000, min(16000, int(max_output_chars)))
@@ -88,6 +90,8 @@ class BackgroundTaskService:
                     protected.append(self.memory_root)
                 if self.schedule_root is not None:
                     protected.append(self.schedule_root)
+                if self.team_root is not None:
+                    protected.append(self.team_root)
                 if any(resolved.is_relative_to(root) for root in protected):
                     return HookDecision(False, "S11 cannot read task state or private memory")
             except (ValueError, OSError, RuntimeError):

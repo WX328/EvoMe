@@ -524,3 +524,89 @@ For non-CLI embedded runtimes, scheduling also requires explicitly constructing
 `EvoMeRuntime(..., enable_scheduler=True)`. Ordinary unit-test runtimes keep
 scheduling off even if the environment flag is set, preventing test-triggered
 jobs against a developer's local task data.
+
+## S13 Agent Teams: explicit, bounded read-only collaboration
+
+S13 adds a Lead-confirmed local team around S10 TaskStore. It does NOT replace
+S06 ResearchSubagent, S11 Background Tasks or S12 Cron Scheduler.
+
+Enable EVOME_AGENT_LOOP_ENABLED=1, EVOME_TASK_SYSTEM_ENABLED=1, and
+EVOME_S13_TEAMS_ENABLED=1 in your own .env. The main CLI opts into teams;
+embedded runtime instances must explicitly use enable_teams=True. Team state
+and inboxes are under .team/, Git-ignored.
+
+### Create and approve a team
+
+1. /team-propose alice:config bob:tests
+   This only creates an in-RAM proposal; no worker, files or API calls start.
+2. Review the proposal_id returned. /team-approve <proposal_id> explicitly
+   confirms spawning independent teammate threads and LLM clients.
+   /team-reject <proposal_id> discards it.
+3. Use existing /task-create commands to create a task board. Use
+   /task-depend <child_task_id> <parent_task_id> as Lead, BEFORE assignment.
+4. /team-bind <task_id> alice
+   Only an approved/active team and a *pending* S10 research task can be
+   bound. The worker claims it atomically through S10 TaskStore once ready.
+   /team-bind <task_id> any allows any idle teammate to claim one time.
+   Unrelated S10 tasks are never auto-claimed by teammates.
+5. /team-status lists teammate WORK/IDLE state and task bindings.
+   Press Enter to display any new team messages; /team-inbox prints all
+   messages already delivered to the foreground.
+6. /task-list and /task-show <id> reveal durable completion and result.
+   Only a read_file-grounded result is marked completed. S13 sends BOTH a
+   typed result and a separate idle_notification to lead.
+
+Optional existing worktree: /team-bind <id> alice auth-refactor
+requires a pre-existing *Git registered* .worktrees/auth-refactor worktree.
+The team never creates Git branches/worktrees or automatically edits code.
+
+### Communication and typed controls
+
+- /team-send alice | Please review the data model invariants.
+  Sends a bounded, typed file-backed message to alice's inbox.
+- /team-plan-request alice | Check the schema contract before implementation.
+  Marks alice's plan pending, blocking her future task claims.
+- /team-plan-approve alice or /team-plan-reject alice records the typed
+  approval decision. Reject continues to block claims, but it never
+  permits write access; all teammates remain restricted to read_file/glob.
+- /team-stop alice requests graceful shutdown through the mailbox and sends
+  a typed shutdown_response to Lead after active work is finished.
+- /team-shutdown stops the whole team before EvoMe exits.
+- /team-resume <team_id> explicitly restarts teammates from a durable roster.
+  Restarting EvoMe NEVER auto-spawns the old team or silently retries an
+  in_progress claim. /team-recover <task_id> is manual-only for abandoned
+  team-owned claims or failed tasks.
+- /team-status displays the previous roster and "stopped"/"interrupted"
+  before explicit resume. A new /team-propose + /team-approve creates a new
+  team, replacing the previous team's roster; old S10 tasks remain on disk.
+
+### Security and limits
+
+- At most three teammates, max 90 explicit task bindings, bounded mailboxes
+  (96 KiB/80 messages each), and read-only research-only task titles.
+- Each teammate owns a separate LLM client, its own worker thread, and a
+  bounded rolling summary of its previous tasks. Each task is run through an
+  isolated S06 AgentLoop with read-only tools. This is *not* a shared model
+  context or unconstrained persistent tool-capable agent.
+- Each TeamRuntime is single-process; S10 claim locking is thread-safe
+  within that process, not a distributed cross-process lease. Do not run two
+  EvoMe processes against the same .tasks or .team files concurrently.
+- S03 forbids ordinary write_file/edit_file access to the .team directory.
+  Teammates cannot use write_file, edit_file, bash, memory updates, task graph
+  edits, S11 job launch or S12 schedule creation. S04 path guards remain
+  active, including for private .env, .tasks, .schedules, .team and .memory.
+- The operator's proposal approval is required before workers exist. A plan
+  gate restricts *even read-only* claims until approved. Plan approval never
+  grants a new tool permission. High-risk code changes/worktree mutations
+  and full autonomous refactoring remain outside this S13 safe variant.
+- The Lead inbox is drained when the foreground CLI next receives input
+  (press Enter to poll). Team result text is passed into the next Lead turn
+  as explicitly untrusted user-role context, not a privileged system message
+  and not a separate learning sample. No unsolicited terminal prompt is
+  produced while the CLI blocks in input().
+- Mailbox drain is at-most-once, not guaranteed delivery across power loss.
+  Task results persist in S10. In-progress jobs are not replayed automatically.
+- Exit requests graceful shutdown; an LLM blocked longer than the bounded
+  shutdown wait may leave a task in_progress for operator review/recovery.
+- S13 consumes additional model tokens when 2 or 3 worker threads run.
+  Keep a small team and bound the number of research tasks.
